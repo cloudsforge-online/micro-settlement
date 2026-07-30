@@ -1,0 +1,256 @@
+# Continuous integration.
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# THIS FILE IS TEMPORARY. Once `cloudsforge/.github` exists (AD-03), everything below is deleted and
+# replaced by a call to the shared reusable workflow:
+#
+#   jobs:
+#     ci:
+#       uses: cloudsforge/.github/.github/workflows/service-ci.yml@v1
+#       with:
+#         service: settlement
+#         database-url-var: SETTLEMENT_DATABASE_URL
+#       secrets: inherit
+#
+# The measured target in docs/ecosystem/03 §5 is **zero repositories with a bespoke CI file**, so
+# treat every line here as a liability with a deletion date rather than as something to extend.
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        # Not a secret: this database exists for the duration of one job, is reachable only from it,
+        # and holds nothing. A real value here would be a real value in a public log.
+        env:
+          POSTGRES_USER: settlement
+          POSTGRES_PASSWORD: settlement
+          POSTGRES_DB: settlement_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U settlement"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # Temporary: the three checkouts and the sibling layout exist only because the runtime and
+      # contracts packages are unpublished. On publish this collapses to one checkout with no
+      # `path:`.
+      - uses: actions/checkout@v4
+        with:
+          path: settlement
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-runtime
+          path: runtime
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-contracts
+          path: contracts
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: settlement/pnpm-lock.yaml
+
+      # `link:` resolves to the sibling's own node_modules, so the siblings must be installed before
+      # this repository is. That is the price of `link:`, and it is worth paying: `file:` packs the
+      # dependency and each of these packages declares files: ["dist"], so a packed install resolves
+      # its exports to a dist/ that was never built.
+      - name: Install the siblings
+        run: |
+          pnpm --dir runtime install --frozen-lockfile
+          pnpm --dir contracts install --frozen-lockfile
+
+      - name: Install
+        working-directory: settlement
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: settlement
+        run: pnpm typecheck
+
+      - name: Migrate the test database
+        working-directory: settlement
+        # The migrator is exercised as a migrator, on an empty database, exactly as a deploy runs
+        # it. A schema created by the test suite instead would never prove the one-shot job works —
+        # and in this service the one-shot job is what creates `outbound_in_flight_uniq`.
+        env:
+          SETTLEMENT_DATABASE_URL: postgres://settlement:settlement@127.0.0.1:5432/settlement_test
+          IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
+          IDENTITY_ISSUER: http://127.0.0.1:4001
+          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
+          CUSTODY_URL: http://127.0.0.1:4005
+          INDEXER_URL: http://127.0.0.1:4006
+          LEDGER_URL: http://127.0.0.1:4004
+          SETTLEMENT_SERVICE_TOKEN: ci-only-not-a-real-token-0000000000000
+        run: pnpm migrate
+
+      - name: Test
+        working-directory: settlement
+        env:
+          SETTLEMENT_TEST_DATABASE_URL: postgres://settlement:settlement@127.0.0.1:5432/settlement_test
+        run: pnpm test
+
+  # The estate-wide rules from docs/ecosystem/03 §2, as checks rather than as review discipline.
+  # §3.7 of the current-state audit is the evidence that discipline alone has already failed.
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'Rule 1 — one database, and it is this service''s own'
+        run: |
+          if grep -rnE '[A-Z_]*DATABASE_URL' src/ --include='*.ts' \
+             | grep -vE 'SETTLEMENT_DATABASE_URL|SETTLEMENT_TEST_DATABASE_URL'; then
+            echo '::error::a connection string other than SETTLEMENT_DATABASE_URL is referenced'
+            exit 1
+          fi
+          if grep -rnE '(postgres|postgresql)://' src/ --include='*.ts' | grep -v '\.test\.ts'; then
+            echo '::error::a literal connection string appears outside a test'
+            exit 1
+          fi
+
+      - name: 'Rule 4 — livez, readyz and metrics exist'
+        run: |
+          for endpoint in /livez /readyz /metrics; do
+            grep -q "'$endpoint'" src/server.ts \
+              || { echo "::error::$endpoint is not served"; exit 1; }
+          done
+
+      - name: 'Rule 7 — migrations are never run by the service process'
+        run: |
+          if grep -nE '\bmigrate\(' src/index.ts; then
+            echo '::error::index.ts calls migrate — that is the migrator job, not the service'
+            exit 1
+          fi
+
+      - name: 'Rule 8 — every background timer is a leased job'
+        run: |
+          if grep -rnE '\bset(Interval|Timeout)\(' src/ --include='*.ts'; then
+            echo '::error::a timer was found; background work is a leased job (@cloudsforge/jobs)'
+            exit 1
+          fi
+
+      # ────────────────────────────────────────────────────────────────────────────────────────
+      # THE INVARIANT, AS A BUILD CHECK.
+      #
+      # One in-flight outbound transaction per (chain, network), enforced by the partial unique
+      # index and by the lease keyed on `chain:network`. Both halves are checked, because losing
+      # either is the lost-payment race coming back: without the index a lease failure signs twice,
+      # and without the lease every tick relies on a 23505 to notice.
+      # ────────────────────────────────────────────────────────────────────────────────────────
+      - name: 'AD — the in-flight index exists and covers exactly the in-flight states'
+        run: |
+          grep -q 'outbound_in_flight_uniq' src/migrations.ts \
+            || { echo '::error::the in-flight unique index is gone from the schema'; exit 1; }
+          grep -A3 'create unique index if not exists outbound_in_flight_uniq' src/migrations.ts \
+            | grep -q "where state in ('building','signed','broadcast')" \
+            || { echo '::error::the in-flight index predicate changed'; exit 1; }
+
+      - name: 'AD — the chain lease is keyed on chain:network, never on a row id'
+        run: |
+          grep -qF '${chain}:${network}' src/jobs.ts \
+            || { echo '::error::the chain job is no longer keyed on chain:network'; exit 1; }
+          if grep -nE 'key: .*(outbound|withdrawal|transaction)Id' src/jobs.ts; then
+            echo '::error::a job is keyed on a row id; the contended resource is the chain nonce'
+            exit 1
+          fi
+
+      # A signed transaction may only ever be refunded through the one function that demands a
+      # proof, and `markFailed` must stay unable to reach a signed row.
+      - name: 'AD — nothing refunds a signed transaction without a proof'
+        run: |
+          grep -A16 'export async function markFailed' src/outbound.ts \
+            | grep -q "state in ('planned','building')" \
+            || { echo '::error::markFailed can now reach a signed row'; exit 1; }
+          grep -q 'export async function resolveWithProof' src/outbound.ts \
+            || { echo '::error::the proof-carrying resolution path is gone'; exit 1; }
+
+      # contracts-chain is exact-pinned by wallet, settlement, custody and indexer. A caret there is
+      # a signature bound to the wrong network the first time one of the copies moves.
+      - name: 'AD-02 — contracts-chain is never caret-ranged'
+        run: |
+          if grep -nE '"@cloudsforge/contracts-chain":\s*"\^' package.json; then
+            echo '::error::contracts-chain must be exact-pinned, never caret-ranged'
+            exit 1
+          fi
+
+      # Confirmation depths and decimals are read from contracts-chain and never restated. A second
+      # declaration is the skew the exact pin exists to prevent.
+      #
+      # ZERO is exempt, and only zero: `confirmations: 0` is this service reporting that a chain has
+      # not confirmed something yet, which is a measurement rather than a policy. Any other literal
+      # is somebody writing a depth down for the second time.
+      - name: 'AD — confirmation policy is read, never restated'
+        run: |
+          if grep -rnE '\b(confirmations|decimals)\s*[:=]\s*[1-9][0-9]*' src/ --include='*.ts' \
+             | grep -vE '\.test\.ts|src/testsupport\.ts'; then
+            echo '::error::a confirmation depth or decimals literal was declared; read contracts-chain'
+            exit 1
+          fi
+
+      # ────────────────────────────────────────────────────────────────────────────────────────
+      # NO TEST MAY REACH A REAL NETWORK.
+      #
+      # The local Hearth testnet on 127.0.0.1:8545 may be READ and is never sent to. What actually
+      # guarantees it is that every chain call in every test goes through `fakeNode`, an in-memory
+      # node — so the check is that no test constructs the real transport. `rpcFactory` is the only
+      # thing in this repository that can open a socket to a chain.
+      # ────────────────────────────────────────────────────────────────────────────────────────
+      - name: 'AD — no test can reach a real network'
+        run: |
+          if grep -rn 'rpcFactory' src/*.test.ts; then
+            echo '::error::a test builds the real RPC transport; chain calls go through fakeNode'
+            exit 1
+          fi
+          if grep -rnE 'https?://' src/*.test.ts | grep -vE '127\.0\.0\.1|localhost|//wallet/|//identity'; then
+            echo '::error::a test names a URL that is not local'
+            exit 1
+          fi
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      # Temporary, and for the same reason as above.
+      - uses: actions/checkout@v4
+        with:
+          path: settlement
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-runtime
+          path: runtime
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-contracts
+          path: contracts
+
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: settlement
+          build-contexts: |
+            runtimepkgs=runtime
+            contractpkgs=contracts
+          push: false
