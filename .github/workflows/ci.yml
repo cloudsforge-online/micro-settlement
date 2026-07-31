@@ -256,5 +256,5 @@ jobs:
           context: settlement
           build-contexts: |
             runtimepkgs=runtime
-            contractpkgs=contracts
+            contractspkgs=contracts
           push: false
