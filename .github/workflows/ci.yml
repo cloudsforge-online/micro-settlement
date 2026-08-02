@@ -1,22 +1,26 @@
-# Continuous integration.
-#
-# ────────────────────────────────────────────────────────────────────────────────────────────────
-# THIS FILE IS TEMPORARY. Once `cloudsforge/.github` exists (AD-03), everything below is deleted and
-# replaced by a call to the shared reusable workflow:
-#
-#   jobs:
-#     ci:
-#       uses: cloudsforge/.github/.github/workflows/service-ci.yml@v1
-#       with:
-#         service: settlement
-#         database-url-var: SETTLEMENT_DATABASE_URL
-#       secrets: inherit
-#
-# The measured target in docs/ecosystem/03 §5 is **zero repositories with a bespoke CI file**, so
-# treat every line here as a liability with a deletion date rather than as something to extend.
-# ────────────────────────────────────────────────────────────────────────────────────────────────
-
 name: CI
+
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# The estate-wide half of this file is a CALL, not a copy. The 260 lines it replaces said so
+# themselves: "THIS FILE IS TEMPORARY … deleted and replaced by a call to the shared reusable
+# workflow". That workflow exists, so this is that deletion.
+#
+# WHAT THE COPY COST WHILE IT SURVIVED. service-ci.yml runs a step no bespoke file had: it derives
+# every scope this service's route gates demand and fails if one is absent from the registry in
+# @cloudsforge/contracts-auth. identity refuses to mint a token naming an unknown scope, so an
+# unregistered scope is a service-to-service surface no identity-issued token can ever reach — and
+# the suite stays green regardless, because it mints its own principals. settlement:read and
+# settlement:register have been gating routes here with nothing checking either.
+#
+# The shared workflow also brings an image job that MIGRATES AND BOOTS the container and reads
+# /livez. The old `docker` job stopped at `push: false` — it built the image and never once ran it,
+# which for a service that signs withdrawals is the difference between "the Dockerfile parses" and
+# "the thing we deploy starts".
+#
+# The `controls` job below is what the shared workflow does not cover: rule 7, this repository's
+# stricter reading of rule 8, and the invariants this service exists to hold. Every one is asserted
+# as TEXT — the tests prove they work, these prove they are still there.
+# ────────────────────────────────────────────────────────────────────────────────────────────────
 
 on:
   push:
@@ -31,114 +35,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17-alpine
-        # Not a secret: this database exists for the duration of one job, is reachable only from it,
-        # and holds nothing. A real value here would be a real value in a public log.
-        env:
-          POSTGRES_USER: settlement
-          POSTGRES_PASSWORD: settlement
-          POSTGRES_DB: settlement_test
-        ports: ['5432:5432']
-        options: >-
-          --health-cmd "pg_isready -U settlement"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      # Temporary: the three checkouts and the sibling layout exist only because the runtime and
-      # contracts packages are unpublished. On publish this collapses to one checkout with no
-      # `path:`.
-      - uses: actions/checkout@v4
-        with:
-          path: settlement
-      - uses: actions/checkout@v4
-        with:
-          repository: cloudsforge-online/micro-runtime
-          path: runtime
-          token: ${{ secrets.ESTATE_READ_TOKEN }}
-      - uses: actions/checkout@v4
-        with:
-          repository: cloudsforge-online/micro-contracts
-          path: contracts
-          token: ${{ secrets.ESTATE_READ_TOKEN }}
+  estate:
+    uses: cloudsforge-online/micro-org/.github/workflows/service-ci.yml@main
+    with:
+      service: settlement
+      database-env-var: SETTLEMENT_DATABASE_URL
+      port: 4000
+      # Match production rather than the workflow's default of 16: the estate's compose files pin
+      # postgres:17-alpine, and a suite that passes on a version nobody runs proves nothing.
+      postgres-version: '17'
+      # The image smoke test boots the real service, and src/env.ts validates its configuration at
+      # import — so the container needs the variables it declares, not just a database, or it exits
+      # before it can serve /livez. CI-only NON-secrets: the two secrets only have to clear a
+      # length check, and the upstream URLs are never dialled because /livez needs no upstream.
+      # Never a real credential.
+      smoke-env: |
+        IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
+        IDENTITY_ISSUER=http://127.0.0.1:4001
+        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        CUSTODY_URL=http://127.0.0.1:4005
+        INDEXER_URL=http://127.0.0.1:4006
+        LEDGER_URL=http://127.0.0.1:4004
+        SETTLEMENT_SERVICE_TOKEN=ci-only-not-a-real-token-0000000000000
+    secrets:
+      # @cloudsforge/* resolves through link:../runtime and link:../contracts rather than a
+      # registry, so the workflow checks out micro-runtime and micro-contracts as siblings. Both are
+      # private, so it needs a contents:read token.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: read
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.9.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: settlement/pnpm-lock.yaml
-
-      # `link:` resolves to the sibling's own node_modules, so the siblings must be installed before
-      # this repository is. That is the price of `link:`, and it is worth paying: `file:` packs the
-      # dependency and each of these packages declares files: ["dist"], so a packed install resolves
-      # its exports to a dist/ that was never built.
-      - name: Install the siblings
-        run: |
-          pnpm --dir runtime install --frozen-lockfile
-          pnpm --dir contracts install --frozen-lockfile
-
-      - name: Install
-        working-directory: settlement
-        run: pnpm install --frozen-lockfile
-
-      - name: Typecheck
-        working-directory: settlement
-        run: pnpm typecheck
-
-      - name: Migrate the test database
-        working-directory: settlement
-        # The migrator is exercised as a migrator, on an empty database, exactly as a deploy runs
-        # it. A schema created by the test suite instead would never prove the one-shot job works —
-        # and in this service the one-shot job is what creates `outbound_in_flight_uniq`.
-        env:
-          SETTLEMENT_DATABASE_URL: postgres://settlement:settlement@127.0.0.1:5432/settlement_test
-          IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
-          IDENTITY_ISSUER: http://127.0.0.1:4001
-          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
-          CUSTODY_URL: http://127.0.0.1:4005
-          INDEXER_URL: http://127.0.0.1:4006
-          LEDGER_URL: http://127.0.0.1:4004
-          SETTLEMENT_SERVICE_TOKEN: ci-only-not-a-real-token-0000000000000
-        run: pnpm migrate
-
-      - name: Test
-        working-directory: settlement
-        env:
-          SETTLEMENT_TEST_DATABASE_URL: postgres://settlement:settlement@127.0.0.1:5432/settlement_test
-        run: pnpm test
-
-  # The estate-wide rules from docs/ecosystem/03 §2, as checks rather than as review discipline.
-  # §3.7 of the current-state audit is the evidence that discipline alone has already failed.
-  rules:
+  controls:
+    name: The controls this service exists to add
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: 'Rule 1 — one database, and it is this service''s own'
-        run: |
-          if grep -rnE '[A-Z_]*DATABASE_URL' src/ --include='*.ts' \
-             | grep -vE 'SETTLEMENT_DATABASE_URL|SETTLEMENT_TEST_DATABASE_URL'; then
-            echo '::error::a connection string other than SETTLEMENT_DATABASE_URL is referenced'
-            exit 1
-          fi
-          if grep -rnE '(postgres|postgresql)://' src/ --include='*.ts' | grep -v '\.test\.ts'; then
-            echo '::error::a literal connection string appears outside a test'
-            exit 1
-          fi
-
-      - name: 'Rule 4 — livez, readyz and metrics exist'
-        run: |
-          for endpoint in /livez /readyz /metrics; do
-            grep -q "'$endpoint'" src/server.ts \
-              || { echo "::error::$endpoint is not served"; exit 1; }
-          done
 
       - name: 'Rule 7 — migrations are never run by the service process'
         run: |
@@ -146,13 +78,17 @@ jobs:
             echo '::error::index.ts calls migrate — that is the migrator job, not the service'
             exit 1
           fi
+          echo 'ok: the service process does not migrate'
 
       - name: 'Rule 8 — every background timer is a leased job'
+        # The shared workflow bans setInterval. This repository bans setTimeout with it: the chain
+        # tick is a leased job keyed on the contended resource, never a timer.
         run: |
           if grep -rnE '\bset(Interval|Timeout)\(' src/ --include='*.ts'; then
             echo '::error::a timer was found; background work is a leased job (@cloudsforge/jobs)'
             exit 1
           fi
+          echo 'ok: no timers'
 
       # ────────────────────────────────────────────────────────────────────────────────────────
       # THE INVARIANT, AS A BUILD CHECK.
@@ -230,31 +166,3 @@ jobs:
             echo '::error::a test names a URL that is not local'
             exit 1
           fi
-
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      # Temporary, and for the same reason as above.
-      - uses: actions/checkout@v4
-        with:
-          path: settlement
-      - uses: actions/checkout@v4
-        with:
-          repository: cloudsforge-online/micro-runtime
-          path: runtime
-          token: ${{ secrets.ESTATE_READ_TOKEN }}
-      - uses: actions/checkout@v4
-        with:
-          repository: cloudsforge-online/micro-contracts
-          path: contracts
-          token: ${{ secrets.ESTATE_READ_TOKEN }}
-
-      - uses: docker/setup-buildx-action@v3
-      - name: Build the image
-        uses: docker/build-push-action@v6
-        with:
-          context: settlement
-          build-contexts: |
-            runtimepkgs=runtime
-            contractspkgs=contracts
-          push: false
