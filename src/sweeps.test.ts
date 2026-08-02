@@ -246,9 +246,9 @@ describe('treasuries and sweeps', { skip }, () => {
 
   it('refuses to sweep a chain with no adapter', async () => {
     const deps = harness(sql, { sweepEnabled: true })
-    const outcome = await planSweep(deps.sweeps, 'btc', 'testnet')
+    const outcome = await planSweep(deps.sweeps, 'sol', 'testnet')
     assert.equal(outcome.kind, 'unsupported')
-    assert.match(outcome.kind === 'unsupported' ? outcome.phase : '', /Bitcoin output policy/)
+    assert.match(outcome.kind === 'unsupported' ? outcome.phase : '', /Solana transfer shape/)
   })
 
   /* ---------------------------------------------------------------- maturity */

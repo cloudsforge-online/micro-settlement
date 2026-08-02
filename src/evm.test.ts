@@ -23,6 +23,17 @@ import { AddressError, FeeOutOfBandError, InsufficientTreasuryError, Unsupported
 import { chainFor } from './registry.ts'
 import { TEST_BOUNDS, TEST_FEE, fakeLegacyTx, fakeNode, testAddress } from './testsupport.ts'
 
+/**
+ * `UnsignedOutbound.payload` is `unknown`, because Bitcoin's is a base64 PSBT string rather than a
+ * field map. An EVM payload IS a field map, so these tests narrow it once here — and assert that
+ * it is one, which is a check the old `Record<string, unknown>` type quietly assumed.
+ */
+function fields(payload: unknown): Record<string, unknown> {
+  assert.equal(typeof payload, 'object', 'an EVM payload is a field map')
+  assert.notEqual(payload, null)
+  return payload as Record<string, unknown>
+}
+
 describe('keccak256', () => {
   it('matches the published empty-string vector', () => {
     assert.equal(
@@ -185,7 +196,7 @@ describe('building an EVM transfer', () => {
     })
     // custody's `signEvm` refuses "a field this service does not sign", so an extra key here is a
     // 403 rather than a wider signature. This asserts the allowlist exactly.
-    assert.deepEqual(Object.keys(unsigned.payload).sort(), [
+    assert.deepEqual(Object.keys(fields(unsigned.payload)).sort(), [
       'chainId',
       'gasLimit',
       'gasPrice',
@@ -194,12 +205,12 @@ describe('building an EVM transfer', () => {
       'type',
       'value',
     ])
-    assert.equal(unsigned.payload['type'], 0, 'Ember has no type-2 decoder and custody refuses 1559')
+    assert.equal(fields(unsigned.payload)['type'], 0, 'Ember has no type-2 decoder and custody refuses 1559')
     // Amounts as DECIMAL STRINGS: custody refuses a non-safe-integer number rather than rounding
     // it, and one EMBER is 1e18, four orders of magnitude past what a double holds exactly.
-    assert.equal(unsigned.payload['value'], '100000000000000000')
-    assert.equal(unsigned.payload['gasLimit'], '21000')
-    assert.equal(unsigned.payload['gasPrice'], '40000000000')
+    assert.equal(fields(unsigned.payload)['value'], '100000000000000000')
+    assert.equal(fields(unsigned.payload)['gasLimit'], '21000')
+    assert.equal(fields(unsigned.payload)['gasPrice'], '40000000000')
     assert.equal(unsigned.nonce, '0')
     // Null because a legacy transaction has no expiry at all: only a consumed nonce retires it.
     assert.equal(unsigned.expiry, null)

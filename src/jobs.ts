@@ -138,10 +138,10 @@ export function rescheduleRecurring(
   network: Network,
   logger: Logger,
 ): (event: RunnerEvent) => void {
-  const byKey = new Map(recurringFor(network).map((r) => [`${r.kind} ${r.key}`, r]))
+  const byKey = new Map(recurringFor(network).map((r) => [`${r.kind}\u0000${r.key}`, r]))
   return (event) => {
     if (event.type !== 'completed') return
-    const recurring = event.kind && event.key ? byKey.get(`${event.kind} ${event.key}`) : undefined
+    const recurring = event.kind && event.key ? byKey.get(`${event.kind}\u0000${event.key}`) : undefined
     if (!recurring) return
     void queue
       .enqueue({

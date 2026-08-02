@@ -306,7 +306,14 @@ export function fakeCustody(options: { readonly mint?: string } = {}): FakeCusto
         const { CustodySignRefusedError } = await import('./custodyclient.ts')
         throw new CustodySignRefusedError(403, code, message)
       }
-      const signedTx = fakeLegacyTx(request.payload)
+      // Real custody asserts the payload shape per family before it signs — `signEvm` wants a
+      // field map and `signBitcoin` wants a base64 string — so the fake refuses the wrong shape
+      // rather than coercing it. A fake that is laxer than the thing it stands in for is a fake
+      // that passes tests production would fail.
+      if (typeof request.payload !== 'object' || request.payload === null) {
+        throw new Error('the EVM signer was handed a payload that is not a field map')
+      }
+      const signedTx = fakeLegacyTx(request.payload as Record<string, unknown>)
       signatures.push(signedTx)
       return { signedTx, auditId: `audit-${signatures.length}` }
     },

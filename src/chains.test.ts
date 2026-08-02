@@ -78,8 +78,11 @@ describe('the registry', () => {
     }
   })
 
-  it('implements exactly ember and eth today', () => {
-    assert.deepEqual([...implementedChains()].sort(), ['ember', 'eth'])
+  it('implements ember, eth and btc today', () => {
+    // BTC joined when `bitcoin.ts` landed. It is here rather than with the unimplemented three
+    // because custody's `purposeGate` only gates `deposit`-purpose bitcoin, so a withdrawal from a
+    // `treasury`-purpose address has always been signable — see the note in `registry.ts`.
+    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'eth'])
   })
 
   /**
@@ -90,7 +93,7 @@ describe('the registry', () => {
    * adapter reaches production.
    */
   it('throws NotImplementedError from every method of an unimplemented chain', async () => {
-    for (const chain of ['btc', 'sol', 'xrp'] as const) {
+    for (const chain of ['sol', 'xrp'] as const) {
       const adapter = chainFor(chain)
       assert.ok(adapter.unimplementedPhase, `${chain} must name its phase`)
       assert.throws(() => adapter.canonicalise('x'), NotImplementedError)
@@ -123,10 +126,10 @@ describe('the registry', () => {
    * case — custody signs it today — and the message says so.
    */
   it('names why each unimplemented chain is unimplemented', () => {
-    assert.match(chainFor('btc').unimplementedPhase!, /Bitcoin output policy/)
+    assert.equal(chainFor('btc').unimplementedPhase, null, 'btc is implemented')
     assert.match(chainFor('sol').unimplementedPhase!, /Solana transfer shape/)
     assert.match(chainFor('xrp').unimplementedPhase!, /XRPL adapter/)
-    for (const chain of ['btc', 'sol'] as const) {
+    for (const chain of ['sol'] as const) {
       const message = (() => {
         try {
           chainFor(chain).canonicalise('x')

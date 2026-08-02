@@ -15,25 +15,38 @@ import { HttpClient } from '@cloudsforge/http'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { CHAIN_IDS, unimplementedChain, type ChainCall, type ChainId, type JsonRpc, type OutboundChain } from './chains.ts'
 import { evmChain } from './evm.ts'
+import { bitcoinChain } from './bitcoin.ts'
 
 const CHAINS: Readonly<Record<ChainId, OutboundChain>> = Object.freeze({
   ember: evmChain('ember'),
   eth: evmChain('eth'),
-  btc: unimplementedChain(
-    'btc',
-    'phase 8 — Bitcoin output policy',
-    'custody signs a base64 PSBT and its sweep OUTPUT policy is specified but not built, so ' +
-      "gates.SWEEPABLE_FAMILIES refuses a 'deposit'-purpose bitcoin address before anything is " +
-      'decrypted. Neither a withdrawal nor a sweep is possible until that policy exists, and ' +
-      'building the PSBT side here first would produce bytes custody will not sign.',
-  ),
+  // Implemented — see `bitcoin.ts`.
+  //
+  // The note that used to sit here said "neither a withdrawal nor a sweep is possible until that
+  // policy exists". **The withdrawal half of that was wrong**, and it kept a gate item closed that
+  // was never actually blocked. custody's `purposeGate` reads:
+  //
+  //     if (row.purpose === 'deposit' && !SWEEPABLE_FAMILIES.has(row.family)) refuse
+  //
+  // — conditioned on `deposit`. `SIGNABLE_PURPOSES` is {deployer, treasury, deposit} and
+  // `keys.ts` dispatches a bitcoin row to `signBitcoin` for any of them, which signs a PSBT to any
+  // destination it names. So a withdrawal from a `treasury`-purpose address has been signable all
+  // along. A SWEEP still is not, because a sweep spends a `deposit`-purpose address, and that
+  // remains blocked in custody rather than here — `bitcoin.buildSweepPsbt` builds the pinned-output
+  // PSBT that policy will want, so the remaining change is custody's alone.
+  btc: bitcoinChain(),
   sol: unimplementedChain(
     'sol',
     'phase 8 — Solana transfer shape',
     'custody signs only the SPL mint-creation instruction set and explicitly refuses ' +
       'SystemProgram::Transfer, which is what moving SOL is. There is no transfer shape and ' +
       'therefore no sweep shape; admitting one without a pinned destination would hand a signing ' +
-      "credential createAccount over every customer's SOL deposit key.",
+      "credential createAccount over every customer's SOL deposit key. " +
+      'THE BLOCKER IS ENTIRELY CUSTODY-SIDE AND IT BLOCKS BOTH HALVES, unlike bitcoin where only ' +
+      'the sweep is gated: signSolana refuses a transfer for EVERY purpose, not just deposit, so ' +
+      'there is no treasury-purpose path either. Building an adapter here first would produce ' +
+      'bytes custody refuses at gate 2 — after a row is committed and money is in flight — which ' +
+      'is strictly worse than this refusal, which happens before anything is written.',
   ),
   xrp: unimplementedChain(
     'xrp',

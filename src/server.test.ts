@@ -151,9 +151,12 @@ describe('the HTTP surface', { skip }, () => {
   })
 
   it('answers 501 for a chain with no adapter, naming the phase', async () => {
-    const { status, body } = await call('/v1/fees/btc/testnet/BTC', { token: 'wallet' })
+    // SOL rather than BTC: BTC has an adapter now. SOL is blocked in CUSTODY — signSolana refuses
+    // SystemProgram::Transfer for every purpose — so it is still the honest example of a chain
+    // this service will not build a transaction for.
+    const { status, body } = await call('/v1/fees/sol/testnet/SOL', { token: 'wallet' })
     assert.equal(status, 501)
-    assert.match(String((body['error'] as Record<string, unknown>)['message']), /Bitcoin output policy/)
+    assert.match(String((body['error'] as Record<string, unknown>)['message']), /Solana transfer shape/)
   })
 
   it('refuses an asset that does not settle on the named chain', async () => {

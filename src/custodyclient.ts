@@ -95,8 +95,13 @@ export interface SignRequest {
   readonly purpose: 'treasury' | 'deposit'
   readonly userId: string
   readonly orderId: string
-  /** The exact object custody's signer receives. Extra fields are refused, not ignored. */
-  readonly payload: Record<string, unknown>
+  /**
+   * Exactly what custody's signer receives. Extra fields are refused, not ignored.
+   *
+   * `unknown` because the shape is the family's: an object of allowlisted fields for EVM and XRP,
+   * a base64 PSBT string for Bitcoin. See `UnsignedOutbound.payload`.
+   */
+  readonly payload: unknown
   /** Correlates the signature with the row it was made for, in custody's audit and ours. */
   readonly correlationId: string
 }

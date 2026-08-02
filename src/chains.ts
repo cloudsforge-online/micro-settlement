@@ -283,7 +283,16 @@ export interface BuildInput {
  * a loose record assembled at the call site.
  */
 export interface UnsignedOutbound {
-  readonly payload: Record<string, unknown>
+  /**
+   * `unknown` rather than `Record<string, unknown>`, because not every family's payload is an
+   * object. custody's `signEvm` takes a field map and its `signBitcoin` takes a **base64 PSBT
+   * string** — a segwit signature commits to the value of each input and only a PSBT carries it,
+   * so there is nothing to express as a record. Custody's route reads `body['payload']` untyped
+   * and each signer asserts its own shape, so the transport already allowed this; narrowing it
+   * here only forced a cast at the one call site that needed the other shape, which is a lie in
+   * the type system rather than a check.
+   */
+  readonly payload: unknown
   readonly value: bigint
   readonly fee: bigint
   /**
