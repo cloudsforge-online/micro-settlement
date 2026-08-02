@@ -8,8 +8,51 @@
  * reconciliation between the chain and the books has nothing to reconcile against.
  *
  * One entry per confirmed transaction, `treasury_spend`, and it balances by construction because it
- * is the same number on both sides: the platform's fee EXPENSE increases by what was burned, and the
- * custody treasury ASSET decreases by the same.
+ * is the same number on both sides: the platform's EXPENSE increases by what was burned, and the
+ * custody ASSET decreases by the same.
+ *
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * **BOTH ACCOUNTS MOVED, AND UNTIL THEY DID NOT ONE OF THESE ENTRIES COULD EVER HAVE POSTED.**
+ *
+ * The ledger keys an account on `(subject, asset_code, purpose)` and NOTHING else.
+ *
+ *   1. The debit was `(platform, <asset>, fees)` as type `expense`. `micro-billing`,
+ *      `micro-market`, `micro-mint`, `micro-trade` and `micro-wallet` all name that SAME key as
+ *      type `revenue` (market/src/ledgerclient.ts:123, wallet/src/money.ts:145), and
+ *      `micro-foresight` names `(platform, EMBER, fees)` `revenue` too
+ *      (foresight/src/ledgerclient.ts:116). `ensureAccount` THROWS `AccountConflictError` when a
+ *      caller's stated type disagrees with the row that already exists
+ *      (ledger/src/accounts.ts:125) — so whichever service posted second would have had EVERY
+ *      entry refused, for as long as the disagreement stood. No suite caught it because each
+ *      service tests against its own fake ledger.
+ *
+ *      `revenue` is the correct reading and this service's `expense` was the wrong one:
+ *      `micro-ledger` states the chart for the `platform` subject in its own source — "`platform`
+ *      is revenue under `fees`, equity under `treasury` and expense under `payout_due`"
+ *      (ledger/src/accounts.ts:16-17) — and `normalBalance` makes `revenue` credit-normal, the
+ *      direction six services already credit fee income in.
+ *
+ *      But merely RETYPING this posting to `revenue` would have swapped one production breakage
+ *      for another. A burned gas fee is not negative fee income, and debiting a credit-normal
+ *      account drives it below zero: `ledger_assert_no_overdraft` exempts `clearing`, `suspense`
+ *      and an explicit `overdraft_allowed`, and NOT `revenue`, so the first BTC fee — an asset
+ *      nothing in the estate credits fee revenue in at all — would have been refused by the
+ *      trigger instead of by the type check. So the debit moved to the chart's own platform
+ *      expense account, `(platform, <asset>, payout_due)`. `expense` is debit-normal, so it grows
+ *      with every fee and can never go negative. `payout_due` under a `user:` subject is a
+ *      seller's liability in `micro-market` and a different account entirely: the subject is part
+ *      of the key.
+ *
+ *   2. The credit was `(custody, <asset>, treasury)`. Nothing in the estate has ever DEBITED that
+ *      account — `micro-wallet` books every deposit and every settled withdrawal against
+ *      `(custody, <asset>, available)` (wallet/src/deposits.ts:627, wallet/src/withdrawals.ts:564)
+ *      — so its balance is 0, and crediting an `asset` (debit-normal) account with a zero balance
+ *      takes it negative and `ledger_assert_no_overdraft` refuses the entry. The fee was burned
+ *      out of the coin custody actually holds, so it is that pool which goes down. Same type,
+ *      same subject, and reconciliation sums custody `asset` accounts across purposes either way
+ *      (ledger/src/reconcile.ts, `totalFor`) — but only one of the two is a pool with a balance in
+ *      it.
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
  *
  * **Its failure is never fatal to the transaction.** The payment is on chain whatever the ledger
  * says, and a service that could not mark a confirmed payment confirmed because a bookkeeping entry
@@ -20,9 +63,30 @@
 
 import type { Logger } from '@cloudsforge/telemetry'
 import type { LedgerAssetCode } from '@cloudsforge/contracts-money'
-import type { LedgerClient } from './ledgerclient.ts'
+import type { AccountRef, LedgerClient } from './ledgerclient.ts'
 import type { Db } from './outbox.ts'
 import type { OutboundTransaction } from './outbound.ts'
+
+/**
+ * The platform's own expense line — the chart's `expense` slot for the `platform` subject, named
+ * by `micro-ledger` itself (ledger/src/accounts.ts:16-17). Exported so the suite can assert the
+ * key rather than re-spell it: a second spelling is a second account, and the whole defect this
+ * replaces was two services spelling one key two ways.
+ *
+ * NOT `(platform, <asset>, fees)`. That key is the platform's fee REVENUE and six other services
+ * already own it as such; see the block comment at the head of this file.
+ */
+export function feeExpenseAccount(assetCode: LedgerAssetCode): AccountRef {
+  return { subject: 'platform', assetCode, purpose: 'payout_due', type: 'expense' }
+}
+
+/**
+ * What custody holds, as `micro-wallet` maintains it — `(custody, <asset>, available)`
+ * (wallet/src/deposits.ts:627). The pool a burned network fee actually came out of.
+ */
+export function custodyAccount(assetCode: LedgerAssetCode): AccountRef {
+  return { subject: 'custody', assetCode, purpose: 'available', type: 'asset' }
+}
 
 export interface FeeDeps {
   readonly sql: Db
@@ -78,14 +142,14 @@ export async function bookFee(
         amount: fee,
         assetCode,
         sequence: 1,
-        account: { subject: 'platform', assetCode, purpose: 'fees', type: 'expense' },
+        account: feeExpenseAccount(assetCode),
       },
       {
         direction: 'credit',
         amount: fee,
         assetCode,
         sequence: 2,
-        account: { subject: 'custody', assetCode, purpose: 'treasury', type: 'asset' },
+        account: custodyAccount(assetCode),
       },
     ],
   })
