@@ -3,6 +3,8 @@
 The outbound chain service. Treasuries, sweeps, outbound transaction building, signing requests,
 broadcast, confirmation tracking and stuck adjudication.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 **This is where a bug loses a customer's money permanently.** Its central property is not a feature.
 
 ---
@@ -173,3 +175,10 @@ pnpm start
 `src/testsupport.ts`, an in-memory EVM node. The local Hearth testnet on `127.0.0.1:8545` may be
 read; it is never sent to. `scripts/upstreams.ts` stands up local stubs for identity, custody, the
 indexer, the ledger and a fake chain so the real service can be booted and driven by hand.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
