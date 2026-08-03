@@ -76,7 +76,7 @@ the one inside them, read at `latest` and never at `pending`. An unreachable nod
 |---|---|
 | `GET /livez` `GET /readyz` `GET /metrics` | Rule 4. |
 | `GET /v1/fees/:chain/:network/:asset` | The live fee, in the shape `wallet/src/settlement.ts` already declares. |
-| `POST /v1/events` | `wallet.withdrawal.requested`. HMAC verified **before the body is parsed**. |
+| `POST /v1/events` | `wallet.withdrawal.requested`. Signature verified **before the body is parsed**, under the contract's `cf-signature` scheme or wallet's pre-contract one — see `verifyInbound`. |
 | `GET /v1/outbound?state=stuck` | The queue an operator works from. |
 | `GET /v1/outbound/:id` | One transaction. The **nonce** is published; the **bytes** never are. |
 | `POST /v1/outbound/:id/adjudicate` | **The route that had to exist.** Administrator only. |
@@ -108,16 +108,29 @@ advances at confirmation and never at broadcast.
 
 ## Chains
 
-`ember` and `eth` are one implementation (`src/evm.ts`). `btc`, `sol` and `xrp` are **real objects on
-the real interface that throw `NotImplementedError` naming their phase** — not absent from the
-registry, not stubs returning zero. `chainFor` is total, so an unsupported chain is a classified,
-immediately-refunded build failure rather than a `TypeError` in a job handler.
+`ember` and `eth` are one implementation (`src/evm.ts`); `btc` is `src/bitcoin.ts` and `sol` is
+`src/solana.ts`. `xrp` is a **real object on the real interface that throws `NotImplementedError`
+naming its phase** — not absent from the registry, not a stub returning zero. `chainFor` is total, so
+an unsupported chain is a classified, immediately-refunded build failure rather than a `TypeError`
+in a job handler.
 
-BTC and SOL can currently be neither withdrawn nor swept, and that is **custody's** limitation and a
-deliberate one: `signBitcoin`'s sweep output policy is specified and not built, and `signSolana` has
-no transfer shape at all, so `gates.SWEEPABLE_FAMILIES` refuses a `deposit`-purpose address in both
-families before anything is decrypted. XRP is the opposite case — custody signs it today — and the
-gap is this service not yet speaking XRPL.
+A withdrawal and a sweep are built to **different shapes**, because custody applies a different
+signing policy to each: a sweep's destination is chosen by the vault and not by this service, and on
+Bitcoin that means a PSBT with no change output at all. `BuildInput.shape` is how the adapter is
+told which, and `worker.signingPolicy` returns it beside the purpose claimed to custody so the two
+cannot disagree.
+
+**XRP is the only chain left, and the gap is on THIS side** — custody signs it today, with a payment
+shape and a pinned sweep shape. What is missing here is an XRPL adapter: an XRP blob carries a
+`Sequence` and a `LastLedgerSequence` that must be committed beside the bytes to be adjudicable at
+all, and a half-implementation that signs without recording them produces payments no operator can
+ever settle.
+
+This section previously said BTC and SOL "can currently be neither withdrawn nor swept, and that is
+custody's limitation". **Every clause of that was wrong or went stale**, and the way each one failed
+is recorded at the head of `src/chains.ts` and `src/registry.ts` rather than deleted — the BTC claim
+misread a real gate that was conditioned on `purpose === 'deposit'`, and the SOL claim was true when
+written and was never re-checked.
 
 ## Running it
 
