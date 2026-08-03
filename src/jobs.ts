@@ -55,7 +55,12 @@ import { createRelay, type Db, type RelayDeps } from './outbox.ts'
 import { bookFee, unbookedFees, type FeeDeps } from './fees.ts'
 import { planSweep, type SweepDeps } from './sweeps.ts'
 import { driveChain, type WorkerDeps } from './worker.ts'
-import { NoTreasuryPinnedError, TreasuryDisagreementError } from './treasury.ts'
+import {
+  NoTreasuryPinnedError,
+  TreasuryDisagreementError,
+  registerTreasuryWithIndexer,
+  type TreasuryWatchDeps,
+} from './treasury.ts'
 import { NoEndpointError } from './registry.ts'
 
 export const RELAY_KIND = 'outbox.relay'
@@ -64,6 +69,13 @@ export const OUTBOUND_KIND = 'chain.outbound'
 /** Plans sweeps. Writes `planned` rows and never signs — see the note in the header. */
 export const SWEEP_KIND = 'chain.sweep'
 export const FEE_KIND = 'ledger.fee'
+/**
+ * Keeps the treasury inside the indexer's custody set, which is what makes swept coin visible to
+ * the platform's solvency check. `treasury.ts` on `registerTreasuryWithIndexer` carries the whole
+ * argument; the short version is that nothing had ever written a `treasury:` label, so every sweep
+ * shrank the aggregate and walked the estate towards a spurious withdrawal freeze.
+ */
+export const TREASURY_WATCH_KIND = 'treasury.watch'
 
 export interface Recurring {
   readonly kind: string
@@ -103,6 +115,22 @@ export function recurringFor(network: Network): readonly Recurring[] {
       // Slow, because a sweep is a response to a shortfall that a confirmation depth will take
       // minutes to clear anyway, and because each pass costs one balance probe per candidate.
       everyMs: 60_000,
+      payload: { chain, network },
+    })),
+    ...chains.map((chain) => ({
+      kind: TREASURY_WATCH_KIND,
+      key: `${chain}:${network}`,
+      // Five minutes, and the bound that matters is micro-ledger's reconciliation sweep at fifteen.
+      // An unregistered treasury is invisible to the custody aggregate, which reads as positive
+      // drift and freezes withdrawals — so the window must close well inside one reconciliation
+      // cycle. In steady state the pass makes ONE custody read and no indexer call at all, because
+      // `indexer_watched_key` already equals `address_key`; a shorter cadence would buy nothing but
+      // traffic, and a longer one would let a rotation go unnoticed across a whole reconciliation.
+      //
+      // **Its own kind rather than a step inside `chain.sweep`**, because a treasury holds coin
+      // whether or not sweeping is enabled: it is what every withdrawal is paid from, and
+      // `SWEEP_ENABLED=false` must not make the platform's largest custody position invisible.
+      everyMs: 300_000,
       payload: { chain, network },
     })),
     { kind: FEE_KIND, key: 'stream', everyMs: 30_000 },
@@ -165,6 +193,7 @@ export interface JobDeps {
   readonly worker: WorkerDeps
   readonly sweeps: SweepDeps
   readonly fees: FeeDeps
+  readonly treasuryWatch: TreasuryWatchDeps
 }
 
 /** How many rows one pass of a backlog job takes. Bounded so a pass fits inside its lease. */
@@ -259,6 +288,37 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
         return
       }
       throw err
+    }
+  })
+
+  /**
+   * Keep this chain's treasury inside the indexer's custody set.
+   *
+   * **The consequence of this job not running is a spurious withdrawal freeze**, arrived at
+   * honestly: an unregistered treasury is invisible to the aggregate `micro-ledger` reconciles
+   * against, the aggregate under-reports by the whole swept balance, that reads as positive drift,
+   * and positive drift freezes the asset. `treasury.ts` on `registerTreasuryWithIndexer` carries
+   * the argument for why this repository owns the repair rather than `micro-custody`.
+   *
+   * A failure is logged and left, exactly like the sweep handler's configuration refusals, for the
+   * same reason: an indexer outage or a grant that has not been provisioned yet must not
+   * dead-letter a recurring job. The row keeps `indexer_watched_key` null, so the next pass tries
+   * again and the work is never lost. What must NOT happen is the other thing — recording the
+   * attempt — and `registerTreasuryWithIndexer` writes only after the indexer has accepted.
+   */
+  runner.register<{ chain?: unknown; network?: unknown }>(TREASURY_WATCH_KIND, async (job) => {
+    const { chain, network } = scopeOf(job)
+    try {
+      const outcome = await registerTreasuryWithIndexer(deps.treasuryWatch, chain, network)
+      if (outcome.kind === 'registered') {
+        deps.metrics.increment('settlement_treasury_registrations_total', { chain })
+      }
+    } catch (err) {
+      deps.metrics.increment('settlement_treasury_registrations_failed_total', { chain })
+      deps.logger.error(
+        'the treasury is NOT in the indexer custody set — swept coin is invisible to reconciliation',
+        { chain, network, err },
+      )
     }
   })
 

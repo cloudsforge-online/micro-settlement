@@ -231,6 +231,10 @@ registerHandlers(runner, {
   worker,
   sweeps,
   fees: { sql: db, ledger, logger: logger.child({ component: 'fees' }), producer: SERVICE },
+  // What makes swept coin visible to the platform's solvency check. Built from `treasuries` rather
+  // than from `sweeps`, because the treasury must be registered whether or not `SWEEP_ENABLED` is
+  // set: it is the address every withdrawal is paid from either way.
+  treasuryWatch: { ...treasuries, indexer, logger: logger.child({ component: 'treasury-watch' }) },
 })
 await seedRecurring(queue, env.network)
 runner.start()

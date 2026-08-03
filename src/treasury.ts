@@ -30,9 +30,11 @@
  */
 
 import { parseAmount, type Network } from '@cloudsforge/contracts-chain'
+import type { Logger } from '@cloudsforge/telemetry'
 import { chainKey, custodyChainOf, custodyFamilyOf, type ChainId } from './chains.ts'
 import { chainFor } from './registry.ts'
 import type { CustodyClient } from './custodyclient.ts'
+import { treasuryLabel, type IndexerClient } from './indexerclient.ts'
 import type { Db, Tx } from './outbox.ts'
 
 /**
@@ -71,6 +73,11 @@ export interface Treasury {
   readonly custodyUserId: string
   readonly custodyOrderId: string
   readonly pinnedAt: Date | null
+  /**
+   * The `addressKey` this service last successfully registered with the indexer's custody set, or
+   * `null` if it never has. See migration 7 on why this is a key and not a timestamp.
+   */
+  readonly indexerWatchedKey: string | null
 }
 
 interface TreasuryRow {
@@ -84,6 +91,7 @@ interface TreasuryRow {
   readonly custody_user_id: string
   readonly custody_order_id: string
   readonly pinned_at: Date | null
+  readonly indexer_watched_key: string | null
 }
 
 function toTreasury(row: TreasuryRow): Treasury {
@@ -98,6 +106,7 @@ function toTreasury(row: TreasuryRow): Treasury {
     custodyUserId: row.custody_user_id,
     custodyOrderId: row.custody_order_id,
     pinnedAt: row.pinned_at,
+    indexerWatchedKey: row.indexer_watched_key,
   }
 }
 
@@ -154,7 +163,7 @@ export async function findTreasury(
 ): Promise<Treasury | null> {
   const rows = await sql<TreasuryRow[]>`
     select id, chain, network, address, address_key, custody_chain, custody_family,
-           custody_user_id, custody_order_id, pinned_at
+           custody_user_id, custody_order_id, pinned_at, indexer_watched_key
       from treasuries where chain = ${chain} and network = ${network}
   `
   const row = rows[0]
@@ -164,7 +173,7 @@ export async function findTreasury(
 export async function listTreasuries(sql: Db): Promise<readonly Treasury[]> {
   const rows = await sql<TreasuryRow[]>`
     select id, chain, network, address, address_key, custody_chain, custody_family,
-           custody_user_id, custody_order_id, pinned_at
+           custody_user_id, custody_order_id, pinned_at, indexer_watched_key
       from treasuries order by chain, network
   `
   return rows.map(toTreasury)
@@ -279,6 +288,119 @@ export async function assertSweepable(
     throw new TreasuryDisagreementError(chain, network, treasury.address, pin)
   }
   return { treasury, pin }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE TREASURY AS THE CHAIN SEES IT
+ * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+export interface TreasuryWatchDeps extends TreasuryDeps {
+  readonly indexer: IndexerClient
+  readonly logger: Logger
+}
+
+export type TreasuryWatchOutcome =
+  | { readonly kind: 'registered'; readonly address: string; readonly label: string }
+  | { readonly kind: 'already_registered'; readonly address: string }
+  | { readonly kind: 'no_treasury' }
+
+/**
+ * Tell the indexer that this chain's treasury is an address the platform holds.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE DEFECT THIS CLOSES: SWEPT COIN WAS INVISIBLE TO THE PLATFORM'S SOLVENCY CHECK.**
+ *
+ * `micro-indexer`'s custody aggregate — the number `micro-ledger` reconciles against, and the only
+ * thing that can prove the estate's economics are valid from the chain — sums `watched_addresses`
+ * whose label carries a platform prefix. `micro-wallet` registers every deposit address under
+ * `deposit:`. **Nothing had ever registered a `treasury:` address, in any repository.**
+ *
+ * And this service SWEEPS: it consolidates deposits out of addresses the aggregate counts and into
+ * one it does not. So the aggregate fell by the swept amount while the ledger's custody total was
+ * unchanged — a POSITIVE drift, which is the reading that says "the ledger claims coin the chain
+ * does not show", which FREEZES WITHDRAWALS. The direction was the safe one and the outcome was a
+ * certainty rather than a risk: consolidating deposits is what a treasury is for, so every
+ * successful sweep moved the estate closer to a freeze that nothing was wrong.
+ *
+ * ## Why this belongs to settlement and not to custody
+ *
+ * `micro-custody` mints and pins, holds the pin row, and is authoritative — it learns of a treasury
+ * FIRST. It is still the wrong owner:
+ *
+ *   * It builds no HTTP client to any peer and holds no `indexer:*` grant. Giving the service that
+ *     holds the estate's signing keys an outbound write credential to another service widens the
+ *     blast radius of the one process where that matters most.
+ *   * Its pin route is on the ADMIN surface, taken with an operator's token, and its own comment
+ *     records why the signing surface has no write route at all. Registration is not an operator's
+ *     act; it is bookkeeping that must happen whether or not an operator is present.
+ *   * This service already builds an indexer client, already carries `INDEXER_URL` and
+ *     `SETTLEMENT_SERVICE_TOKEN`, and already re-derives the pin on a leased schedule — so the
+ *     repair costs one grant and one job here, against a new outbound surface there.
+ *
+ * `micro-ledger` is excluded by construction: the aggregate exists precisely so the ledger never
+ * learns which addresses are custody's.
+ *
+ * ## Self-healing, and the two properties that make it so
+ *
+ * Nothing needs backfilling. `requireTreasury` ADOPTS the pin when this service has no row, so a
+ * treasury pinned long before this code existed is picked up on the first pass. And the aggregate
+ * reads `eth_getBalance` at a confirmed height rather than summing recorded movements
+ * (`indexer/src/custody.ts`), so registering an address that has been accumulating swept coin for
+ * months makes its **entire** balance visible on the very next observation — there is no history to
+ * replay.
+ *
+ * **A rotation is handled by storing the KEY that was registered rather than a timestamp.** During
+ * a rotation `requireTreasury` deliberately returns the OLD row, and registering the old address is
+ * right: it is where the balance still is. When the rotation completes, `upsertTreasury` moves
+ * `address_key` and `indexer_watched_key` no longer matches, so the new address registers on the
+ * next pass. **The old one is never un-watched**, and that is deliberate too — it is still an
+ * address the platform holds, it may still hold dust, and removing it from the set would recreate
+ * this very defect for whatever is left on it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export async function registerTreasuryWithIndexer(
+  deps: TreasuryWatchDeps,
+  chain: ChainId,
+  network: Network,
+): Promise<TreasuryWatchOutcome> {
+  let treasury: Treasury
+  try {
+    treasury = await requireTreasury(deps, chain, network)
+  } catch (err) {
+    // An operator has not pinned one yet. That is an omission, not a fault, and it must not
+    // dead-letter a recurring job — otherwise registration would be silently off for the life of
+    // the deployment rather than starting the moment they pin. Same argument as the sweep handler.
+    if (err instanceof NoTreasuryPinnedError) return { kind: 'no_treasury' }
+    throw err
+  }
+
+  if (treasury.indexerWatchedKey === treasury.addressKey) {
+    return { kind: 'already_registered', address: treasury.address }
+  }
+
+  const label = treasuryLabel(chain, network)
+  // The DISPLAY form, exactly as custody published it. The indexer canonicalises for itself, and
+  // sending the lowercase comparison key would put a spelling into `watched_addresses` that no
+  // operator comparing it against custody's pin would recognise.
+  await deps.indexer.watch(chain, network, treasury.address, label)
+
+  // Written only AFTER the call returned. `watch` throws on every failure precisely so this line is
+  // unreachable unless the indexer really did accept it — a row that recorded the attempt would
+  // report an invisible treasury as registered, which is the defect wearing the fix's clothes.
+  await deps.sql`
+    update treasuries
+       set indexer_watched_key = ${treasury.addressKey},
+           indexer_watched_at = now(),
+           updated_at = now()
+     where id = ${treasury.id}
+  `
+  deps.logger.info('treasury registered with the indexer custody set', {
+    chain,
+    network,
+    address: treasury.address,
+    label,
+  })
+  return { kind: 'registered', address: treasury.address, label }
 }
 
 /**

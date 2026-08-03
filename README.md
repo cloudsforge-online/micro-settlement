@@ -98,6 +98,33 @@ administrator-only precisely so that a signing credential can never influence th
 Nothing sweeps to an unpinned candidate, and nothing sweeps at all while the pin and the payout row
 disagree.
 
+### The treasury must be in the indexer's custody set, and until now it never was
+
+`micro-indexer` serves the number `micro-ledger` reconciles the platform's solvency against — Σ
+confirmed native balance over `watched_addresses` whose label carries a platform prefix, default
+`deposit:,treasury:`. `micro-wallet` writes the first for every deposit address. **Nothing in the
+estate had ever written the second**, and this service is the one that moves coin out of an address
+counted by that sum and into one that is not.
+
+So every sweep shrank the aggregate while the ledger's custody total stood still — a *positive*
+drift, which is the reading that **freezes withdrawals**. The direction was the safe one and the
+outcome was a certainty rather than a risk: consolidating deposits is what a treasury is for.
+
+`treasury.watch` is a leased recurring job, one per chain, every five minutes. It adopts the pin,
+registers the address under `treasury:<chain>:<network>`, and writes the `address_key` it
+registered — not a timestamp, because a rotation overwrites the key in place and a timestamp set
+for the old address would report the new treasury as done and leave it invisible for ever. It is
+its own kind rather than a step in `chain.sweep`, because a treasury holds coin whether or not
+`SWEEP_ENABLED` is set. `registerTreasuryWithIndexer` records the registration only after the
+indexer has accepted it; nothing is ever un-watched.
+
+No backfill is needed and none exists: the aggregate reads a live balance at a confirmed height
+rather than replaying movements, so a treasury that has been accumulating swept coin for months
+becomes fully visible on the next observation after it registers.
+
+This is why `INDEXER_SCOPES` carries `indexer:write`. The grant is derived from that constant by
+`deploy/scripts/derive-grants.mjs`; it is not added by hand.
+
 ## Sweeps
 
 Deposit address → the pinned treasury, as an `outbound_transaction` with `purpose: 'sweep'` on the

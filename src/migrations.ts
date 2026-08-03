@@ -355,6 +355,47 @@ export const MIGRATIONS: readonly Migration[] = [
         on outbound_adjudications (outbound_id, created_at desc);
     `,
   },
+  {
+    version: 7,
+    name: 'treasury-indexer-registration',
+    up: `
+      -- Which address this service has told the indexer to WATCH, and the defect it closes.
+      --
+      -- micro-indexer serves GET /v1/custody/:chain/:network/total — the number micro-ledger
+      -- reconciles the platform's solvency against — as the sum of confirmed native balances over
+      -- its "custody set". That set is 'watched_addresses' filtered by label prefix, default
+      -- 'deposit:,treasury:' (indexer/src/store.ts custodyAddresses).
+      --
+      -- micro-wallet registers every deposit address it assigns, with a 'deposit:' label. NOTHING
+      -- IN THE ESTATE HAS EVER WRITTEN A 'treasury:' LABEL — grepping the 58 repositories for a
+      -- caller of the watch route finds two, both wallet's, both 'deposit:'. And this service
+      -- SWEEPS deposits into the treasury: it moves coin out of an address the indexer counts and
+      -- into one it does not.
+      --
+      -- So every sweep made the aggregate smaller while the ledger's custody total stayed the
+      -- same. That is a POSITIVE drift — "the ledger claims coin the chain does not show" — which
+      -- is the reading that FREEZES WITHDRAWALS. The direction is the safe one and the failure was
+      -- certain: consolidating deposits, which is the whole point of a treasury, walked the estate
+      -- towards a spurious freeze one sweep at a time.
+      --
+      -- WHY A KEY AND NOT A TIMESTAMP. 'indexer_watched_at is null' would answer "has this row ever
+      -- been registered", and that is the wrong question across a rotation: a treasury rotates by
+      -- 'upsertTreasury' overwriting address and address_key in place, so a timestamp set for the
+      -- OLD address would report the NEW one as already registered and the new treasury would be
+      -- invisible for ever — the same defect, surviving the fix that was meant to end it. Storing
+      -- the key that was registered makes the predicate 'indexer_watched_key is distinct from
+      -- address_key', which is true again the instant a rotation lands and needs no reset anywhere.
+      alter table treasuries add column if not exists indexer_watched_key text;
+      alter table treasuries add column if not exists indexer_watched_at timestamptz;
+
+      -- The registration job's access path, and it is deliberately PARTIAL. In a healthy estate
+      -- every row is registered, so the index is empty and the job's query touches nothing; the
+      -- rows it does hold are exactly the work outstanding.
+      create index if not exists treasuries_unregistered_idx
+        on treasuries (chain, network)
+        where indexer_watched_key is null or indexer_watched_key is distinct from address_key;
+    `,
+  },
 ]
 
 /**

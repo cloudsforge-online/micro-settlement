@@ -110,6 +110,7 @@ describe('two concurrent workers on one chain', { skip }, () => {
         worker: deps.worker,
         sweeps: deps.sweeps,
         fees: { sql: deps.sql, ledger: deps.ledger, logger: quietLogger(), producer: 'settlement' },
+        treasuryWatch: deps.treasuryWatch,
       })
       return { queue, runner }
     })

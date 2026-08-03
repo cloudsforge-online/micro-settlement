@@ -38,7 +38,35 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  * refuses to boot on a name the registry does not have — or has deprecated, which `Scope` alone
  * would not have caught.
  */
-export const INDEXER_SCOPES: readonly LiveScope[] = Object.freeze(['indexer:read'])
+export const INDEXER_SCOPES: readonly LiveScope[] = Object.freeze(['indexer:read', 'indexer:write'])
+
+/**
+ * The label prefix that makes an address part of the indexer's CUSTODY SET.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS PREFIX IS A CROSS-SERVICE CONTRACT AND IT HAS NEVER BEEN HONOURED BY ANYBODY.**
+ *
+ * `GET /v1/custody/:chain/:network/total` is the number `micro-ledger` reconciles the platform's
+ * solvency against, and its set is `watched_addresses` filtered by
+ * `INDEXER_CUSTODY_LABEL_PREFIXES` — default `deposit:,treasury:`
+ * (`indexer/src/store.ts` `custodyAddresses`). `micro-wallet` writes the first prefix for every
+ * deposit address it assigns. **Nothing in fifty-eight repositories has ever written the second**,
+ * and this service is precisely the one that moves coin from an address carrying the first into an
+ * address that should carry the second.
+ *
+ * The consequence is not subtle and it is not rare: every sweep shrinks the aggregate while the
+ * ledger's custody total is unchanged, which is a POSITIVE drift, which FREEZES WITHDRAWALS. The
+ * safe direction, and a certainty rather than a risk — consolidating deposits is what a treasury is
+ * FOR.
+ *
+ * The suffix is the chain and network rather than an id, because the operator use of this label is
+ * reading `watched_addresses` beside a freeze and asking which set was summed. `micro-indexer`
+ * truncates a label to 200 characters (`indexer/src/server.ts`), which this cannot approach.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function treasuryLabel(chain: ChainId, network: Network): string {
+  return `treasury:${chain}:${network}`
+}
 
 export class IndexerUnavailableError extends Error {
   constructor(message: string) {
@@ -73,6 +101,18 @@ export interface IndexedTransaction {
 export interface IndexerClient {
   /** Null when the indexer has never seen this hash. Never an exception for a 404. */
   transaction(chain: ChainId, network: Network, hash: string): Promise<IndexedTransaction | null>
+  /**
+   * Register an address as one the platform holds, under `label`.
+   *
+   * Idempotent on the far side — the store does `on conflict (chain, network, address) do update
+   * set label = excluded.label` — so a re-registration is a no-op rather than a second row, and the
+   * job that calls this may safely run again after a partial failure.
+   *
+   * **Throws rather than returning a status.** A registration that silently failed is a treasury
+   * the aggregate cannot see, which is the defect this method exists to close; the caller must be
+   * able to tell "registered" from "tried", because it writes the former down.
+   */
+  watch(chain: ChainId, network: Network, address: string, label: string): Promise<void>
 }
 
 export interface IndexerClientOptions {
@@ -102,6 +142,25 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
         // other 4xx is a fault in the request itself and any 5xx is an outage; both become an
         // unavailability, which the caller treats as "ask the node" rather than as "not on chain".
         if (err instanceof HttpError && err.status === 404) return null
+        throw new IndexerUnavailableError(err instanceof Error ? err.message : String(err))
+      }
+    },
+
+    async watch(chain, network, address, label) {
+      try {
+        await client.request(`/v1/watch/${chain}/${network}/${encodeURIComponent(address)}`, {
+          method: 'POST',
+          body: { label },
+          // An upsert on the far side, so a retry is a no-op rather than a second row. Supplied
+          // because `HttpClient` will not retry a POST without one, and this POST is idempotent by
+          // construction — the whole request is derived from the pin.
+          idempotencyKey: `settlement:watch:${chain}:${network}:${address.toLowerCase()}`,
+        })
+      } catch (err) {
+        // No 404 case and no swallowing. Every failure here — a missing `indexer:write` grant, an
+        // indexer that is down, a 400 on an address the indexer will not accept — means the
+        // treasury is still invisible to the custody aggregate, and the caller must not record it
+        // as registered. It retries on the next pass of a leased job.
         throw new IndexerUnavailableError(err instanceof Error ? err.message : String(err))
       }
     },

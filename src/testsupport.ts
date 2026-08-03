@@ -47,6 +47,7 @@ import type { SweepDeps } from './sweeps.ts'
 import type { WorkerDeps } from './worker.ts'
 import type { AdjudicateDeps } from './adjudicate.ts'
 import type { WithdrawalDeps } from './withdrawals.ts'
+import type { TreasuryWatchDeps } from './treasury.ts'
 
 /* ------------------------------------------------------------------ RLP, for the fake signer */
 
@@ -341,6 +342,16 @@ export interface FakeIndexer extends IndexerClient {
   set(hash: string, transaction: IndexedTransaction | null): void
   setUnavailable(value: boolean): void
   readonly asked: readonly string[]
+  /**
+   * Every address this service has asked the indexer to WATCH, with the label it sent.
+   *
+   * Recorded rather than discarded because the label is the whole of the fix: an address registered
+   * under the wrong prefix is not in the custody set, and the failure would be indistinguishable
+   * from not registering at all — silent, and visible only as a withdrawal freeze weeks later.
+   */
+  readonly watched: readonly { readonly chain: string; readonly network: string; readonly address: string; readonly label: string }[]
+  /** Refuse the next `watch`, as a missing `indexer:write` grant or an outage would. */
+  setWatchFails(value: boolean): void
 }
 
 /**
@@ -351,9 +362,22 @@ export interface FakeIndexer extends IndexerClient {
 export function fakeIndexer(): FakeIndexer {
   const known = new Map<string, IndexedTransaction>()
   const asked: string[] = []
+  const watched: { chain: string; network: string; address: string; label: string }[] = []
   let unavailable = false
+  let watchFails = false
   return {
     asked,
+    watched,
+    setWatchFails(value) {
+      watchFails = value
+    },
+    async watch(chain, network, address, label) {
+      if (watchFails) {
+        const { IndexerUnavailableError } = await import('./indexerclient.ts')
+        throw new IndexerUnavailableError('the fake indexer refused the registration')
+      }
+      watched.push({ chain, network, address, label })
+    },
     set(hash, transaction) {
       if (transaction) known.set(hash.toLowerCase(), transaction)
       else known.delete(hash.toLowerCase())
@@ -533,6 +557,7 @@ export interface Harness {
   readonly sweeps: SweepDeps
   readonly withdrawals: WithdrawalDeps
   readonly treasuries: { readonly sql: Db; readonly custody: FakeCustody; readonly network: Network }
+  readonly treasuryWatch: TreasuryWatchDeps
 }
 
 export interface HarnessOptions {
@@ -590,6 +615,7 @@ export function harness(sql: postgres.Sql, options: HarnessOptions = {}): Harnes
     },
     withdrawals: { ...treasuries, producer: 'settlement' },
     treasuries,
+    treasuryWatch: { ...treasuries, indexer, logger },
   }
 }
 
