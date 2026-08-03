@@ -27,8 +27,12 @@ import {
   planBuildFailure,
 } from './withdrawals.ts'
 import { findByIdempotencyKey } from './outbound.ts'
+import { buildEnvelope } from './outbox.ts'
+import { driveChain } from './worker.ts'
 import {
   enabled,
+  estateRecipient,
+  fakeNode,
   harness,
   migrateTestDb,
   openDb,
@@ -247,5 +251,87 @@ describe('taking wallet.withdrawal.requested', { skip }, () => {
     const inbox = await sql`select count(*)::int as n from inbox`
     assert.equal(outbound[0]!.n, 0)
     assert.equal(inbox[0]!.n, 0, 'the event must stay redeliverable')
+  })
+
+  /**
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   * **A USER WHOSE WITHDRAWAL FAILS MUST BE REACHABLE, AND FOR THE LIFE OF THIS SERVICE NOBODY WAS.**
+   *
+   * `settlement.outbound.failed` is the ONLY event a failure produces — there is no
+   * `settlement.withdrawal.failed`, and `wallet.withdrawal.refunded` is unregistered and fires only
+   * on the refundable branch — and it went out as `{ withdrawalId, reason, refundable }`. Every
+   * reader that turns an event into something a person sees resolves the person from the payload, so
+   * the one event in this file whose subject is somebody's missing money named nobody at all.
+   *
+   * This runs the WHOLE path rather than the emitter: wallet's real event in, a real build failure,
+   * the real outbox row, the relay's own `buildEnvelope`, a JSON round trip, and only then the
+   * question — is the person whose money did not arrive reachable? Every earlier step is a place the
+   * user id can be lost, and `handleWithdrawalRequested` writing it onto the row is one of them.
+   *
+   * The JSON round trip is load-bearing. A field assigned `undefined` is indistinguishable from an
+   * absent one after it, which is exactly how "the payload has a userId" can be true in a test and
+   * false on the wire.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  it('tells the person their withdrawal failed — from wallet\'s event to the wire', async () => {
+    const payload = withdrawalPayload()
+    const destination = String(payload['destination'])
+    // Code at the destination: a permanent, refund-now refusal, and the shortest honest path from
+    // an accepted request to a failed withdrawal.
+    const node = fakeNode({ contracts: [destination] })
+    node.setBalance(TREASURY, 100n * 10n ** 18n)
+    const deps = harness(sql, { node })
+    deps.custody.pin('ember', 'testnet', TREASURY)
+
+    const decision = await handleWithdrawalRequested(deps.withdrawals, {
+      eventId: randomUUID(),
+      payload,
+      correlationId: 'req-1',
+    })
+    assert.equal(decision.kind, 'planned')
+
+    await driveChain(deps.worker, 'ember', 'testnet')
+    const row = await findByIdempotencyKey(deps.sql, 'wallet:withdrawal:1')
+    assert.equal(row?.state, 'failed', 'a destination with code at it is permanent, and refunds now')
+
+    const rows = await sql<
+      Array<{
+        id: string
+        topic: string
+        key: string
+        occurred_at: Date
+        producer: string
+        version: number
+        actor: string | null
+        correlation_id: string | null
+        payload: Record<string, unknown>
+      }>
+    >`
+      select id, topic, key, occurred_at, producer, version, actor, correlation_id, payload
+        from outbox where topic = 'settlement.outbound.failed'
+    `
+    assert.equal(rows.length, 1, 'a failed withdrawal must produce exactly one terminal event')
+
+    const delivered = JSON.parse(JSON.stringify(buildEnvelope(rows[0]!))) as {
+      topic: string
+      key: string
+      actor: string
+      payload: Record<string, unknown>
+    }
+    // **THE ASSERTION.** Not "the payload has a userId" — the restated readers of `activity` and
+    // `notify`, run on the delivered bytes, hand back the person wallet said this money belonged to.
+    assert.equal(
+      estateRecipient(delivered),
+      payload['userId'],
+      'the user whose withdrawal failed is told nothing at all — this event reaches nobody',
+    )
+    // And they are told WHICH failure it was. Nothing was signed here, so the money is genuinely
+    // coming back and a reader splitting on `refundable === true` says so.
+    assert.equal(delivered.payload['refundable'], true)
+    assert.equal(delivered.key, payload['withdrawalId'], 'keyed by the withdrawal, as the registry says')
+    // The recipient came from the payload and could not have come from anywhere else: the actor is
+    // the service, and the key is the withdrawal id.
+    assert.equal(delivered.actor, 'service:settlement')
+    assert.notEqual(payload['withdrawalId'], payload['userId'])
   })
 })

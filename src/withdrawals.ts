@@ -463,13 +463,69 @@ export function confirmedEvents(row: OutboundTransaction): readonly DomainEvent[
 }
 
 /**
- * The event a failed withdrawal produces, and the one field that matters.
+ * The event a failed withdrawal produces — the one event here whose subject is a person who has
+ * just lost a payment, and **for the life of this service it named nobody.**
+ *
+ * ## The defect: a failed withdrawal reached nobody at all
+ *
+ * The payload was `{ withdrawalId, reason, refundable }`. There is no `settlement.withdrawal.failed`
+ * topic, and `wallet.withdrawal.refunded` fires only on the refundable branch and is unregistered,
+ * so `settlement.outbound.failed` is the ONLY event a failure produces — and every reader in the
+ * estate that turns an event into something a person sees resolves the person from the payload:
+ *
+ *   - `activity/src/classify.ts:510` classifies this topic with `userId: userFromPayload`, which
+ *     reads `payload.userId` and requires a uuid. **Deliberately not `userFromKey`**, because the
+ *     key is the WITHDRAWAL id and is also a uuid — a key fallback would hand back a withdrawal id
+ *     as a user id: well-formed, queryable and wrong.
+ *   - `notify/src/catalogue.ts:120` reads `payload.user_id`/`payload.userId`, then the key only if
+ *     the registry keys the topic by `user_id` (it keys by `withdrawal_id`), then an `actor` of
+ *     `user:<id>`. This service's relay stamps `actor` as `service:settlement` when an emit names
+ *     none (`outbox.ts` `buildEnvelope`), and none of these three emits does — every one originates
+ *     in a leased job or an operator's adjudication, not in the user's own request. **So the
+ *     payload is the only route that exists, on both consumers.**
+ *
+ * `row.userId` is the same value `stuckEvents` already sends from the same row, and it has been on
+ * the row since planning time (`handleWithdrawalRequested` writes `userId: request.userId` from
+ * wallet's payload). It was present and simply not put on the wire.
+ *
+ * ## `refundable` decides WHICH of two facts this is, so it is never absent and never a guess
+ *
+ * "Your withdrawal failed and the money is coming back" and "your withdrawal failed and your money
+ * is held" are different messages to a reader, and every consumer splits them the same way — on
+ * `refundable === true`, with anything else meaning HELD:
+ *
+ *   - `wallet/src/server.ts:875` writes `refundable: payload['refundable'] === true` and
+ *     `wallet/src/withdrawals.ts:592` sends `!refundable` to `stuck` — funds held, operator paged.
+ *   - `activity/src/classify.ts:191` mirrors that `=== true` on purpose, so a feed entry can never
+ *     say "on its way back" while wallet is holding the money on the same screen.
+ *
+ * An ABSENT field is `undefined` to both, which reads as held — the safe direction, and the reason
+ * this payload must not leave it to chance. It cannot: `refundable` is a required `boolean`
+ * parameter, so "unknown" is unrepresentable at the call site, and all three callers pass `true`
+ * only where they hold a proof. `topics.test.ts` asserts the field survives a JSON round trip as a
+ * boolean, which is the only way an emitted-but-undefined field would show itself.
  *
  * `refundable` is stated by the CALLER rather than inferred here, because the two callers know two
  * different things: `markFailed` is only ever reached from `planned` or `building`, where nothing
- * was signed and a refund is unconditionally safe; `resolveStuck` reaches it only with a proof from
- * the chain. There is no third caller, and adding one that could not say which of those it was
- * would be the bug this whole service is arranged around.
+ * was signed and a refund is unconditionally safe; `resolveWithProof` reaches it only with a proof
+ * from the chain or from an adjudicating operator. There is no third caller, and adding one that
+ * could not say which of those it was would be the bug this whole service is arranged around.
+ *
+ * ## Why the repair is a FIELD and not a new `settlement.withdrawal.failed`
+ *
+ * `notify/src/catalogue.ts:851` records this gap as "the one entry in this table that records a
+ * notification the estate still owes somebody", says the envelope "names nobody notify could
+ * address", and ends "the user-facing twin does not exist … there is no settlement.withdrawal.failed
+ * … owned by micro-settlement". The obvious reading is that this service should invent that topic,
+ * and it is the wrong one: `completed` has a twin because the two carry DIFFERENT payloads for two
+ * different readers, whereas a `.failed` twin would carry one fact under two official names keyed
+ * the same way — which is exactly the `settlement.outbound.stuck` proposal `micro-contracts` refused
+ * (`topics.ts`, `AWAITING_REGISTRATION`), and the `wallet.deposit.credited` defect before it.
+ *
+ * What was actually missing was the recipient, and it is one field off the row this event is already
+ * built from. With it, `notify`'s `forUser` resolves a user here exactly as it does on
+ * `settlement.withdrawal.stuck`, so the rule it is owed can be written against the topic that
+ * already exists. That paragraph in notify's catalogue is the thing to revisit, not the registry.
  */
 export function failedEvents(
   row: OutboundTransaction,
@@ -481,7 +537,16 @@ export function failedEvents(
     {
       topic: SETTLEMENT_OUTBOUND_FAILED,
       key: row.sourceRef,
-      payload: { withdrawalId: row.sourceRef, reason, refundable },
+      payload: {
+        withdrawalId: row.sourceRef,
+        // THE FIELD WITHOUT WHICH THIS EVENT REACHES NOBODY. Sent exactly as `confirmedEvents` and
+        // `stuckEvents` send it — straight off the row, `null` if the row has none, never a guess
+        // from the key. A withdrawal row always has one; a null here is a row that predates the
+        // column being written, and unreachable is the correct answer for it.
+        userId: row.userId,
+        reason,
+        refundable,
+      },
       ...(row.correlationId ? { correlationId: row.correlationId } : {}),
     },
   ]

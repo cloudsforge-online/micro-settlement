@@ -416,6 +416,56 @@ export function fakeLedger(): FakeLedger {
   }
 }
 
+/* ------------------------------------------------------------------ the estate's readers */
+
+/**
+ * **The two user-facing consumers' recipient resolution, restated — a fake, like the others here.**
+ *
+ * It stands in for the same class of thing `fakeNode` and `fakeCustody` do: the far side of a seam
+ * this repository cannot import. It exists because "the payload has a `userId` field" is a much
+ * weaker assertion than "the person whose money did not arrive is reachable", and this service spent
+ * its whole life emitting a failure that satisfied no reader at all.
+ *
+ *   - `notify/src/catalogue.ts:120` (`userIdOf`) — `payload.user_id` or `payload.userId`; failing
+ *     that the envelope KEY, but only where the registry keys that topic by `user_id`; failing that
+ *     an `actor` of `user:<id>`.
+ *   - `activity/src/classify.ts:112` (`userFromPayload`) — `payload.userId`, and it must be a uuid.
+ *     Deliberately NOT the key: on `settlement.outbound.failed` the key is the withdrawal id and is
+ *     also a uuid, so a key fallback returns a well-formed, queryable, wrong "user".
+ *
+ * Both fallbacks are dead ends for everything this service emits — the registry keys its topics by
+ * `withdrawal_id`, `chain:network` and `sweep_source_id`, and `buildEnvelope` stamps
+ * `service:settlement` as the actor for every emit here, because a confirmation, a failure and a
+ * stuck page all originate in a leased job or an operator's adjudication rather than in the user's
+ * own request. **The payload is the only route that exists.**
+ *
+ * The uuid demand is applied to both, i.e. the stricter reader wins: an id notify would accept and
+ * activity would not is a person reached by one surface and not the other, which is not a state this
+ * service should be able to produce.
+ */
+const READER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export function estateRecipient(
+  envelope: {
+    readonly topic: string
+    readonly key: string
+    readonly actor: string
+    readonly payload: Record<string, unknown>
+  },
+  keyedByUserId: (topic: string) => boolean = () => false,
+): string | null {
+  const fromPayload = envelope.payload['user_id'] ?? envelope.payload['userId']
+  if (typeof fromPayload === 'string' && fromPayload.length > 0) {
+    return READER_UUID.test(fromPayload) ? fromPayload : null
+  }
+  if (keyedByUserId(envelope.topic)) return READER_UUID.test(envelope.key) ? envelope.key : null
+  if (envelope.actor.startsWith('user:')) {
+    const id = envelope.actor.slice('user:'.length)
+    return READER_UUID.test(id) ? id : null
+  }
+  return null
+}
+
 /* ------------------------------------------------------------------ the database harness */
 
 /**

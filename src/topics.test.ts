@@ -47,6 +47,7 @@ import {
 } from './outbox.ts'
 import { confirmedEvents, failedEvents, stuckEvents } from './withdrawals.ts'
 import { sweepCompletedEvents } from './sweeps.ts'
+import { estateRecipient } from './testsupport.ts'
 import {
   AWAITING_REGISTRATION,
   EMITTED_TOPICS,
@@ -241,6 +242,169 @@ test('every emitted event is keyed the way the registry declares', () => {
   }
   // A key may never be empty: `makeEvent` refuses one outright, because ordering would be undefined.
   for (const key of Object.values(emitted)) assert.ok(key.length > 0)
+})
+
+/* ------------------------------------------------------------------ who the event reaches */
+
+/**
+ * **THE PERSON, WHICH IS A DIFFERENT QUESTION FROM THE FIELD.**
+ *
+ * `settlement.outbound.failed` carried `{ withdrawalId, reason, refundable }` and no `userId`, and
+ * there is no `settlement.withdrawal.failed` — so a user whose withdrawal failed was told nothing at
+ * all, by anyone. Nothing broke and nothing logged: `activity` classified the topic and resolved a
+ * null user, `notify` recorded it as un-notifiable "for ever", and the event was delivered perfectly.
+ *
+ * A test that asserts `payload.userId === '…'` is weaker than this one and would have passed the day
+ * before the fix if the field were spelled `user` or `user_id` — or if the readers demanded a shape
+ * this service does not send. So the readers themselves are restated, in `testsupport.ts` beside the
+ * other fakes of the far side of a seam, and run here on the bytes the relay produces.
+ *
+ * `keyedByUserId` is answered from the REGISTRY rather than from a list here, because that fallback
+ * is `notify`'s and it is conditioned on the registry's `keyedBy` — a topic this service later keyed
+ * by a user would gain the fallback automatically, and none of today's does.
+ */
+const recipientOf = (envelope: {
+  readonly topic: string
+  readonly key: string
+  readonly actor: string
+  readonly payload: Record<string, unknown>
+}): string | null =>
+  estateRecipient(
+    envelope,
+    (topic) => isRegisteredTopic(topic) && topicSpec(topic).keyedBy === 'user_id',
+  )
+
+/**
+ * One emitted event, put through the outbox exactly as `emitInto` and the relay would.
+ *
+ * The column mapping is `emitInto`'s — `actor` and `correlation_id` are nullable columns and an emit
+ * that names neither stores nulls — and the JSON round trip is the wire. That round trip is not
+ * decoration: a field assigned `undefined` is INDISTINGUISHABLE from an absent one after it, which
+ * is precisely how "the payload has a userId" can be true in a test and false on the wire.
+ */
+function asDelivered(event: { topic: string; key: string; payload: Record<string, unknown>; actor?: string; correlationId?: string }) {
+  const envelope = buildEnvelope({
+    id: '018f0000-0000-7000-8000-0000000000c1',
+    topic: event.topic,
+    key: event.key,
+    occurred_at: new Date('2026-08-03T10:00:00.000Z'),
+    producer: SERVICE,
+    version: 1,
+    actor: event.actor ?? null,
+    correlation_id: event.correlationId ?? null,
+    payload: event.payload,
+  })
+  return JSON.parse(JSON.stringify(envelope)) as {
+    topic: string
+    key: string
+    actor: string
+    payload: Record<string, unknown>
+  }
+}
+
+test('the recipient reader can actually fail — yesterday\'s failed payload reaches nobody', () => {
+  // **The trap, stated first.** `activity`'s own end-to-end feed test sent the real
+  // `{ withdrawalId, reason, refundable }` payload with its classifier deliberately broken and
+  // stayed GREEN, because an absent field is null to every reader and null was the expected answer.
+  // The same shape is fed to this reader here, so the assertions below cannot be passing vacuously.
+  const yesterday = asDelivered({
+    topic: 'settlement.outbound.failed',
+    key: ROW_FIXTURE.sourceRef,
+    payload: { withdrawalId: ROW_FIXTURE.sourceRef, reason: 'because', refundable: true },
+  })
+  assert.equal(recipientOf(yesterday), null, 'the payload this service used to send named nobody')
+
+  // Nor is the key a way out, on the topic where it is most tempting: it is a uuid and it is the
+  // WITHDRAWAL, so a reader that fell back to it would return a withdrawal id as a person.
+  assert.equal(topicSpec('settlement.outbound.failed').keyedBy, 'withdrawal_id')
+  assert.notEqual(ROW_FIXTURE.sourceRef, ROW_FIXTURE.userId)
+
+  // Nor is the actor: every emit in this file leaves it unset and the relay stamps the service.
+  assert.equal(yesterday.actor, 'service:settlement')
+
+  // And a user id that is not a uuid is refused rather than half-accepted — `userFromPayload` would
+  // drop it while `userIdOf` would keep it, which is one surface reaching a person and one not.
+  const bare = asDelivered({
+    topic: 'settlement.outbound.failed',
+    key: ROW_FIXTURE.sourceRef,
+    payload: { withdrawalId: ROW_FIXTURE.sourceRef, userId: 'user-1', reason: 'r', refundable: true },
+  })
+  assert.equal(recipientOf(bare), null)
+})
+
+test('THE RULE: a failed withdrawal reaches the person whose money did not arrive', () => {
+  for (const event of failedEvents(ROW_FIXTURE, 'the payment could not be sent', true)) {
+    const delivered = asDelivered(event)
+    assert.equal(
+      recipientOf(delivered),
+      ROW_FIXTURE.userId,
+      'a user whose withdrawal failed is told nothing at all — this event names nobody',
+    )
+  }
+  // Not vacuous: `failedEvents` returns [] for a row of the wrong purpose or with no withdrawal id,
+  // and a loop over nothing asserts nothing.
+  assert.equal(failedEvents(ROW_FIXTURE, 'r', true).length, 1)
+})
+
+/**
+ * The other half of the same event, and the half that decides what the reader is TOLD.
+ *
+ * `activity` classifies this topic as TWO facts — `withdrawal.failed_refunded` and
+ * `withdrawal.failed_held` — because "the money is coming back" and "your money is held while we
+ * find out where it went" are different messages to a person. Both consumers split on
+ * `refundable === true` with everything else meaning HELD (`wallet/src/server.ts:875`,
+ * `activity/src/classify.ts:191`), so an absent or undefined field silently reads as held. It is the
+ * safe direction, and it is still not one this service is allowed to fall into by accident.
+ */
+test('the reader can tell refunded from held, and an absent flag reads as held', () => {
+  const refunded = asDelivered(failedEvents(ROW_FIXTURE, 'r', true)[0]!)
+  const held = asDelivered(failedEvents(ROW_FIXTURE, 'r', false)[0]!)
+
+  // Present on the WIRE, after the round trip, and a boolean — never `undefined`, which JSON drops
+  // and every reader then sees as "held" whatever this service meant.
+  for (const delivered of [refunded, held]) {
+    assert.ok(Object.hasOwn(delivered.payload, 'refundable'), 'refundable must survive the wire')
+    assert.equal(typeof delivered.payload['refundable'], 'boolean')
+  }
+  assert.equal(refunded.payload['refundable'] === true, true, 'this one is "the money is coming back"')
+  assert.equal(held.payload['refundable'] === true, false, 'this one is "your money is held"')
+
+  // And the two facts are distinguishable while still reaching the same person.
+  assert.equal(recipientOf(refunded), ROW_FIXTURE.userId)
+  assert.equal(recipientOf(held), ROW_FIXTURE.userId)
+})
+
+test('every terminal event about a withdrawal names the person it is about', () => {
+  // `.failed` was the only one missing, and stating it for all three is what stops the next one
+  // being added without a person on it. `settlement.sweep.completed` is deliberately absent: a sweep
+  // is an internal custody movement whose owner exists only in `sweep_sources`, and activity
+  // classifies it `internal` with `userId: () => null` for exactly that reason.
+  const events = [
+    ...confirmedEvents(ROW_FIXTURE),
+    ...failedEvents(ROW_FIXTURE, 'r', true),
+    ...stuckEvents(ROW_FIXTURE, 'r'),
+  ]
+  // Every user-facing topic is represented, so no arm of this can pass by being empty.
+  assert.deepEqual(
+    [...new Set(events.map((e) => e.topic))].sort(),
+    [
+      'settlement.outbound.confirmed',
+      'settlement.outbound.failed',
+      'settlement.withdrawal.completed',
+      'settlement.withdrawal.stuck',
+    ],
+  )
+  for (const event of events) {
+    const delivered = asDelivered(event)
+    // `settlement.outbound.confirmed` is wallet's deliberately narrow topic — a withdrawal id, a
+    // hash and a timestamp — and wallet resolves the user from its own row. It is the one whose
+    // reader is a service rather than a person, so it is exempted by name rather than by silence.
+    if (event.topic === 'settlement.outbound.confirmed') {
+      assert.equal(recipientOf(delivered), null, 'wallet reads this one, and it owns the user')
+      continue
+    }
+    assert.equal(recipientOf(delivered), ROW_FIXTURE.userId, `${event.topic} names nobody`)
+  }
 })
 
 test('a pending proposal disappears once contracts adopts it', () => {
