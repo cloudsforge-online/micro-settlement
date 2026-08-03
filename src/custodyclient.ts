@@ -41,6 +41,7 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { ChainFamily, Network } from '@cloudsforge/contracts-chain'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
  * The scopes this service's token must carry. Named here so the deploy can be derived from it.
@@ -50,8 +51,27 @@ import type { ChainFamily, Network } from '@cloudsforge/contracts-chain'
  * of the first can drain the treasury (a withdrawal must be payable to an address a user names),
  * while the second can only ever move money TOWARDS the pin. A deployment that does not sweep
  * should not be issued the second.
+ *
+ * ── THE ANNOTATION: AN OUTBOUND DEMAND, TYPED AGAINST THE REGISTRY ───────────────────────────
+ *
+ * `readonly LiveScope[]`, not `readonly string[]`. `service-ci.yml` proves that every scope a
+ * repository's route GATES demand is registered — the INBOUND direction. This constant is the
+ * other one: what this service PRESENTS to a peer. Nothing had ever checked it, which is how
+ * `micro-market` declared `policy:evaluate` and `micro-wallet` `custody:address` — neither ever
+ * a registry key — for the life of both services. `derive-grants.mjs` reads this into
+ * `IDENTITY_SERVICE_TOKEN_GRANTS`, and identity validates that list at import and REFUSES TO
+ * START on an unknown name (`identity/src/env.ts:141`): a dead identity container, so no tokens
+ * for anybody.
+ *
+ * `LiveScope` rather than `Scope` because `Scope` is `keyof typeof SCOPES` — every registered
+ * key, DEPRECATED ones included — and identity will not mint a deprecated scope either.
+ * `LiveScope = Exclude<Scope, DeprecatedScope>`, with `DeprecatedScope` computed FROM `SCOPES` by
+ * a conditional type over the `deprecated` field rather than hand-listed
+ * (`contracts/packages/auth/src/index.ts:507`), so it cannot drift from the registry. `Scope`
+ * keeps its wide meaning and this does not narrow it: a token arriving from anywhere may carry a
+ * scope that has since died, so reading is wide and demanding is narrow. This is demanding.
  */
-export const CUSTODY_SCOPES: readonly string[] = Object.freeze([
+export const CUSTODY_SCOPES: readonly LiveScope[] = Object.freeze([
   'custody:sign:treasury',
   'custody:sign:deposit',
   'custody:treasury:read',

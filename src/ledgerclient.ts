@@ -32,8 +32,18 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { Actor, EntryKind, LedgerAssetCode } from '@cloudsforge/contracts-money'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
-export const LEDGER_SCOPES: readonly string[] = Object.freeze(['ledger:post'])
+/**
+ * The scopes this service's token must carry to call this peer.
+ *
+ * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
+ * This is an outbound demand, `derive-grants.mjs` reads it into the estate's grant list, and
+ * identity
+ * refuses to boot on a name the registry does not have — or has deprecated, which `Scope` alone
+ * would not have caught.
+ */
+export const LEDGER_SCOPES: readonly LiveScope[] = Object.freeze(['ledger:post'])
 
 /** The ledger refused on the state of the world. Never retried with the same request. */
 export class LedgerRefusedError extends Error {
