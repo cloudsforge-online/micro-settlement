@@ -12,8 +12,8 @@
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, it } from 'node:test'
 import type postgres from 'postgres'
-import { findOutbound, planOutbound, type OutboundTransaction } from './outbound.ts'
-import { driveChain } from './worker.ts'
+import { findOutbound, planOutbound, type OutboundPurpose, type OutboundTransaction } from './outbound.ts'
+import { driveChain, signingPolicy } from './worker.ts'
 import { evmTxHash, legacyNonce } from './evm.ts'
 import {
   TEST_FEE,
@@ -27,6 +27,45 @@ import {
   skip,
   testAddress,
 } from './testsupport.ts'
+
+/**
+ * **The purpose claimed to custody and the shape the bytes are built for, pinned together.**
+ *
+ * No database, because this is exactly the kind of negative property that gets deleted when it
+ * needs one. A disagreement between these two is not a wrong answer anywhere — it is a 403 arriving
+ * after the row is committed and the chain's single outbound slot is claimed, with a message that
+ * deliberately will not say which field was wrong.
+ */
+describe('the signing policy a row selects', () => {
+  it('pairs every purpose with the custody purpose and the shape that policy wants', () => {
+    // `deposit` is the only purpose whose destination custody chooses, so it is the only one that
+    // gets the pinned shape — and on Bitcoin that shape is a PSBT with no change output at all.
+    assert.deepEqual(signingPolicy('sweep'), { custodyPurpose: 'deposit', shape: 'sweep' })
+    for (const purpose of ['withdrawal', 'treasury_move', 'deploy'] as const) {
+      assert.deepEqual(
+        signingPolicy(purpose),
+        { custodyPurpose: 'treasury', shape: 'payment' },
+        `${purpose} spends the treasury and names its own destination`,
+      )
+    }
+  })
+
+  it('never pairs a treasury purpose with a sweep shape, or the reverse', () => {
+    // The two failure directions are not symmetrical and that is why this is stated separately.
+    // `treasury` + `sweep` builds a change-free transaction for a withdrawal, which on Bitcoin pays
+    // the user's whole treasury balance minus a fee to one output. `deposit` + `payment` builds a
+    // change output custody refuses whole. The first loses money; the second costs a retry.
+    const purposes: readonly OutboundPurpose[] = ['withdrawal', 'sweep', 'treasury_move', 'deploy']
+    for (const purpose of purposes) {
+      const policy = signingPolicy(purpose)
+      assert.equal(
+        policy.shape === 'sweep',
+        policy.custodyPurpose === 'deposit',
+        `${purpose}: the shape and the custody purpose disagree`,
+      )
+    }
+  })
+})
 
 describe('the outbound worker', { skip }, () => {
   let sql: postgres.Sql

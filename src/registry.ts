@@ -16,38 +16,45 @@ import type { Network } from '@cloudsforge/contracts-chain'
 import { CHAIN_IDS, unimplementedChain, type ChainCall, type ChainId, type JsonRpc, type OutboundChain } from './chains.ts'
 import { evmChain } from './evm.ts'
 import { bitcoinChain } from './bitcoin.ts'
+import { solanaChain } from './solana.ts'
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE CLAIMS THIS TABLE USED TO MAKE ABOUT CUSTODY, AND HOW EACH ONE WAS WRONG
+ *
+ * Two entries here carried paragraphs about what custody would and would not sign. Both are now
+ * gone from the table because both chains are implemented, and both are summarised here instead —
+ * not out of sentiment, but because **this file is the second place in this repository where a
+ * confident claim about another repository turned out to be false**, and the pattern is worth
+ * being able to recognise the third time.
+ *
+ *   * **The BTC entry was wrong when it was written.** It said "neither a withdrawal nor a sweep
+ *     is possible until that policy exists", citing `SWEEPABLE_FAMILIES`. The gate it cited reads
+ *     `if (row.purpose === 'deposit' && !SWEEPABLE_FAMILIES.has(row.family))` — conditioned on
+ *     `deposit`, so it never touched a `treasury`-purpose withdrawal at all. The sentence was true
+ *     about sweeps and false about withdrawals, and it kept a gate item closed for the half that
+ *     was never blocked. It is a REAL LINE misread, not an invented one, which is the failure mode
+ *     to watch for: quoting the right file at the right line and drawing the wrong conclusion.
+ *   * **The SOL entry was true when it was written and went stale.** It said `signSolana` "refuses
+ *     SystemProgram::Transfer for EVERY purpose". It did. It does not now: `SolanaPolicy`
+ *     (custody/src/signing.ts:379) has three disjoint shapes and `transfer` and `sweep` are each
+ *     exactly one System Transfer. Nothing announced that; it was found by reading custody again.
+ *   * The SOL entry also said admitting SOL "would hand a signing credential createAccount over
+ *     every customer's SOL deposit key". That is now false in the OPPOSITE direction as well:
+ *     `solanaShapeForPurpose` gives `mint` — the only shape `createAccount` is reachable under —
+ *     to `deployer` alone, so a `treasury` address LOST `createAccount` in the same change that
+ *     gave it a transfer.
+ *
+ * What has NOT changed, and what this service therefore still does not ask for: SPL Transfer,
+ * Approve, SetAuthority, Burn and CloseAccount are refused under all three Solana shapes. A SOL
+ * withdrawal and a SOL sweep are each one System Transfer of native lamports and nothing else.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
 const CHAINS: Readonly<Record<ChainId, OutboundChain>> = Object.freeze({
   ember: evmChain('ember'),
   eth: evmChain('eth'),
-  // Implemented — see `bitcoin.ts`.
-  //
-  // The note that used to sit here said "neither a withdrawal nor a sweep is possible until that
-  // policy exists". **The withdrawal half of that was wrong**, and it kept a gate item closed that
-  // was never actually blocked. custody's `purposeGate` reads:
-  //
-  //     if (row.purpose === 'deposit' && !SWEEPABLE_FAMILIES.has(row.family)) refuse
-  //
-  // — conditioned on `deposit`. `SIGNABLE_PURPOSES` is {deployer, treasury, deposit} and
-  // `keys.ts` dispatches a bitcoin row to `signBitcoin` for any of them, which signs a PSBT to any
-  // destination it names. So a withdrawal from a `treasury`-purpose address has been signable all
-  // along. A SWEEP still is not, because a sweep spends a `deposit`-purpose address, and that
-  // remains blocked in custody rather than here — `bitcoin.buildSweepPsbt` builds the pinned-output
-  // PSBT that policy will want, so the remaining change is custody's alone.
   btc: bitcoinChain(),
-  sol: unimplementedChain(
-    'sol',
-    'phase 8 — Solana transfer shape',
-    'custody signs only the SPL mint-creation instruction set and explicitly refuses ' +
-      'SystemProgram::Transfer, which is what moving SOL is. There is no transfer shape and ' +
-      'therefore no sweep shape; admitting one without a pinned destination would hand a signing ' +
-      "credential createAccount over every customer's SOL deposit key. " +
-      'THE BLOCKER IS ENTIRELY CUSTODY-SIDE AND IT BLOCKS BOTH HALVES, unlike bitcoin where only ' +
-      'the sweep is gated: signSolana refuses a transfer for EVERY purpose, not just deposit, so ' +
-      'there is no treasury-purpose path either. Building an adapter here first would produce ' +
-      'bytes custody refuses at gate 2 — after a row is committed and money is in flight — which ' +
-      'is strictly worse than this refusal, which happens before anything is written.',
-  ),
+  sol: solanaChain(),
   xrp: unimplementedChain(
     'xrp',
     'phase 7 — XRPL adapter',

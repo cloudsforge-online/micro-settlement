@@ -8,43 +8,51 @@
  * not meant for. Custody resolves the chain id independently from the address's own row
  * (`gates.resolveChainId`) and refuses a disagreement, which is the second half of the same rule.
  *
- * ## Two implemented, three real and unimplemented
+ * ## Four implemented, one real and unimplemented
  *
  * `eth` and `ember` are one implementation — see `evm.ts`. An EMBER payment is a legacy (type 0)
  * EVM transaction against a standard `eth_*` endpoint, so the two differ only in which node answers
- * and which chain id the signature commits to.
+ * and which chain id the signature commits to. `btc` is `bitcoin.ts`; `sol` is `solana.ts`.
  *
- * `btc`, `sol` and `xrp` are **real objects on this interface that throw `NotImplementedError`
- * naming the phase that brings them**. They are not stubs that return zero, they are not absent
- * from the registry, and `chainFor('btc')` does not throw: a caller gets an object it can ask
- * `unimplementedPhase` of, which is what lets the withdrawal path classify the refusal as permanent
- * and refund from `pending` rather than retrying a chain that will never answer. A missing entry
- * would instead be a `TypeError` somewhere in the job handler.
+ * `xrp` is **a real object on this interface that throws `NotImplementedError` naming the phase
+ * that brings it**. It is not a stub that returns zero, it is not absent from the registry, and
+ * `chainFor('xrp')` does not throw: a caller gets an object it can ask `unimplementedPhase` of,
+ * which is what lets the withdrawal path classify the refusal as permanent and refund from
+ * `pending` rather than retrying a chain that will never answer. A missing entry would instead be a
+ * `TypeError` somewhere in the job handler.
  *
- * ## Why BTC and SOL cannot be withdrawn OR swept, stated once
+ * custody signs XRP today (`signXrp`, with both a `payment` and a pinned `sweep` shape), so the gap
+ * is entirely on this side — this service does not yet speak XRPL. It is unimplemented rather than
+ * half-built because an XRP blob carries a `Sequence` and a `LastLedgerSequence` that must be
+ * COMMITTED beside the bytes to be abandonable at all, and a half-implementation that signs without
+ * recording them produces withdrawals that can never be adjudicated. `outbound_transactions`
+ * already has the columns; the adapter is what is missing.
  *
- * It is not this service's limitation, it is custody's, and it is deliberate on custody's side:
+ * ## What this header used to say about BTC and SOL, and how each sentence was wrong
  *
- *   * **BTC** — `signBitcoin` requires a base64 PSBT, because a segwit signature commits to the
- *     VALUE of each input and only a PSBT carries it. The signer is ready; the OUTPUT POLICY is
- *     not. `signing.ts` specifies it (every output of a `deposit`-purpose PSBT must pay the pinned
- *     treasury, change included, and a PSBT carrying anything else is refused whole rather than
- *     partially signed) and does not build it, so `gates.SWEEPABLE_FAMILIES` refuses a
- *     `deposit`-purpose bitcoin address outright. That refusal is the fail-closed half of
- *     "specified, not built" and it must not be worked around from this side.
- *   * **SOL** — `signSolana` allows only the SPL mint-creation instruction set and explicitly
- *     refuses `SystemProgram::Transfer`, which is what moving SOL is. There is no transfer shape,
- *     so there is no sweep shape either. Admitting a `deposit`-purpose SOL address to custody's
- *     signer without one would hand a signing credential `createAccount` over every customer's SOL
- *     deposit key, and `createAccount` can park up to 50,000,000 lamports in a mint account that
- *     nothing in this estate can recover.
+ * A section titled "Why BTC and SOL cannot be withdrawn OR swept, stated once" sat here. **Every
+ * claim in it is now false and two of them were false the day they were written.** It is summarised
+ * rather than deleted, because the way a claim about another repository goes stale is the part
+ * worth keeping — this estate has now found the same failure four times.
  *
- * `xrp` is a third case and a different one: custody signs XRP today (`signXrp`, with both a
- * `payment` and a pinned `sweep` shape), so the gap is entirely on this side — this service does
- * not yet speak XRPL. It is here rather than half-built because an XRP blob carries a `Sequence`
- * and a `LastLedgerSequence` that must be COMMITTED beside the bytes to be abandonable at all, and
- * a half-implementation that signs without recording them produces withdrawals that can never be
- * adjudicated. `outbound_transactions` already has the columns; the adapter is what is missing.
+ *   * It said `signBitcoin`'s output policy was "specified, not built", so `SWEEPABLE_FAMILIES`
+ *     refused a bitcoin `deposit` address and therefore "neither a withdrawal nor a sweep is
+ *     possible". **The withdrawal half was never true.** The gate it named is conditioned on
+ *     `purpose === 'deposit'` (custody/src/gates.ts:150), so it never touched a `treasury`-purpose
+ *     withdrawal at all. `bitcoin.ts` corrected that half. The sweep half was true and is not any
+ *     more: `BitcoinPolicy` (custody/src/signing.ts:596) is built, and `SWEEPABLE_FAMILIES`
+ *     (custody/src/gates.ts:118) now names `bitcoin` and `solana`.
+ *   * It said `signSolana` "allows only the SPL mint-creation instruction set and explicitly
+ *     refuses `SystemProgram::Transfer`". That WAS true and is now false: `SolanaPolicy`
+ *     (custody/src/signing.ts:379) has three disjoint shapes, and `transfer` and `sweep` each admit
+ *     exactly one System Transfer of native lamports.
+ *   * It said admitting SOL would "hand a signing credential `createAccount` over every customer's
+ *     SOL deposit key". False in the opposite direction now: `createAccount` is reachable only
+ *     under the `mint` shape, which `solanaShapeForPurpose` gives to `deployer` alone — a
+ *     `treasury` address LOST it in the same change that gave it a transfer.
+ *
+ * SPL Transfer is still refused under all three Solana shapes, and this service asks for nothing
+ * that needs it: a SOL withdrawal and a SOL sweep are both one System Transfer of native lamports.
  */
 
 import {
@@ -272,6 +280,47 @@ export interface BuildInput {
   readonly value: bigint
   readonly fee: bigint
   readonly bounds: FeeBounds
+  /**
+   * Which of custody's signing policies these bytes will be judged under.
+   *
+   * **Not a label, and not derivable from the addresses on the row.** custody picks the policy from
+   * the PURPOSE of the address it is signing for, and the two policies want two DIFFERENT
+   * transactions. On Bitcoin the difference is a whole output: `assertSweepOutputs`
+   * (custody/src/signing.ts:722) refuses a PSBT any of whose outputs does not pay the pin, change
+   * included — and a change output back to the deposit address is exactly what the withdrawal
+   * builder produces. An adapter that could not tell the two apart would hand custody bytes it
+   * refuses AFTER the row is committed and this chain's single outbound slot is claimed.
+   *
+   * The two names are custody's own: `BitcoinPolicy` is `payment | sweep`. Solana's `transfer` and
+   * `sweep` differ only in whether the destination is checked against the pin, so `payment` maps
+   * onto `transfer` there. `treasury_move` and `deploy` are `payment`: they spend the treasury and
+   * name their own destination.
+   */
+  readonly shape: OutboundShape
+}
+
+/** @see BuildInput.shape */
+export type OutboundShape = 'payment' | 'sweep'
+
+/**
+ * What a sweep of ONE address would move, and what moving it would cost.
+ *
+ * Its own method on the adapter rather than `estimateFee` plus `spendableBalance`, because on a
+ * UTXO chain those two cannot answer it between them: the fee of a Bitcoin sweep depends on how
+ * many coins the address holds, and `estimateFee` is not given an address. The sweeper used to
+ * quote a one-input two-output spend for every sweep on every chain, and that number is not an
+ * estimate for a Bitcoin sweep, it is a wrong answer — a three-coin address quoted at
+ * `vsizeOf(1, 2)` pays 141 satoshis of fee for a 246-vbyte transaction, which is 0.57 sat/vB and
+ * below the relay floor, so no node would forward it.
+ *
+ * `null` means "not worth sweeping right now", which is the ordinary recurring state of almost
+ * every deposit address, and it is never an error.
+ */
+export interface SweepQuote {
+  /** What the TREASURY gains: the whole spendable balance, less the fee. */
+  readonly value: bigint
+  /** Burned on top of it. `value + fee` is everything that leaves the address. */
+  readonly fee: bigint
 }
 
 /**
@@ -307,9 +356,12 @@ export interface UnsignedOutbound {
   /**
    * The chain height past which these bytes can NEVER be applied, as a decimal string.
    *
-   * Null for EVM, and that is not an omission: a signed legacy transaction is valid for ever and
-   * only a consumed nonce retires it, which is why the EVM half of the death proof is about the
-   * nonce and not about time. XRP's `LastLedgerSequence` goes here when that adapter lands.
+   * Null for EVM and for Bitcoin, and that is not an omission: a signed legacy transaction is
+   * valid for ever and only a consumed nonce retires it, and a signed Bitcoin transaction is valid
+   * for ever unless its inputs are spent — which is why both of those death proofs are about a
+   * resource being taken rather than about time. **Solana is the one chain here where a signature
+   * genuinely expires**, and this carries its `lastValidBlockHeight`. XRP's `LastLedgerSequence`
+   * goes here too when that adapter lands.
    */
   readonly expiry: string | null
 }
@@ -381,6 +433,8 @@ export interface OutboundChain {
   estimateFee(call: ChainCall, bounds: FeeBounds): Promise<bigint>
   /** What this address could send right now, net of anything the chain will not let it move. */
   spendableBalance(call: ChainCall, address: string): Promise<bigint>
+  /** What sweeping THIS address would move and cost, or null when it is not worth it. */
+  sweepQuote(call: ChainCall, address: string, bounds: FeeBounds): Promise<SweepQuote | null>
 
   /** Ask the node everything, and assemble the payload custody will sign. Signs nothing. */
   build(call: ChainCall, input: BuildInput): Promise<UnsignedOutbound>
@@ -421,6 +475,10 @@ export function unimplementedChain(
     estimateFee: () => Promise.reject(new NotImplementedError(chain, phase, 'fee estimation', detail)),
     spendableBalance: () =>
       Promise.reject(new NotImplementedError(chain, phase, 'balance reading', detail)),
+    // Rejects rather than answering `null`. `null` is this method's word for "not worth sweeping
+    // right now", which the sweeper treats as ordinary and silent — so an unimplemented chain that
+    // answered it would look exactly like a chain with nothing to sweep, for ever, at no log level.
+    sweepQuote: () => Promise.reject(new NotImplementedError(chain, phase, 'sweep quoting', detail)),
     build: () => Promise.reject(new NotImplementedError(chain, phase, 'transaction building', detail)),
     txIdOf: () => refuse('transaction id derivation'),
     broadcast: () => Promise.reject(new NotImplementedError(chain, phase, 'broadcast', detail)),

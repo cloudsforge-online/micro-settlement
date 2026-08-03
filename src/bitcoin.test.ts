@@ -12,12 +12,19 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import * as bitcoin from 'bitcoinjs-lib'
 import {
+  CUSTODY_MAX_PAYMENT_SAT_PER_VB,
+  CUSTODY_MAX_SWEEP_SAT_PER_VB,
+  MAX_SAT_PER_VB,
+  MAX_SWEEP_SAT_PER_VB,
+  assertUnderCustodysCeiling,
   bitcoinChain,
   btcToSats,
   buildSweepPsbt,
+  finalisedVsize,
   networkFor,
   satsToBtc,
   selectCoins,
+  sweepPlan,
   validateAddress,
   vsizeOf,
   type Utxo,
@@ -278,13 +285,135 @@ describe('coin selection', () => {
 /* ------------------------------------------------------------------ the adapter */
 
 describe('the registry', () => {
-  it('now reports btc as implemented, and sol as not', () => {
+  it('reports btc as implemented', () => {
     assert.equal(chainFor('btc').unimplementedPhase, null)
     assert.ok(implementedChains().includes('btc'))
-    // SOL is blocked in CUSTODY for both halves — signSolana refuses a transfer for every purpose
-    // — so an adapter here would produce bytes refused after money is in flight.
-    assert.notEqual(chainFor('sol').unimplementedPhase, null)
-    assert.match(String(chainFor('sol').unimplementedPhase), /Solana transfer shape/)
+  })
+})
+
+/* ------------------------------------------------------------------ the two fee ceilings */
+
+/**
+ * **THE RELATIONSHIP BETWEEN THIS SERVICE'S CEILINGS AND CUSTODY'S, PINNED AS A NUMBER.**
+ *
+ * Two constants that happen to differ is not a policy. What has to hold is that **no PSBT this
+ * service is willing to build can be one custody refuses**, and that is not implied by
+ * `900 < 1000`: custody measures the fee rate of the FINALISED transaction and this service quotes
+ * against `vsizeOf`, which is an upper bound on the size and therefore a LOWER bound on the rate.
+ * A smaller transaction is a higher rate, so the margin has to cover the difference.
+ *
+ * So the assertion is the worst case, computed rather than asserted about: build at this service's
+ * own ceiling, measure the rate custody would see, and require it to stay under custody's for every
+ * input count a real sweep could have. Move either constant and this goes red.
+ */
+describe('the fee ceilings', () => {
+  it('is a mirror of custody and the mirror is strictly tighter', () => {
+    assert.ok(
+      MAX_SWEEP_SAT_PER_VB < CUSTODY_MAX_SWEEP_SAT_PER_VB,
+      'this service must refuse before custody does, so the failure is a build failure not a 403',
+    )
+    assert.ok(MAX_SAT_PER_VB < CUSTODY_MAX_PAYMENT_SAT_PER_VB)
+    // The sweep ceiling is the tighter of the two here, as it is in custody: pinning the
+    // destination stops a sweep paying an attacker, it does not stop it paying the miner, and the
+    // credential that bounds it is the one this service holds.
+    assert.ok(MAX_SWEEP_SAT_PER_VB < MAX_SAT_PER_VB)
+    assert.ok(CUSTODY_MAX_SWEEP_SAT_PER_VB < CUSTODY_MAX_PAYMENT_SAT_PER_VB)
+  })
+
+  it('leaves margin for every input count a real sweep could have', () => {
+    for (let inputs = 1; inputs <= 50; inputs += 1) {
+      // What this service would charge at its own ceiling, for the size it predicts.
+      const fee = MAX_SWEEP_SAT_PER_VB * BigInt(vsizeOf(inputs, 1))
+      // What custody would measure, against the SMALLEST transaction it could finalise.
+      const psbt = new bitcoin.Psbt({ network: TESTNET })
+      for (let i = 0; i < inputs; i += 1) {
+        psbt.addInput({
+          hash: Buffer.alloc(32, i + 1),
+          index: 0,
+          witnessUtxo: { script: bitcoin.address.toOutputScript(TREASURY, TESTNET), value: 1_000_000 },
+        })
+      }
+      psbt.addOutput({ address: OTHER, value: 1_000 })
+      const measured = fee / BigInt(finalisedVsize(psbt))
+      assert.ok(
+        measured < CUSTODY_MAX_SWEEP_SAT_PER_VB,
+        `${inputs} inputs: custody would measure ${measured} sat/vB against its ${CUSTODY_MAX_SWEEP_SAT_PER_VB} ceiling`,
+      )
+    }
+  })
+
+  it('clamps the node quote to the ceiling for the SHAPE, not one ceiling for both', async () => {
+    // A node quoting 0.05 BTC/kvB is 5,000 sat/vB. A payment is clamped to this service's payment
+    // ceiling; a sweep is clamped five times tighter, because that is where custody's bites.
+    const node = fakeBtcNode({ utxos: [utxo(1, 500_000_000n)], feerate: 0.05 })
+    const payment = await chainFor('btc').estimateFee(node.call, BOUNDS)
+    assert.equal(payment, MAX_SAT_PER_VB * BigInt(vsizeOf(1, 2)))
+
+    const sweep = await chainFor('btc').sweepQuote(node.call, TREASURY, BOUNDS)
+    assert.ok(sweep)
+    assert.equal(sweep.fee, MAX_SWEEP_SAT_PER_VB * BigInt(vsizeOf(1, 1)))
+  })
+
+  /**
+   * The guard that reproduces custody's own comparison, exercised on a PSBT that trips it.
+   *
+   * The clamp above means production cannot normally reach here — which is exactly why it is worth
+   * having, and exactly why it has to be shown firing. A check whose only evidence is that it never
+   * fires is a check nobody knows works.
+   */
+  it('refuses a PSBT whose finalised fee rate reaches custody ceiling', () => {
+    const psbt = new bitcoin.Psbt({ network: TESTNET })
+    psbt.addInput({
+      hash: Buffer.alloc(32, 1),
+      index: 0,
+      witnessUtxo: { script: bitcoin.address.toOutputScript(TREASURY, TESTNET), value: 10_000_000 },
+    })
+    psbt.addOutput({ address: OTHER, value: 1_000 })
+    const vsize = BigInt(finalisedVsize(psbt))
+
+    // Exactly at the ceiling. custody compares `>=`, so this is refused and one satoshi per vbyte
+    // less is not — the boundary is the whole point.
+    assert.throws(
+      () => assertUnderCustodysCeiling(psbt, CUSTODY_MAX_SWEEP_SAT_PER_VB * vsize, 'sweep'),
+      FeeOutOfBandError,
+    )
+    assert.doesNotThrow(() =>
+      assertUnderCustodysCeiling(psbt, (CUSTODY_MAX_SWEEP_SAT_PER_VB - 1n) * vsize, 'sweep'),
+    )
+    // The payment ceiling is the looser one, so the same fee passes under it.
+    assert.doesNotThrow(() =>
+      assertUnderCustodysCeiling(psbt, CUSTODY_MAX_SWEEP_SAT_PER_VB * vsize, 'payment'),
+    )
+    assert.throws(
+      () => assertUnderCustodysCeiling(psbt, CUSTODY_MAX_PAYMENT_SAT_PER_VB * vsize, 'payment'),
+      FeeOutOfBandError,
+    )
+  })
+
+  it('measures against the SMALLEST transaction custody could finalise, never the largest', () => {
+    // `vsizeOf` is an upper bound and `finalisedVsize` must not exceed it — if it did, the guard
+    // would be dividing by a bigger number than custody uses and would let through a PSBT custody
+    // refuses, which is the one direction that must not happen.
+    for (const [inputs, outputs] of [
+      [1, 1],
+      [2, 1],
+      [3, 2],
+      [7, 1],
+    ] as const) {
+      const psbt = new bitcoin.Psbt({ network: TESTNET })
+      for (let i = 0; i < inputs; i += 1) {
+        psbt.addInput({
+          hash: Buffer.alloc(32, i + 1),
+          index: 0,
+          witnessUtxo: { script: bitcoin.address.toOutputScript(TREASURY, TESTNET), value: 1_000_000 },
+        })
+      }
+      for (let o = 0; o < outputs; o += 1) psbt.addOutput({ address: OTHER, value: 1_000 })
+      assert.ok(
+        finalisedVsize(psbt) <= vsizeOf(inputs, outputs),
+        `${inputs}-in ${outputs}-out: the guard must divide by no more than the quote assumed`,
+      )
+    }
   })
 })
 
@@ -297,6 +426,7 @@ describe('build', () => {
       value: 600_000n,
       fee: 100_000n,
       bounds: BOUNDS,
+          shape: 'payment',
     })
 
     assert.equal(typeof unsigned.payload, 'string', 'signBitcoin takes a base64 PSBT, not an object')
@@ -344,6 +474,7 @@ describe('build', () => {
           value: 100_000n,
           fee: 10n,
           bounds: BOUNDS,
+          shape: 'payment',
         }),
       FeeOutOfBandError,
     )
@@ -359,6 +490,7 @@ describe('build', () => {
           value: 1_000n,
           fee: 100_000n,
           bounds: BOUNDS,
+          shape: 'payment',
         }),
       AddressError,
     )
@@ -376,6 +508,7 @@ describe('build', () => {
           value: 100_000n,
           fee: 100_000n,
           bounds: BOUNDS,
+          shape: 'payment',
         }),
       InsufficientTreasuryError,
     )
@@ -391,6 +524,7 @@ describe('the transaction id', () => {
       value: 100_000n,
       fee: 100_000n,
       bounds: BOUNDS,
+          shape: 'payment',
     })
     const tx = finaliseLikeCustody(String(unsigned.payload))
     const hex = tx.toHex()
@@ -444,6 +578,7 @@ describe('broadcast', () => {
       value: 100_000n,
       fee: 100_000n,
       bounds: BOUNDS,
+          shape: 'payment',
     })
     const tx = finaliseLikeCustody(String(unsigned.payload))
     const hex = tx.toHex()
@@ -564,6 +699,114 @@ describe('the sweep PSBT', () => {
     assert.equal(await buildSweepPsbt(node.call, TREASURY, OTHER, 50n, 3), null)
     // And nothing to sweep is the same answer, not an error.
     assert.equal(await buildSweepPsbt(fakeBtcNode({}).call, TREASURY, OTHER, 10n, 3), null)
+  })
+})
+
+/* ------------------------------------------------------------------ the sweep, through build */
+
+/**
+ * **THE DEFECT THIS SECTION EXISTS FOR.**
+ *
+ * `buildSweepPsbt` was written, exported and tested, and had no production caller. `build` served
+ * both purposes, so a sweep went through the coin selector — which exists to produce CHANGE. Two
+ * things followed and neither had a test:
+ *
+ *   1. With one coin it produced a single output paying the pin, by accident, and worked.
+ *   2. With two or more it threw `InsufficientTreasuryError`, because `selectCoins` cannot cover a
+ *      one-input two-output fee out of a target that has already had that fee subtracted. So every
+ *      Bitcoin sweep of an address holding more than one coin failed, for ever, at info level.
+ *
+ * And had it not thrown, the change output would have been refused WHOLE by custody's
+ * `assertSweepOutputs` — after the row was committed and the chain's single outbound slot claimed.
+ */
+describe('build, for a sweep', () => {
+  it('takes EVERY coin and creates no change output, on an address holding several', async () => {
+    const node = fakeBtcNode({ utxos: [utxo(1, 500_000n), utxo(2, 300_000n), utxo(3, 90_000n)] })
+    const quote = await chainFor('btc').sweepQuote(node.call, TREASURY, BOUNDS)
+    assert.ok(quote, 'three coins well above the fee is worth sweeping')
+
+    const unsigned = await chainFor('btc').build(node.call, {
+      from: TREASURY,
+      to: OTHER,
+      value: quote.value,
+      fee: quote.fee,
+      bounds: BOUNDS,
+      shape: 'sweep',
+    })
+    const psbt = bitcoin.Psbt.fromBase64(String(unsigned.payload), { network: TESTNET })
+
+    assert.equal(psbt.inputCount, 3, 'a sweep takes every coin')
+    // The check custody's `assertSweepOutputs` makes: EVERY output pays the pin, change included.
+    // One output is how that is satisfied by construction.
+    assert.equal(psbt.txOutputs.length, 1, 'a change output would be refused whole by custody')
+    assert.equal(psbt.txOutputs[0]?.address, OTHER)
+    assert.equal(BigInt(psbt.txOutputs[0]?.value ?? 0), quote.value)
+    assert.equal(quote.value + quote.fee, 890_000n, 'everything that left is accounted for')
+    psbt.data.inputs.forEach((input, i) => {
+      assert.ok(input.witnessUtxo, `input ${i} has no witnessUtxo`)
+      assert.equal(input.sighashType, bitcoin.Transaction.SIGHASH_ALL)
+    })
+  })
+
+  it('quotes the fee for the size a sweep really is, not for a one-input two-output spend', async () => {
+    // The number that was wrong. `estimateFee` quotes `vsizeOf(1, 2)` = 141 vbytes; a three-coin
+    // sweep is `vsizeOf(3, 1)` = 246. At the relay floor of 1 sat/vB the old quote would have paid
+    // 141 satoshis for a 246-vbyte transaction — 0.57 sat/vB, which no node forwards.
+    const node = fakeBtcNode({ utxos: [utxo(1, 500_000n), utxo(2, 300_000n), utxo(3, 90_000n)] })
+    const quote = await chainFor('btc').sweepQuote(node.call, TREASURY, BOUNDS)
+    assert.ok(quote)
+    assert.equal(quote.fee, 1n * BigInt(vsizeOf(3, 1)))
+    assert.ok(quote.fee > 1n * BigInt(vsizeOf(1, 2)), 'the sweep fee must exceed the generic quote')
+  })
+
+  it('refuses when the coins have moved since the row was quoted', async () => {
+    // The row carries the value and fee `planSweep` computed from a UTXO set; if the set has
+    // changed, the difference between the two numbers is a fee nobody agreed to pay. Refused rather
+    // than silently re-quoted, exactly as a withdrawal's locked fee is.
+    const node = fakeBtcNode({ utxos: [utxo(1, 500_000n), utxo(2, 300_000n)] })
+    const quote = await chainFor('btc').sweepQuote(node.call, TREASURY, BOUNDS)
+    assert.ok(quote)
+    const richer = fakeBtcNode({ utxos: [utxo(1, 500_000n), utxo(2, 300_000n), utxo(4, 40_000n)] })
+    await assert.rejects(
+      chainFor('btc').build(richer.call, {
+        from: TREASURY,
+        to: OTHER,
+        value: quote.value,
+        fee: quote.fee,
+        bounds: BOUNDS,
+        shape: 'sweep',
+      }),
+      FeeOutOfBandError,
+    )
+  })
+
+  it('refuses when there is nothing at depth to sweep', async () => {
+    const node = fakeBtcNode({ utxos: [utxo(1, 500_000n, 1)] })
+    assert.equal(await chainFor('btc').sweepQuote(node.call, TREASURY, BOUNDS), null)
+    await assert.rejects(
+      chainFor('btc').build(node.call, {
+        from: TREASURY,
+        to: OTHER,
+        value: 100n,
+        fee: 100n,
+        bounds: BOUNDS,
+        shape: 'sweep',
+      }),
+      InsufficientTreasuryError,
+    )
+  })
+
+  it('does the arithmetic in ONE place, so the quote and the build cannot drift', () => {
+    // `sweepPlan` is what both call. A second copy of this arithmetic is a build that refuses a row
+    // it quoted itself.
+    const utxos = [utxo(1, 500_000n), utxo(2, 300_000n)]
+    const plan = sweepPlan(utxos, 7n, 546n)
+    assert.ok(plan)
+    assert.equal(plan.fee, 7n * BigInt(vsizeOf(2, 1)))
+    assert.equal(plan.value + plan.fee, 800_000n)
+    assert.equal(plan.inputs.length, 2)
+    assert.equal(sweepPlan([], 7n, 546n), null)
+    assert.equal(sweepPlan([utxo(1, 600n)], 7n, 546n), null, 'a dust-sized sweep destroys value')
   })
 })
 

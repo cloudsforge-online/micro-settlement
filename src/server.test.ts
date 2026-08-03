@@ -151,12 +151,12 @@ describe('the HTTP surface', { skip }, () => {
   })
 
   it('answers 501 for a chain with no adapter, naming the phase', async () => {
-    // SOL rather than BTC: BTC has an adapter now. SOL is blocked in CUSTODY — signSolana refuses
-    // SystemProgram::Transfer for every purpose — so it is still the honest example of a chain
-    // this service will not build a transaction for.
-    const { status, body } = await call('/v1/fees/sol/testnet/SOL', { token: 'wallet' })
+    // XRP, and it is the last one. BTC and SOL both had adapters withheld on the strength of
+    // claims about custody that turned out to be wrong or stale; XRP is the honest case, where
+    // custody signs it today and this service does not speak XRPL.
+    const { status, body } = await call('/v1/fees/xrp/testnet/XRP', { token: 'wallet' })
     assert.equal(status, 501)
-    assert.match(String((body['error'] as Record<string, unknown>)['message']), /Solana transfer shape/)
+    assert.match(String((body['error'] as Record<string, unknown>)['message']), /XRPL adapter/)
   })
 
   it('refuses an asset that does not settle on the named chain', async () => {

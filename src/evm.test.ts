@@ -193,6 +193,7 @@ describe('building an EVM transfer', () => {
       value: 10n ** 17n,
       fee: TEST_FEE,
       bounds: TEST_BOUNDS,
+      shape: 'payment',
     })
     // custody's `signEvm` refuses "a field this service does not sign", so an extra key here is a
     // 403 rather than a wider signature. This asserts the allowlist exactly.
@@ -218,7 +219,7 @@ describe('building an EVM transfer', () => {
 
   it('reads the nonce at PENDING, not latest', async () => {
     const { node, call: c } = call()
-    await chain.build(c, { from: TREASURY, to: ALICE, value: 1n, fee: TEST_FEE, bounds: TEST_BOUNDS })
+    await chain.build(c, { from: TREASURY, to: ALICE, value: 1n, fee: TEST_FEE, bounds: TEST_BOUNDS, shape: 'payment' })
     const nonceCall = node.calls.find((k) => k.method === 'eth_getTransactionCount')
     // A latest nonce ignores anything already in the mempool, which produces a second transaction
     // with the same nonce — at most one of which can ever be mined.
@@ -231,7 +232,7 @@ describe('building an EVM transfer', () => {
     await assert.rejects(
       chain.build(
         { network: 'testnet', rpc: node.rpc },
-        { from: TREASURY, to: contract, value: 1n, fee: TEST_FEE, bounds: TEST_BOUNDS },
+        { from: TREASURY, to: contract, value: 1n, fee: TEST_FEE, bounds: TEST_BOUNDS, shape: 'payment' },
       ),
       UnsupportedDestinationError,
     )
@@ -246,6 +247,7 @@ describe('building an EVM transfer', () => {
         value: 1n,
         fee: TEST_FEE,
         bounds: TEST_BOUNDS,
+        shape: 'payment',
       }),
       UnsupportedDestinationError,
     )
@@ -258,7 +260,7 @@ describe('building an EVM transfer', () => {
     await assert.rejects(
       chain.build(
         { network: 'testnet', rpc: node.rpc },
-        { from: TREASURY, to: ALICE, value: 10n ** 17n, fee: TEST_FEE, bounds: TEST_BOUNDS },
+        { from: TREASURY, to: ALICE, value: 10n ** 17n, fee: TEST_FEE, bounds: TEST_BOUNDS, shape: 'payment' },
       ),
       InsufficientTreasuryError,
     )
@@ -271,7 +273,7 @@ describe('building an EVM transfer', () => {
     await assert.rejects(
       chain.build(
         { network: 'testnet', rpc: node.rpc },
-        { from: TREASURY, to: ALICE, value: 1n, fee: TEST_FEE, bounds: TEST_BOUNDS },
+        { from: TREASURY, to: ALICE, value: 1n, fee: TEST_FEE, bounds: TEST_BOUNDS, shape: 'payment' },
       ),
       /not the 7412 this build is pinned to/,
     )
@@ -280,7 +282,7 @@ describe('building an EVM transfer', () => {
   it('refuses an out-of-band fee before asking the node anything at all', async () => {
     const { node, call: c } = call()
     await assert.rejects(
-      chain.build(c, { from: TREASURY, to: ALICE, value: 1n, fee: 10n ** 19n, bounds: TEST_BOUNDS }),
+      chain.build(c, { from: TREASURY, to: ALICE, value: 1n, fee: 10n ** 19n, bounds: TEST_BOUNDS, shape: 'payment' }),
       FeeOutOfBandError,
     )
     assert.equal(node.calls.length, 0)

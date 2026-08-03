@@ -359,6 +359,21 @@ export function evmChain(chain: ChainId): OutboundChain {
       return balanceAt(call, address)
     },
 
+    /**
+     * An EVM sweep moves the whole balance less the one fee it costs to move it.
+     *
+     * There is no per-address component to an EVM fee — a value transfer is 21,000 gas whatever the
+     * account holds — so this is `estimateFee` and `spendableBalance` put together, and it exists
+     * here only because Bitcoin's cannot be. Null below the fee, because a sweep that costs more
+     * than it moves destroys value.
+     */
+    async sweepQuote(call, address, bounds) {
+      const fee = gasPriceBid(quantity(await call.rpc('eth_gasPrice', []), 'eth_gasPrice'), bounds, chain) * TRANSFER_GAS
+      const balance = await balanceAt(call, address)
+      const value = balance - fee
+      return value > 0n ? { value, fee } : null
+    },
+
     async build(call, input): Promise<UnsignedOutbound> {
       // Refused BEFORE the node is asked anything: a fee this service will not build for is a
       // permanent property of the row, and finding that out after four round trips is four round

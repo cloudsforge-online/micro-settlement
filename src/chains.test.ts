@@ -78,11 +78,11 @@ describe('the registry', () => {
     }
   })
 
-  it('implements ember, eth and btc today', () => {
-    // BTC joined when `bitcoin.ts` landed. It is here rather than with the unimplemented three
-    // because custody's `purposeGate` only gates `deposit`-purpose bitcoin, so a withdrawal from a
-    // `treasury`-purpose address has always been signable — see the note in `registry.ts`.
-    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'eth'])
+  it('implements ember, eth, btc and sol today', () => {
+    // BTC joined when `bitcoin.ts` landed and SOL when `solana.ts` did. Both were once refused for
+    // reasons about custody that this repository had written down and that are no longer true —
+    // see the block at the head of `registry.ts` for how each claim was wrong.
+    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'eth', 'sol'])
   })
 
   /**
@@ -93,7 +93,7 @@ describe('the registry', () => {
    * adapter reaches production.
    */
   it('throws NotImplementedError from every method of an unimplemented chain', async () => {
-    for (const chain of ['sol', 'xrp'] as const) {
+    for (const chain of ['xrp'] as const) {
       const adapter = chainFor(chain)
       assert.ok(adapter.unimplementedPhase, `${chain} must name its phase`)
       assert.throws(() => adapter.canonicalise('x'), NotImplementedError)
@@ -104,8 +104,12 @@ describe('the registry', () => {
       const bounds = { minGasPriceWei: 0n, maxGasPriceWei: 0n, maxFeeWei: 0n }
       await assert.rejects(adapter.estimateFee(call, bounds), NotImplementedError)
       await assert.rejects(adapter.spendableBalance(call, 'x'), NotImplementedError)
+      // Rejects rather than answering `null`. `null` is this method's word for "not worth sweeping
+      // right now", which the sweeper treats as ordinary and silent — so an unimplemented chain
+      // answering it would look exactly like a chain with nothing to sweep, for ever.
+      await assert.rejects(adapter.sweepQuote(call, 'x', bounds), NotImplementedError)
       await assert.rejects(
-        adapter.build(call, { from: 'a', to: 'b', value: 1n, fee: 1n, bounds }),
+        adapter.build(call, { from: 'a', to: 'b', value: 1n, fee: 1n, bounds, shape: 'payment' }),
         NotImplementedError,
       )
       await assert.rejects(adapter.broadcast(call, '0x00'), NotImplementedError)
@@ -118,28 +122,28 @@ describe('the registry', () => {
   })
 
   /**
-   * BTC and SOL name custody's refusal, not a shrug.
+   * XRP names whose limitation it is, and it is THIS service's.
    *
-   * Their absence is not this service running behind: custody has no output policy for a BTC sweep
-   * and no transfer shape at all for SOL, and its `SWEEPABLE_FAMILIES` gate refuses a
-   * `deposit`-purpose address in both families before anything is decrypted. XRP is the opposite
-   * case — custody signs it today — and the message says so.
+   * That is the whole content of the remaining entry and it is worth asserting: BTC and SOL were
+   * both unimplemented on the strength of claims about CUSTODY, and both claims turned out to be
+   * either wrong when written or stale by the time they were read. XRP is the opposite case —
+   * custody signs it today, with a payment shape and a pinned sweep shape — so the message must not
+   * blame custody for it.
    */
-  it('names why each unimplemented chain is unimplemented', () => {
+  it('names whose limitation the one unimplemented chain is', () => {
     assert.equal(chainFor('btc').unimplementedPhase, null, 'btc is implemented')
-    assert.match(chainFor('sol').unimplementedPhase!, /Solana transfer shape/)
+    assert.equal(chainFor('sol').unimplementedPhase, null, 'sol is implemented')
     assert.match(chainFor('xrp').unimplementedPhase!, /XRPL adapter/)
-    for (const chain of ['sol'] as const) {
-      const message = (() => {
-        try {
-          chainFor(chain).canonicalise('x')
-          return ''
-        } catch (err) {
-          return (err as Error).message
-        }
-      })()
-      assert.match(message, /custody/, 'the refusal must name whose limitation it is')
-    }
+    const message = (() => {
+      try {
+        chainFor('xrp').canonicalise('x')
+        return ''
+      } catch (err) {
+        return (err as Error).message
+      }
+    })()
+    assert.match(message, /custody already signs XRP/, 'the gap is on this side and must say so')
+    assert.match(message, /this side/)
   })
 
   it('classifies an unimplemented chain as a permanent, immediately refunded build failure', () => {

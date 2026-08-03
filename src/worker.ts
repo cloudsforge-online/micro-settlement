@@ -37,7 +37,7 @@
 
 import type { Network } from '@cloudsforge/contracts-chain'
 import type { Logger, Metrics } from '@cloudsforge/telemetry'
-import { custodyChainOf, custodyFamilyOf, type ChainId } from './chains.ts'
+import { custodyChainOf, custodyFamilyOf, type ChainId, type OutboundShape } from './chains.ts'
 import { chainFor } from './registry.ts'
 import {
   callFor,
@@ -56,6 +56,7 @@ import {
   resolveWithProof,
   stuckDeadlinePassed,
   type OutboundDeps,
+  type OutboundPurpose,
   type OutboundTransaction,
 } from './outbound.ts'
 import { treasuryBinding } from './treasury.ts'
@@ -145,14 +146,16 @@ async function start(deps: WorkerDeps, row: OutboundTransaction): Promise<StartO
       // than a round trip. `NotImplementedError` is what the classifier keys on.
       await adapter.estimateFee(call, deps.bounds)
     }
+    const binding = await bindingFor(deps, row)
     unsigned = await adapter.build(call, {
       from: row.fromAddress,
       to: row.toAddress,
       value: row.amount,
       fee: row.fee,
       bounds: deps.bounds,
+      // Read off the SAME object that carries the purpose claimed to custody. See `signingPolicy`.
+      shape: binding.shape,
     })
-    const binding = await bindingFor(deps, row)
     const result = await deps.custody.sign({
       address: row.fromAddress,
       chain: custodyChainOf(row.chain),
@@ -205,20 +208,58 @@ async function start(deps: WorkerDeps, row: OutboundTransaction): Promise<StartO
   return 'signed'
 }
 
+/**
+ * **THE PURPOSE CLAIMED TO CUSTODY AND THE SHAPE THE BYTES ARE BUILT FOR ARE ONE DECISION.**
+ *
+ * They are returned together, from one function, because a disagreement between them is not a bug
+ * that shows up as a wrong answer — it is a 403 arriving after the row is committed and this
+ * chain's single outbound slot is claimed, with a message that deliberately will not say which
+ * field was wrong.
+ *
+ * custody picks its signing policy from the PURPOSE of the address (`solanaShapeForPurpose`,
+ * `bitcoinShapeForPurpose`), so `deposit` gets the pinned-destination shape and nothing else does.
+ * On Bitcoin that is a whole output's difference: a `sweep` PSBT may carry no change output at all,
+ * and the withdrawal builder's change output back to the deposit address is refused WHOLE.
+ *
+ * Pure, and separate from the row lookup, so the mapping can be asserted without a database — the
+ * same reason custody's own gates live away from its route.
+ */
+export function signingPolicy(purpose: OutboundPurpose): {
+  readonly custodyPurpose: 'treasury' | 'deposit'
+  readonly shape: OutboundShape
+} {
+  return purpose === 'sweep'
+    ? { custodyPurpose: 'deposit', shape: 'sweep' }
+    : // A withdrawal, a treasury move and a deploy all spend the TREASURY and all name their own
+      // destination, which is custody's `payment`/`transfer` shape. There is deliberately no
+      // fallback to `sweep` here, unlike custody's own `…ShapeForPurpose`: custody fails toward the
+      // shape it cannot resolve a pin for, and therefore signs nothing, whereas this service
+      // failing toward `sweep` would build a change-free PSBT for a withdrawal and silently pay the
+      // user's whole balance minus a fee to a single output. Failing toward `payment` produces
+      // bytes custody REFUSES, which is the direction that costs a retry rather than money.
+      { custodyPurpose: 'treasury', shape: 'payment' }
+}
+
 /** Which binding custody will demand be restated for the address this row spends from. */
 async function bindingFor(
   deps: WorkerDeps,
   row: OutboundTransaction,
-): Promise<{ readonly purpose: 'treasury' | 'deposit'; readonly userId: string; readonly orderId: string }> {
-  if (row.purpose === 'sweep') {
+): Promise<{
+  readonly purpose: 'treasury' | 'deposit'
+  readonly shape: OutboundShape
+  readonly userId: string
+  readonly orderId: string
+}> {
+  const policy = signingPolicy(row.purpose)
+  if (policy.custodyPurpose === 'deposit') {
     const binding = await sweepBindingFor(deps, row)
-    return { purpose: 'deposit', userId: binding.userId, orderId: binding.orderId }
+    return { purpose: policy.custodyPurpose, shape: policy.shape, ...binding }
   }
-  // A withdrawal or a treasury move spends the treasury, whose binding is DERIVED from the chain
-  // and network alone — the same derivation custody used when it minted the address, so the two are
-  // byte-identical without either side remembering anything.
+  // The treasury's binding is DERIVED from the chain and network alone — the same derivation
+  // custody used when it minted the address, so the two are byte-identical without either side
+  // remembering anything.
   const binding = treasuryBinding(row.chain, row.network)
-  return { purpose: 'treasury', userId: binding.userId, orderId: binding.orderId }
+  return { purpose: policy.custodyPurpose, shape: policy.shape, ...binding }
 }
 
 /**

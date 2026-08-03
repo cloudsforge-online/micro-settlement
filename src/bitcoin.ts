@@ -67,7 +67,9 @@ import {
   type DeathVerdict,
   type FeeBounds,
   type OutboundChain,
+  type OutboundShape,
   type OutboundStatus,
+  type SweepQuote,
   type UnsignedOutbound,
 } from './chains.ts'
 
@@ -289,15 +291,160 @@ export function selectCoins(
   throw new InsufficientTreasuryError('btc', total, target)
 }
 
+export function totalOf(utxos: readonly Utxo[]): bigint {
+  return utxos.reduce((sum, utxo) => sum + utxo.sats, 0n)
+}
+
+export interface SweepPlan extends SweepQuote {
+  readonly inputs: readonly Utxo[]
+}
+
+/**
+ * **THE ONE PLACE A BITCOIN SWEEP'S ARITHMETIC IS DONE**, used by the quote and by the build.
+ *
+ * They must agree to the satoshi. `planSweep` writes `value` and `fee` onto the row from the quote
+ * and the build is handed both back; if the two computed the same thing two ways they would
+ * eventually disagree by a rounding, and the build would refuse a row it had itself quoted. So
+ * there is one function and both call it.
+ *
+ * EVERY coin and ONE output, which is what makes custody's output policy satisfiable at all: a
+ * sweep leaves nothing behind, so there is no change output that could pay anywhere but the pin.
+ * The fee is therefore not chosen, it is the remainder — `value` is set so the remainder comes out
+ * at the quoted rate for the size the transaction will really be, `vsizeOf(n, 1)`, and not for the
+ * one-input two-output spend `estimateFee` quotes.
+ *
+ * Null rather than a throw for "not worth it yet", because that is the ordinary recurring state of
+ * almost every deposit address and a throw would make it an incident.
+ */
+export function sweepPlan(
+  utxos: readonly Utxo[],
+  feeRatePerVb: bigint,
+  dustThreshold: bigint,
+): SweepPlan | null {
+  if (utxos.length === 0) return null
+  const total = totalOf(utxos)
+  const fee = feeRatePerVb * BigInt(vsizeOf(utxos.length, 1))
+  const value = total - fee
+  // Sweeping less than it costs to sweep destroys value, and an output at or below the dust
+  // threshold costs more to spend than it holds — it would manufacture a coin nothing can ever
+  // economically move again.
+  if (value <= dustThreshold) return null
+  return { inputs: utxos, value, fee }
+}
+
+/**
+ * The virtual size custody will measure, taken from the SMALLEST transaction it could finalise
+ * this PSBT into.
+ *
+ * The smallest, deliberately, because a smaller transaction is a HIGHER fee rate and this feeds a
+ * ceiling. `vsizeOf` is an upper bound on the size and would therefore be a LOWER bound on the
+ * rate, which is the wrong direction for a guard: it would let through exactly the PSBT that
+ * measures over the ceiling once the real witnesses are on it.
+ *
+ * A P2WPKH witness is a DER signature plus its sighash byte and a 33-byte compressed pubkey. 71
+ * bytes is the signature length a low-S DER encoding almost always produces; 72 is what bitcoinjs
+ * assumes when it predicts one. Shorter ones exist — a leading zero byte drops out of `r` or `s`
+ * about once in 256 — and they are covered by the margin between this service's ceiling and
+ * custody's rather than by pretending to model them. `bitcoin.test.ts` measures that margin.
+ */
+export function finalisedVsize(psbt: bitcoin.Psbt): number {
+  const tx = new bitcoin.Transaction()
+  psbt.txInputs.forEach((input, i) => {
+    tx.addInput(input.hash, input.index, input.sequence)
+    tx.setWitness(i, [Buffer.alloc(71, 1), Buffer.alloc(33, 2)])
+  })
+  for (const output of psbt.txOutputs) tx.addOutput(output.script, output.value)
+  return tx.virtualSize()
+}
+
+/**
+ * Refuse a PSBT custody's own ceiling would refuse. See the ceiling block below.
+ *
+ * The comparison is `>=` and the divisor is the finalised size, because that is character for
+ * character what `signBitcoin` does: `psbt.getFeeRate()` is `Math.floor(fee / virtualSize)` and it
+ * refuses at `feeRate >= ceiling` (custody/src/signing.ts:700). Reproducing the comparison rather
+ * than approximating it is the point — an approximation is a second policy, and the one thing that
+ * must not happen here is this service believing a PSBT acceptable that custody will not sign.
+ */
+export function assertUnderCustodysCeiling(
+  psbt: bitcoin.Psbt,
+  fee: bigint,
+  shape: OutboundShape,
+): void {
+  const ceiling = shape === 'sweep' ? CUSTODY_MAX_SWEEP_SAT_PER_VB : CUSTODY_MAX_PAYMENT_SAT_PER_VB
+  const vsize = BigInt(finalisedVsize(psbt))
+  if (fee / vsize >= ceiling) {
+    throw new FeeOutOfBandError('btc', 'above', fee, ceiling * vsize)
+  }
+}
+
 /* ------------------------------------------------------------------ the adapter */
 
 const DEFAULT_DUST = 546n
 /** Core's own relay floor. Below it a transaction is not forwarded at all. */
 const MIN_RELAY_SAT_PER_VB = 1n
-/** A ceiling, not an estimate. Above this a node has quoted something absurd. */
-const MAX_SAT_PER_VB = 5_000n
 /** How many blocks `estimatesmartfee` is asked to target. */
 const FEE_TARGET_BLOCKS = 3
+
+/* ------------------------------------------------------------------ the two fee ceilings */
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * **CUSTODY'S CEILINGS ARE THE AUTHORITY. THESE ARE A MIRROR OF THEM, AND THE MIRROR IS TIGHTER.**
+ *
+ * There is one number here that must not be got wrong and it is a RELATIONSHIP, not a value.
+ * custody's `signBitcoin` sets `psbt.setMaximumFeeRate(ceiling)` and then refuses outright at
+ * `feeRate >= ceiling` (custody/src/signing.ts:700), with two ceilings of its own:
+ *
+ *     MAX_SWEEP_FEE_RATE   = 1_000   (custody/src/signing.ts:623)
+ *     MAX_PAYMENT_FEE_RATE = 5_000   (custody/src/signing.ts:624)
+ *
+ * Until this block existed, this service carried ONE ceiling, `MAX_SAT_PER_VB = 5_000`, applied to
+ * both shapes. Two things were wrong with that and they are different failures:
+ *
+ *   1. **A sweep this service considered acceptable was refused at signing.** custody binds first
+ *      and its sweep ceiling is five times tighter, so during any event above 1000 sat/vB every
+ *      sweep would have been built, committed, and 403'd — a `shape_refused`, which
+ *      `planBuildFailure` classifies as permanent, from a service the operator does not run.
+ *   2. **Equality was not safe even at the payment ceiling.** custody compares `>=` against the
+ *      fee rate of the FINALISED transaction, and this service quotes against `vsizeOf`, which is
+ *      an UPPER bound on the size (`bitcoin.test.ts` pins it at within two vbytes). A smaller
+ *      transaction is a HIGHER rate, so a PSBT built at exactly 5,000 arrives at custody measuring
+ *      5,000 or a little more, and is refused.
+ *
+ * **SO: TWO AUTHORITIES, NOT ONE, AND THE TIGHTER ONE IS BOTH DOCUMENTED AND ASSERTED.** Collapsing
+ * them into one number is not available, and it is worth saying why rather than leaving it to look
+ * like duplication. custody's ceiling cannot move here: a signing rule enforced only by its caller
+ * is a signing rule an attacker bypasses by reaching the signer directly, which is the argument
+ * custody's own header makes about the policy service, and the credential this ceiling bounds
+ * (`custody:sign:deposit`) is precisely the one this service holds. This service's ceiling cannot
+ * move there either: refusing at BUILD time is what turns a 403 with a committed row and a claimed
+ * chain slot into a classified build failure that releases the row before anything is signed. Two
+ * gates, the same rule, one of them fails cheap and the other fails safe.
+ *
+ * The relationship is asserted, not asserted about: `bitcoin.test.ts` computes the worst-case rate
+ * custody can measure for a transaction this service built at its own ceiling, for input counts
+ * from one to fifty, and requires every one of them to stay under custody's. Move either constant
+ * and that test goes red.
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/** custody/src/signing.ts:623. Restated so the test can compare, never used as this service's own. */
+export const CUSTODY_MAX_SWEEP_SAT_PER_VB = 1_000n
+/** custody/src/signing.ts:624. Same. */
+export const CUSTODY_MAX_PAYMENT_SAT_PER_VB = 5_000n
+
+/**
+ * This service's own ceilings. Strictly below custody's, by more than the vsize slack can consume.
+ *
+ * A ceiling, not an estimate: above these a node has quoted something absurd and the answer is to
+ * wait for a cheaper block rather than to burn a customer's deposit on miner revenue. A sweep is a
+ * background job with nobody waiting, so stalling one is self-healing in a way a burn is not; a
+ * withdrawal has a user waiting, which is why its ceiling is the looser of the two here exactly as
+ * it is in custody.
+ */
+export const MAX_SWEEP_SAT_PER_VB = 900n
+export const MAX_SAT_PER_VB = 4_500n
 
 export interface BitcoinChainOptions {
   readonly dustThreshold?: bigint
@@ -307,8 +454,15 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
   const dust = options.dustThreshold ?? DEFAULT_DUST
   const spec = chainSpec(assetOf('btc'))
 
-  /** sat/vB from the node, bounded. */
-  async function feeRate(call: ChainCall): Promise<bigint> {
+  /**
+   * sat/vB from the node, bounded by the ceiling for THIS shape.
+   *
+   * The shape is a parameter rather than one clamp for both, because the two ceilings are five
+   * times apart and the tighter one is the one custody will actually apply to a sweep. See the
+   * ceiling block above.
+   */
+  async function feeRate(call: ChainCall, shape: OutboundShape): Promise<bigint> {
+    const ceiling = shape === 'sweep' ? MAX_SWEEP_SAT_PER_VB : MAX_SAT_PER_VB
     const answer = await call.rpc('estimatesmartfee', [FEE_TARGET_BLOCKS])
     const row = (answer ?? {}) as Record<string, unknown>
     // `feerate` is BTC per kilovbyte. Absent means the node has too little data to estimate, which
@@ -317,7 +471,7 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
     const perKvb = btcToSats(row['feerate'])
     const perVb = perKvb / 1_000n
     if (perVb < MIN_RELAY_SAT_PER_VB) return MIN_RELAY_SAT_PER_VB
-    if (perVb > MAX_SAT_PER_VB) return MAX_SAT_PER_VB
+    if (perVb > ceiling) return ceiling
     return perVb
   }
 
@@ -347,44 +501,21 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
   }
 
   /**
-   * Build a PSBT paying `outputs`, funded by `from`.
+   * Build a PSBT spending `inputs` and paying `outputs`, funded by `from`.
    *
-   * Shared by the withdrawal path and by `buildSweep`, because the two differ only in what the
-   * outputs are: a withdrawal pays the user and returns change to the treasury address, a sweep
-   * pays the pinned treasury and by construction has no change. Sharing the construction means the
-   * sweep cannot drift away from the encoding custody validated the withdrawal against.
+   * The one encoder, shared by the withdrawal path and the sweep path, because the two differ only
+   * in WHICH coins and WHICH outputs — and sharing the construction is what stops the sweep drifting
+   * away from the encoding custody has already validated a withdrawal against.
    */
-  async function buildPsbt(
-    call: ChainCall,
+  function encodePsbt(
+    net: bitcoin.Network,
     from: string,
+    inputs: readonly Utxo[],
     outputs: readonly { address: string; sats: bigint }[],
-    lockedFee: bigint | null,
-    bounds: FeeBounds,
-  ): Promise<UnsignedOutbound> {
-    const net = networkFor(call.network)
-    validateAddress(from, call.network)
-    for (const output of outputs) validateAddress(output.address, call.network)
-
-    const target = outputs.reduce((sum, output) => sum + output.sats, 0n)
-    const rate = await feeRate(call)
-    const utxos = await listUnspent(call, from, spec.confirmations)
-    const selection = selectCoins(utxos, target, rate, dust)
-
-    // The locked fee is what the user agreed to. It is checked, never re-quoted: re-quoting here
-    // would sign a transaction that does not match the row it was built from, and the fee bounds
-    // exist so a node having a bad minute cannot spend a user's balance on miner revenue.
-    if (lockedFee !== null) {
-      if (selection.fee > lockedFee) {
-        throw new FeeOutOfBandError('btc', 'below', lockedFee, selection.fee)
-      }
-      if (lockedFee > bounds.maxFeeWei) {
-        throw new FeeOutOfBandError('btc', 'above', lockedFee, bounds.maxFeeWei)
-      }
-    }
-
+  ): bitcoin.Psbt {
     const psbt = new bitcoin.Psbt({ network: net })
     const script = bitcoin.address.toOutputScript(from, net)
-    for (const utxo of selection.inputs) {
+    for (const utxo of inputs) {
       psbt.addInput({
         hash: utxo.txid,
         index: utxo.vout,
@@ -401,17 +532,80 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
     for (const output of outputs) {
       psbt.addOutput({ address: output.address, value: Number(output.sats) })
     }
-    if (selection.change > 0n) {
-      // Change returns to the SOURCE address, never to a fresh one. A fresh change address would
-      // be a key this service invented, and every key in this estate is custody's.
-      psbt.addOutput({ address: from, value: Number(selection.change) })
+    return psbt
+  }
+
+  /**
+   * Build one outbound transaction, of either shape.
+   *
+   * **The two shapes select their coins by two different rules and that is the whole of the
+   * branch.** A withdrawal chooses the fewest coins that cover the payment and returns the change
+   * to the treasury. A sweep takes EVERY coin and creates no change at all, because custody's
+   * `assertSweepOutputs` refuses a PSBT any of whose outputs does not pay the pin — so a sweep with
+   * a change output back to the deposit address is refused WHOLE, and that is exactly what routing
+   * a sweep through the withdrawal builder used to produce.
+   */
+  async function buildOutbound(call: ChainCall, input: BuildInput): Promise<UnsignedOutbound> {
+    const net = networkFor(call.network)
+    validateAddress(input.from, call.network)
+    validateAddress(input.to, call.network)
+    if (input.value <= 0n) {
+      // A zero-value output is refused by the relay as dust and by custody as an output that pays
+      // nothing. Refusing here makes it a classified build failure rather than a 403.
+      throw new FeeOutOfBandError('btc', 'below', input.value, 1n)
     }
+    if (input.fee > input.bounds.maxFeeWei) {
+      throw new FeeOutOfBandError('btc', 'above', input.fee, input.bounds.maxFeeWei)
+    }
+
+    const rate = await feeRate(call, input.shape)
+    const utxos = await listUnspent(call, input.from, spec.confirmations)
+
+    let inputs: readonly Utxo[]
+    let fee: bigint
+    const outputs: { address: string; sats: bigint }[] = [{ address: input.to, sats: input.value }]
+
+    if (input.shape === 'sweep') {
+      const plan = sweepPlan(utxos, rate, dust)
+      if (!plan) {
+        // Nothing at depth, or not enough to be worth moving. Either way the coins are not there,
+        // which classifies as a treasury failure and is retried rather than refunded on the spot.
+        throw new InsufficientTreasuryError('btc', totalOf(utxos), input.value + input.fee)
+      }
+      // **The plan must still be the plan the ROW was written from.** `planSweep` quoted this same
+      // UTXO set through this same function; a disagreement means coins arrived or left in between,
+      // and the difference between the two numbers is a fee nobody agreed to pay. Refused rather
+      // than silently re-quoted, exactly as a withdrawal's locked fee is.
+      if (plan.value !== input.value || plan.fee !== input.fee) {
+        throw new FeeOutOfBandError('btc', plan.fee > input.fee ? 'below' : 'above', input.fee, plan.fee)
+      }
+      inputs = plan.inputs
+      fee = plan.fee
+    } else {
+      const selection = selectCoins(utxos, input.value, rate, dust)
+      // The locked fee is what the user agreed to. It is checked, never re-quoted: re-quoting here
+      // would sign a transaction that does not match the row it was built from, and the fee bounds
+      // exist so a node having a bad minute cannot spend a user's balance on miner revenue.
+      if (selection.fee > input.fee) {
+        throw new FeeOutOfBandError('btc', 'below', input.fee, selection.fee)
+      }
+      inputs = selection.inputs
+      fee = selection.fee
+      if (selection.change > 0n) {
+        // Change returns to the SOURCE address, never to a fresh one. A fresh change address would
+        // be a key this service invented, and every key in this estate is custody's.
+        outputs.push({ address: input.from, sats: selection.change })
+      }
+    }
+
+    const psbt = encodePsbt(net, input.from, inputs, outputs)
+    assertUnderCustodysCeiling(psbt, fee, input.shape)
 
     return {
       // A base64 PSBT string, which is what `signBitcoin` requires. See `UnsignedOutbound.payload`.
       payload: psbt.toBase64(),
-      value: target,
-      fee: selection.fee,
+      value: input.value,
+      fee,
       // Bitcoin has no nonce. The contended resource is the UTXO SET, and it is named by the
       // inputs rather than by a number: two transactions spending one outpoint are the Bitcoin
       // spelling of two transactions at one nonce, and `outbound_in_flight_uniq` is what stops a
@@ -459,7 +653,7 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
      * load-bearing.
      */
     async estimateFee(call, bounds) {
-      const rate = await feeRate(call)
+      const rate = await feeRate(call, 'payment')
       const fee = rate * BigInt(vsizeOf(1, 2))
       if (fee > bounds.maxFeeWei) {
         throw new FeeOutOfBandError('btc', 'above', fee, bounds.maxFeeWei)
@@ -468,19 +662,29 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
     },
 
     async spendableBalance(call, address) {
-      const utxos = await listUnspent(call, address, spec.confirmations)
-      return utxos.reduce((sum, utxo) => sum + utxo.sats, 0n)
+      return totalOf(await listUnspent(call, address, spec.confirmations))
     },
 
-    async build(call, input: BuildInput): Promise<UnsignedOutbound> {
-      return buildPsbt(
-        call,
-        input.from,
-        [{ address: input.to, sats: input.value }],
-        input.fee,
-        input.bounds,
-      )
+    /**
+     * What a sweep of this address would move, from the coins it actually holds.
+     *
+     * **This is the method `estimateFee` could not be.** A sweep spends every coin at depth, so its
+     * size — and therefore its fee — is a property of the address, and `estimateFee` is not given
+     * one. Quoting `vsizeOf(1, 2)` for a three-coin address, which is what the sweeper did before
+     * this existed, under-quotes the fee by more than half and produces a transaction below the
+     * relay floor.
+     */
+    async sweepQuote(call, address, bounds) {
+      const rate = await feeRate(call, 'sweep')
+      const plan = sweepPlan(await listUnspent(call, address, spec.confirmations), rate, dust)
+      if (!plan) return null
+      if (plan.fee > bounds.maxFeeWei) {
+        throw new FeeOutOfBandError('btc', 'above', plan.fee, bounds.maxFeeWei)
+      }
+      return { value: plan.value, fee: plan.fee }
     },
+
+    build: buildOutbound,
 
     /**
      * The txid of the bytes custody handed back.
@@ -607,22 +811,26 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
 }
 
 /**
- * The sweep PSBT: every output pays the pinned treasury, change included.
+ * The sweep PSBT: every output pays the pinned treasury, and there is only one output.
  *
- * **This is built and it does not work yet, and both halves of that sentence are deliberate.**
+ * **It was built before it could be signed, and it is wired up now.** custody's `signing.ts` used
+ * to SPECIFY the output policy this satisfies — "EVERY output must pay the pinned BTC treasury for
+ * the row's (chain, network), including any change output, since a sweep leaves nothing behind" —
+ * and `purposeGate` refused a `deposit`-purpose bitcoin address until it had a caller. Both halves
+ * have landed: `BitcoinPolicy` is built and `SWEEPABLE_FAMILIES` names `bitcoin`, so the adapter's
+ * own `build` routes a `shape: 'sweep'` through the same `sweepPlan` this uses.
  *
- * custody's `signing.ts` specifies the output policy this satisfies — "EVERY output must pay the
- * pinned BTC treasury for the row's (chain, network), including any change output, since a sweep
- * leaves nothing behind" — and `purposeGate` refuses a `deposit`-purpose bitcoin address until
- * that policy has a caller. This is the caller. It is here so that the custody-side change is a
- * gate flag and a policy function rather than a gate flag, a policy function, and an unwritten
- * builder; and it is here rather than merged into `build` because a sweep that accidentally
- * acquired a change output paying anything other than the treasury would be refused whole by
- * custody, which is the correct outcome and a confusing one to debug.
+ * **This function had no production caller until that happened, and that is the defect worth
+ * recording.** `build` served both purposes, so a sweep went through the coin selector, which
+ * exists to produce CHANGE — and a change output back to the deposit address is refused whole by
+ * `assertSweepOutputs`. It only ever worked for an address holding exactly one coin, by accident:
+ * with two or more, `selectCoins` could not cover a one-input-two-output fee out of a target that
+ * had already had that fee subtracted, and threw. A tested exported function with no caller is
+ * indistinguishable in a suite from one that works.
  *
- * It takes no change parameter at all: a sweep sends the entire balance, so the only outputs are
- * the treasury and nothing else, and the fee is the remainder. That is why it cannot reuse the
- * coin selector, which exists to produce change.
+ * It stays as a named entry point because a sweep is worth being able to build in isolation — an
+ * operator reproducing one by hand, and the tests below — and because the shape it produces is the
+ * whole of what custody's policy asks for, in six lines, where `build` states it among branches.
  */
 export async function buildSweepPsbt(
   call: ChainCall,
@@ -630,26 +838,18 @@ export async function buildSweepPsbt(
   treasury: string,
   feeRatePerVb: bigint,
   minConfirmations: number,
+  dustThreshold: bigint = DEFAULT_DUST,
 ): Promise<{ psbtBase64: string; value: bigint; fee: bigint } | null> {
   const net = networkFor(call.network)
   validateAddress(from, call.network)
   validateAddress(treasury, call.network)
 
-  const utxos = await listUnspent(call, from, minConfirmations)
-  if (utxos.length === 0) return null
-  const total = utxos.reduce((sum, utxo) => sum + utxo.sats, 0n)
-
-  // One output, because a sweep leaves nothing behind. That is also what makes the policy
-  // satisfiable: there is no change output that could pay anything but the treasury.
-  const fee = feeRatePerVb * BigInt(vsizeOf(utxos.length, 1))
-  const value = total - fee
-  // Sweeping less than it costs to sweep destroys value. Returning null rather than throwing lets
-  // the caller treat "not worth it yet" as the ordinary, recurring state that it is.
-  if (value <= DEFAULT_DUST) return null
+  const plan = sweepPlan(await listUnspent(call, from, minConfirmations), feeRatePerVb, dustThreshold)
+  if (plan === null) return null
 
   const psbt = new bitcoin.Psbt({ network: net })
   const script = bitcoin.address.toOutputScript(from, net)
-  for (const utxo of utxos) {
+  for (const utxo of plan.inputs) {
     psbt.addInput({
       hash: utxo.txid,
       index: utxo.vout,
@@ -657,7 +857,8 @@ export async function buildSweepPsbt(
       sighashType: bitcoin.Transaction.SIGHASH_ALL,
     })
   }
-  psbt.addOutput({ address: treasury, value: Number(value) })
+  psbt.addOutput({ address: treasury, value: Number(plan.value) })
+  assertUnderCustodysCeiling(psbt, plan.fee, 'sweep')
 
-  return { psbtBase64: psbt.toBase64(), value, fee }
+  return { psbtBase64: psbt.toBase64(), value: plan.value, fee: plan.fee }
 }

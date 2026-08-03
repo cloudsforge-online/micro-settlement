@@ -30,9 +30,11 @@
  * depth rather than depth-plus-a-window.
  *
  * What the delay still buys is this service's own arithmetic. Between broadcast and confirmation
- * the funds have left but a spot balance read still shows them, so without subtracting what is in
- * flight the sweeper would spend a second fee discovering that the first sweep had already moved
- * the money. `unmaturedByAddress` is that subtraction.
+ * the funds have left but a spot balance read still shows them, so without accounting for what is
+ * in flight the sweeper would spend a second fee discovering that the first sweep had already moved
+ * the money. `unmaturedByAddress` is that accounting, and it is a SKIP rather than a subtraction:
+ * on a UTXO chain a second sweep of a partly-swept address is a second transaction spending the
+ * same outpoints, which is not a smaller sweep, it is a conflicting one.
  */
 
 import { chainSpec, type Network } from '@cloudsforge/contracts-chain'
@@ -211,10 +213,15 @@ async function recordObservation(sql: Db, id: string, observed: bigint): Promise
 /**
  * What each address has already sent that has not yet matured, in smallest units.
  *
- * Subtracted from a spot balance for the reason in the file header: between broadcast and
- * confirmation the funds have gone but any spot read still shows them, and without this the sweeper
- * would spend a second fee finding that out. Includes `planned` as well, so a queued sweep does not
- * cause a second one to be planned for the same address in the same tick.
+ * A non-zero entry takes the address out of this pass entirely, for the reason in the file header.
+ * Includes `planned` as well, so a queued sweep does not cause a second one to be planned for the
+ * same address in the same tick.
+ *
+ * The AMOUNT rather than a boolean, because it is what an operator reads to answer "how much of
+ * this address is already moving" — and because a `sum` that is null for an address with nothing
+ * in flight is the one shape `BigInt('')` could have been reached through. `sum` over an empty
+ * group returns no ROW here, not an empty string, so the map simply has no entry and the caller's
+ * `?? 0n` is the whole of it.
  */
 export async function unmaturedByAddress(
   sql: Db,
@@ -326,31 +333,44 @@ export async function planSweep(
   if (needed <= 0n) return { kind: 'satisfied' }
 
   const call = callFor(deps, chain)
-  const fee = await adapter.estimateFee(call, deps.bounds)
-  // Sweeping an address whose balance barely exceeds the fee spends most of the customer's deposit
-  // on moving it. The multiple is the whole economics of this worker.
-  const floor = fee * BigInt(Math.max(1, deps.minFeeMultiple))
+  const multiple = BigInt(Math.max(1, deps.minFeeMultiple))
 
   const unmatured = await unmaturedByAddress(deps.sql, chain, network)
   const candidates = await sweepCandidates(deps.sql, chain, network, deps.probeLimit)
 
   for (const source of candidates) {
     if (source.addressKey === treasury.addressKey) continue
-    const inFlight = unmatured.get(source.addressKey) ?? 0n
     // One probe per candidate per pass, bounded by `probeLimit`. Without the bound this is one RPC
     // per deposit address ever created, per tick, for ever — and most of them have never held a
     // coin. That unbounded scan is the shape of forge-pay's watcher, which AD-07 records.
-    const balance = await adapter.spendableBalance(call, source.address)
+    //
+    // **A QUOTE FOR THIS ADDRESS, not a balance and a generic fee.** The two were separate calls
+    // until a Bitcoin sweep needed the fee to depend on how many coins the address holds: a sweep
+    // spends every one of them, so `estimateFee`'s one-input two-output quote under-priced a
+    // three-coin address by more than half and produced a transaction below the relay floor. The
+    // adapter answers the whole question or answers null.
+    const quote = await adapter.sweepQuote(call, source.address, deps.bounds)
+    const balance = quote === null ? 0n : quote.value + quote.fee
     await recordObservation(deps.sql, source.id, balance)
+    if (quote === null) continue
 
-    const movable = balance - inFlight
-    if (movable < floor) continue
+    // Anything already moving off this address is a reason to leave it alone entirely, rather than
+    // to sweep the difference. Between broadcast and confirmation the coins have gone but a spot
+    // read still shows them, so a second sweep would spend a second fee discovering that — and on
+    // a UTXO chain it would also be a second transaction spending the same outpoints.
+    if ((unmatured.get(source.addressKey) ?? 0n) > 0n) continue
+
+    // Sweeping an address whose balance barely exceeds the fee spends most of the customer's
+    // deposit on moving it. The multiple is the whole economics of this worker, and it is applied
+    // to THIS sweep's fee rather than to a typical one.
+    if (balance < quote.fee * multiple) continue
 
     // `amount` is what the TREASURY gains and `fee` is burned on top: the whole spendable balance
     // leaves the address. Counting the fee towards the shortfall would leave the treasury a fee
     // short on every sweep.
-    const value = movable - fee
+    const value = quote.value
     if (value <= 0n) continue
+    const fee = quote.fee
 
     const { outbound, created } = await planOutbound(deps.sql, {
       purpose: 'sweep',
@@ -366,10 +386,11 @@ export async function planSweep(
       assetCode: assetOf(chain),
       amount: value,
       fee,
-      // Deterministic and derived: the source, the balance being moved and the block of time it was
-      // decided in. Two ticks that observe the same balance produce the same key, so a duplicated
-      // planning pass writes one row rather than two sweeps of one address.
-      idempotencyKey: `settlement:sweep:${chain}:${network}:${source.id}:${movable.toString()}`,
+      // Deterministic and derived: the source and the balance being moved. Two ticks that observe
+      // the same balance produce the same key, so a duplicated planning pass writes one row rather
+      // than two sweeps of one address — and a balance that HAS moved produces a different key, so
+      // the re-plan is a new row rather than a conflict with a stale one.
+      idempotencyKey: `settlement:sweep:${chain}:${network}:${source.id}:${balance.toString()}`,
       sourceRef: source.id,
     })
     if (!created) continue
