@@ -468,12 +468,30 @@ export async function sweepBindingFor(
   return { userId: source.custodyUserId, orderId: source.custodyOrderId }
 }
 
-/** A confirmed sweep. Nobody's reservation is waiting on it; this is for reconciliation. */
+/**
+ * A confirmed sweep. Nobody's reservation is waiting on it; this is for reconciliation.
+ *
+ * **KEYED BY THE SWEEP SOURCE, WHICH IS THE REGISTRY'S CHOICE AND NOT THIS SERVICE'S.**
+ * `@cloudsforge/contracts-events` registers `settlement.sweep.completed` with
+ * `keyedBy: 'sweep_source_id'`. This keyed it by the outbound row id, which was also what this
+ * repository proposed when it asked for the topic to be registered — and the registry chose
+ * differently, so the emit site moved. The registry is right: `key` is the ORDERING PARTITION, and
+ * two sweeps of one deposit address must be ordered against each other, while two sweeps of
+ * different addresses have no ordering relationship at all. Keyed by the outbound row every sweep
+ * is its own partition and the ordering guarantee says nothing.
+ *
+ * A row with no `sourceRef` emits NOTHING, exactly as `confirmedEvents` does for a withdrawal with
+ * no withdrawal id. There is deliberately no fallback to the row id: a fallback would be a second
+ * key shape on one topic, which is the ordering guarantee saying different things about different
+ * events, and it would be unreachable anyway — `planSweep` always writes `sourceRef`. The row id
+ * is on the payload as `outboundId` for anyone who wants it.
+ */
 export function sweepCompletedEvents(row: OutboundTransaction): readonly DomainEvent[] {
+  if (!row.sourceRef) return []
   return [
     {
       topic: SETTLEMENT_SWEEP_COMPLETED,
-      key: row.id,
+      key: row.sourceRef,
       payload: {
         outboundId: row.id,
         sweepSourceId: row.sourceRef,

@@ -79,7 +79,14 @@ import {
   handleWithdrawalRequested,
   type WithdrawalDeps,
 } from './withdrawals.ts'
-import { WALLET_WITHDRAWAL_REQUESTED, verifyEventSignature } from './outbox.ts'
+import {
+  EVENT_ID_HEADER,
+  LEGACY_EVENT_ID_HEADER,
+  LEGACY_SIGNATURE_HEADER,
+  SIGNATURE_HEADER,
+  WALLET_WITHDRAWAL_REQUESTED,
+  verifyInbound,
+} from './outbox.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
 export interface PrincipalVerifier {
@@ -153,6 +160,14 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       help: 'Builds that threw, by classification. A shift between classifications is a cause changing.',
       kind: 'counter',
       labels: ['chain', 'classification'],
+    })
+    .register({
+      name: 'settlement_event_signatures_total',
+      help:
+        'Accepted inbound deliveries by signature scheme. `legacy` reaching zero is the signal ' +
+        'that the pre-contract arm in `verifyInbound` can be deleted — see its header.',
+      kind: 'counter',
+      labels: ['scheme'],
     })
     .register({
       name: 'settlement_adjudications_total',
@@ -804,11 +819,23 @@ const STATES = new Set<string>([
  */
 async function handleEvent(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
   const raw = await readRaw(ctx.req)
-  const presented = headerOf(ctx.req, 'x-cloudsforge-signature') ?? ''
-  if (!verifyEventSignature(raw, deps.eventSigningSecret, presented)) {
-    ctx.log.warn('event rejected: bad signature', { eventId: headerOf(ctx.req, 'x-event-id') })
+  // Both header names are read, and `verifyInbound` says which scheme matched. The contract's is
+  // preferred; the legacy one exists because `micro-wallet`'s relay has not adopted `signDelivery`
+  // yet, and dropping it would 401 every withdrawal request this service's only producer sends.
+  // See `verifyInbound` for why that arm is not a weakening and for what deletes it.
+  const scheme = verifyInbound(raw, deps.eventSigningSecret, {
+    contract: headerOf(ctx.req, SIGNATURE_HEADER) ?? '',
+    legacy: headerOf(ctx.req, LEGACY_SIGNATURE_HEADER) ?? '',
+  })
+  const presentedEventId =
+    headerOf(ctx.req, EVENT_ID_HEADER) ?? headerOf(ctx.req, LEGACY_EVENT_ID_HEADER) ?? null
+  if (scheme === null) {
+    ctx.log.warn('event rejected: bad signature', { eventId: presentedEventId })
     return errorReply(401, 'bad_signature', 'the event signature did not verify', ctx.requestId)
   }
+  // Counted, not just logged, so an operator can watch the legacy count reach zero before anybody
+  // deletes the arm that serves it. A migration retired on a belief is a migration retired early.
+  deps.metrics.increment('settlement_event_signatures_total', { scheme })
 
   let envelope: { id?: unknown; topic?: unknown; payload?: unknown }
   try {

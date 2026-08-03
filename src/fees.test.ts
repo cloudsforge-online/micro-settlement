@@ -67,6 +67,42 @@ describe('the fee entry names accounts nobody else claims differently', () => {
       [a.subject, a.assetCode, a.purpose].join('|')
     assert.notEqual(key(feeExpenseAccount('EMBER')), key(custodyAccount('EMBER')))
   })
+
+  /**
+   * **THE SAME TWO KEYS FOR EVERY ASSET, INCLUDING THE ONES THAT DID NOT EXIST YET.**
+   *
+   * `ensureAccount` throws `AccountConflictError` when a caller's stated type disagrees with the
+   * row that already exists (ledger/src/accounts.ts:125), and whichever service posts SECOND has
+   * EVERY entry refused, not one — for as long as the disagreement stands. No suite in the estate
+   * can see it, because each service tests against its own fake ledger.
+   *
+   * So the property worth pinning is that these two functions are ASSET-AGNOSTIC: adding a chain
+   * must not be able to introduce a third key or a different type. SOL is here because it is the
+   * chain this repository just added, and BTC because it is the one the reasoning was written for
+   * — an asset nothing in the estate credits fee revenue in at all, which is where the old
+   * `(platform, <asset>, fees)` posting would have been refused by the overdraft trigger rather
+   * than by the type check.
+   *
+   * Both keys are `micro-conformance`'s CANONICAL_ACCOUNTS entries verbatim
+   * (conformance/src/ledgeraccounts.ts): `(platform, *, payout_due)` is `expense` and
+   * `(custody, *, available)` is `asset`.
+   */
+  it('names one key per side for every asset, new chains included', () => {
+    for (const asset of ['EMBER', 'ETH', 'BTC', 'SOL', 'XRP', 'SHARD'] as const) {
+      assert.deepEqual(feeExpenseAccount(asset), {
+        subject: 'platform',
+        assetCode: asset,
+        purpose: 'payout_due',
+        type: 'expense',
+      })
+      assert.deepEqual(custodyAccount(asset), {
+        subject: 'custody',
+        assetCode: asset,
+        purpose: 'available',
+        type: 'asset',
+      })
+    }
+  })
 })
 
 describe('isBooked', () => {

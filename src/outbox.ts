@@ -19,6 +19,14 @@
 
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { Sql, TransactionSql } from 'postgres'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  serviceActor,
+  signDelivery,
+  verifyDelivery,
+  type EventVersion,
+} from '@cloudsforge/contracts-events'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'
 import type { Handler } from '@cloudsforge/jobs'
@@ -55,8 +63,28 @@ export const WALLET_WITHDRAWAL_REQUESTED = 'wallet.withdrawal.requested'
 export const SETTLEMENT_WITHDRAWAL_COMPLETED = 'settlement.withdrawal.completed'
 export const SETTLEMENT_OUTBOUND_CONFIRMED = 'settlement.outbound.confirmed'
 export const SETTLEMENT_OUTBOUND_FAILED = 'settlement.outbound.failed'
-/** A signed transaction that needs a human. Nobody's money moves on it; it pages an operator. */
-export const SETTLEMENT_OUTBOUND_STUCK = 'settlement.outbound.stuck'
+/**
+ * **THE REGISTERED NAME FOR A STUCK WITHDRAWAL, AND IT WAS NOT BEING EMITTED.**
+ *
+ * `@cloudsforge/contracts-events` owns `settlement.withdrawal.stuck`, keyed `chain:network`, with
+ * the description "An outbound transaction passed its deadline unconfirmed. Pages on one." Both
+ * consumers classify that name — `activity/src/classify.ts:383` and `notify/src/catalogue.ts:433`,
+ * the latter at `priority: 'high'` with the reason "Silence here is a user who believes their money
+ * has vanished".
+ *
+ * This service emitted `settlement.outbound.stuck` instead, keyed by the outbound row id. Nothing
+ * in the estate has ever subscribed to that name, so **both consumers were dead code and a stuck
+ * withdrawal notified nobody** — which is precisely the failure their rules were written for. It is
+ * the same defect wallet had with `wallet.deposit.credited` against `wallet.deposit.confirmed`.
+ *
+ * **`settlement.outbound.stuck` IS GONE, AND NOT BECAUSE IT WAS TIDIER.** The first fix emitted
+ * both names, and `micro-contracts` refused to register the second: one payload, one fact, two
+ * partitions, no subscriber, and the row id it was keyed by is already on the payload as
+ * `outboundId`. Two official names for one fact is exactly the defect being repaired here, so
+ * keeping it — even quarantined — would have been a proposal that could never be resolved. See
+ * `stuckEvents`.
+ */
+export const SETTLEMENT_WITHDRAWAL_STUCK = 'settlement.withdrawal.stuck'
 export const SETTLEMENT_SWEEP_COMPLETED = 'settlement.sweep.completed'
 
 /* ------------------------------------------------------------------ writing */
@@ -73,16 +101,40 @@ export interface DomainEvent {
   readonly version?: number
 }
 
-/** The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02. */
+/**
+ * The wire version, in the CONTRACT's shape.
+ *
+ * `@cloudsforge/contracts-events` types `EventEnvelope.version` as `` `${number}.${number}` `` — a
+ * "major.minor" STRING — and `validateEnvelope` refuses anything else with "version: missing". This
+ * service typed it `number` end to end and sent `1`, so **every event it ever relayed was thrown
+ * away at the envelope, before a consumer looked at a payload.** The suite stayed green throughout
+ * because it tested against its own fake of the other side.
+ *
+ * The stored column stays an integer — storage records the major — and the mapping to the wire
+ * happens here, in one place. The return type is the contract's own `EventVersion`, IMPORTED rather
+ * than restated: a local copy of a contract type is a copy that can drift, which is the whole
+ * reason this exists.
+ */
+const wireVersion = (v: number): EventVersion => `${v}.0` as EventVersion
+
+/**
+ * The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02.
+ *
+ * **`actor` and `correlationId` are `string`, not `string | null`.** They were nullable here
+ * because the columns are nullable, and that was the version defect wearing two more hats:
+ * `validateEnvelope` refuses a null actor ("actor: missing") and a null correlation id
+ * ("correlationId: missing; a cross-service investigation stops here"). A nullable column is a
+ * storage fact; the wire has no such freedom, and `buildEnvelope` is where the two meet.
+ */
 export interface EventEnvelope {
   readonly id: string
   readonly topic: string
   readonly key: string
   readonly occurredAt: string
   readonly producer: string
-  readonly version: number
-  readonly actor: string | null
-  readonly correlationId: string | null
+  readonly version: EventVersion
+  readonly actor: string
+  readonly correlationId: string
   readonly payload: Record<string, unknown>
 }
 
@@ -136,19 +188,82 @@ export async function withOutbox<T>(
 
 /* ------------------------------------------------------------------ signing */
 
-const SIGNATURE_HEADER = 'x-cloudsforge-signature'
-
-/** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
+/**
+ * **THE CONTRACT SIGNS, NOT THIS FILE.**
+ *
+ * This was a local implementation — `sha256=<hmac over the body>` under a locally-declared
+ * `x-cloudsforge-signature` — and five producers carried the same drifted copy. The contract signs
+ * `t=<seconds>,v1=<hmac over "<seconds>.<body>">` under `cf-signature`, and every consumer that
+ * imports it verifies exactly that. So every delivery this service made was refused: first as
+ * "signature: missing" for the header name, and once that was aligned as `malformed_header` for the
+ * scheme.
+ *
+ * The exported names stay, so no call site changes; the implementations are the contract's, so they
+ * cannot drift again. The scheme is also STRICTLY stronger than what it replaces — the timestamp is
+ * inside the signed message, so a captured delivery stops being a lasting credential after
+ * `DELIVERY_TOLERANCE_MS`.
+ */
 export function signEvent(body: string, secret: string): string {
-  return `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`
+  return signDelivery(body, secret)
 }
 
-/** Timing-safe, because a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle. */
+/** Timing-safety and the freshness window both live in the contract's verifier. */
 export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  const expected = Buffer.from(signEvent(body, secret))
+  return verifyDelivery(body, presented, secret).ok
+}
+
+/* ------------------------------------------------------------------ the inbound seam */
+
+/** The header and the scheme `micro-wallet`'s relay still uses. Deleted with `verifyInbound`'s arm. */
+export const LEGACY_SIGNATURE_HEADER = 'x-cloudsforge-signature'
+export const LEGACY_EVENT_ID_HEADER = 'x-event-id'
+
+/** `sha256=<hex>` over the body, with no timestamp. The scheme this repository used to sign with. */
+function verifyLegacyDelivery(body: string, secret: string, presented: string): boolean {
+  const expected = Buffer.from(`sha256=${createHmac('sha256', secret).update(body).digest('hex')}`)
   const actual = Buffer.from(presented)
+  // Length first: `timingSafeEqual` throws on a mismatch, and a digest length is public knowledge.
   if (expected.length !== actual.length) return false
   return timingSafeEqual(expected, actual)
+}
+
+export type InboundScheme = 'contract' | 'legacy'
+
+/**
+ * Verify a delivery this service RECEIVES, under either scheme, and say which one matched.
+ *
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS IS A MIGRATION, AND IT IS DELIBERATELY ASYMMETRIC WITH WHAT THIS SERVICE SENDS.**
+ *
+ * The producer half above is unconditional: everything this service emits is signed the contract's
+ * way, because every consumer of it imports the contract. The CONSUMER half cannot be, and the
+ * reason is a fact about another repository rather than a preference: this service consumes exactly
+ * one topic, `wallet.withdrawal.requested`, and `micro-wallet`'s relay still signs the old way —
+ * `wallet/src/outbox.ts:165,168`, a local `x-cloudsforge-signature` and a local `sha256=<hmac>`.
+ *
+ * Switching only the verifier would 401 every withdrawal request the instant this deploys. That is
+ * not a smaller outage than the one being fixed; it is the same service's only inbound path.
+ *
+ * **THE LEGACY ARM IS NOT A WEAKENING.** It is the same HMAC over the same body under the same
+ * secret — the property in force today, unchanged. What it lacks is the contract's timestamp
+ * binding, so a captured delivery stays replayable; and a replay is already a no-op here, because
+ * `withInbox` dedupes on `(topic, event_id)` and a redelivered withdrawal must not produce a second
+ * payment. So the exposure the legacy arm leaves is exactly the one the inbox already closes.
+ *
+ * **WHAT DELETES IT.** `micro-wallet`'s relay adopting `signDelivery`. `outbox.test.ts` asserts the
+ * legacy arm still verifies, so this cannot be removed silently while wallet still needs it — and
+ * the scheme is REPORTED on every accepted delivery, so an operator can see the legacy count reach
+ * zero before anyone deletes anything, rather than deleting on a belief.
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function verifyInbound(
+  body: string,
+  secret: string,
+  headers: { readonly contract: string; readonly legacy: string },
+): InboundScheme | null {
+  if (headers.contract.length > 0 && verifyDelivery(body, headers.contract, secret).ok) return 'contract'
+  if (headers.legacy.length > 0 && verifyLegacyDelivery(body, secret, headers.legacy)) return 'legacy'
+  return null
 }
 
 /* ------------------------------------------------------------------ relay */
@@ -178,6 +293,40 @@ interface OutboxRow {
 interface SubscriptionRow {
   readonly id: string
   readonly url: string
+}
+
+/**
+ * One outbox row → one wire envelope. **The only place an envelope is built.**
+ *
+ * Exported so `topics.test.ts` can hand the real thing to the contract's own `classifyEnvelope`
+ * rather than to a copy. That distinction is the whole point: this service's suite was green while
+ * every event it emitted was refused, because both sides tested against imagined counterparts. A
+ * guard that builds its own envelope proves only that the guard can build an envelope.
+ *
+ * The two defaults are the contract's own semantics, not inventions:
+ *
+ *   - **`correlationId` falls back to the event id.** `makeEvent` does exactly this — "an event
+ *     that starts a story rather than continuing one is its own correlation root". A null would be
+ *     refused outright, and refusing an event because nobody handed it a request id would lose the
+ *     event rather than the trace. In this service the fallback is the common case rather than the
+ *     rare one: a sweep, a confirmation and a stuck page all originate in a leased job with no
+ *     inbound request behind them.
+ *   - **`actor` falls back to `service:settlement`.** An emit with no actor was this service acting
+ *     on its own behalf, which is precisely what `serviceActor` spells. `null` is not an actor the
+ *     contract has a word for.
+ */
+export function buildEnvelope(row: OutboxRow): EventEnvelope {
+  return {
+    id: row.id,
+    topic: row.topic,
+    key: row.key,
+    occurredAt: row.occurred_at.toISOString(),
+    producer: row.producer,
+    version: wireVersion(row.version),
+    actor: row.actor ?? serviceActor('settlement'),
+    correlationId: row.correlation_id ?? row.id,
+    payload: row.payload,
+  }
 }
 
 /**
@@ -221,17 +370,7 @@ export function createRelay(deps: RelayDeps): Handler {
         select id, url from event_subscriptions where topic = ${event.topic} and active = true
       `
 
-      const envelope: EventEnvelope = {
-        id: event.id,
-        topic: event.topic,
-        key: event.key,
-        occurredAt: event.occurred_at.toISOString(),
-        producer: event.producer,
-        version: event.version,
-        actor: event.actor,
-        correlationId: event.correlation_id,
-        payload: event.payload,
-      }
+      const envelope = buildEnvelope(event)
       // Signed over the exact bytes `HttpClient` will send: it stringifies the same object with the
       // same key order, so the MAC a subscriber recomputes over the received body matches.
       const signature = signEvent(JSON.stringify(envelope), deps.signingSecret)
@@ -301,8 +440,11 @@ async function deliver(
       // The event id is the idempotency key, which is what makes this POST safe to retry and is the
       // same value the subscriber dedupes on.
       idempotencyKey: envelope.id,
-      headers: { [SIGNATURE_HEADER]: signature, 'x-event-id': envelope.id },
-      ...(envelope.correlationId ? { requestId: envelope.correlationId } : {}),
+      // Both header names are the CONTRACT's exported constants. `'x-event-id'` was a literal here
+      // and `EVENT_ID_HEADER` is `cf-event-id`, so a consumer reading the contract's name found
+      // nothing — the same class of drift as the signature scheme, one field along.
+      headers: { [SIGNATURE_HEADER]: signature, [EVENT_ID_HEADER]: envelope.id },
+      requestId: envelope.correlationId,
     })
     await deps.sql`
       update outbox_deliveries set delivered_at = now(), last_error = null
@@ -341,6 +483,8 @@ export type InboxOutcome<T> =
  * "record then handle" dedupe lose events. In this service losing one would mean a user whose
  * balance is reserved and whose payment is never built.
  */
+export { EVENT_ID_HEADER, SIGNATURE_HEADER }
+
 export async function withInbox<T>(
   sql: Db,
   topic: string,

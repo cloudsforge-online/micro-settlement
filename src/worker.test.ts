@@ -320,10 +320,26 @@ describe('the outbound worker', { skip }, () => {
     const topics = (
       await sql<Array<{ topic: string }>>`select topic from outbox`
     ).map((e) => e.topic)
-    assert.ok(topics.includes('settlement.outbound.stuck'), 'an operator must be paged')
+    // The REGISTERED name. This asserted `settlement.outbound.stuck`, which no registry names and
+    // nothing subscribes to, so it proved that a row was written and nothing about whether an
+    // operator was paged — `activity` and `notify` both classify `settlement.withdrawal.stuck` and
+    // neither could ever have matched.
+    assert.ok(topics.includes('settlement.withdrawal.stuck'), 'an operator must be paged')
+    assert.ok(
+      !topics.includes('settlement.outbound.stuck'),
+      'the unregistered per-row twin was refused registration and must not be emitted alongside',
+    )
     assert.ok(
       !topics.includes('settlement.outbound.failed'),
       'a stuck transaction must not emit anything that releases a reservation',
+    )
+    // Keyed `chain:network`, as the registry declares, and NOT by the row.
+    const keys = await sql<Array<{ key: string }>>`
+      select key from outbox where topic = 'settlement.withdrawal.stuck'
+    `
+    assert.deepEqual(
+      keys.map((k) => k.key),
+      ['ember:testnet'],
     )
     // And it stays stuck however many ticks run. Nothing in the worker moves a stuck row.
     await driveChain(deps.worker, 'ember', 'testnet')

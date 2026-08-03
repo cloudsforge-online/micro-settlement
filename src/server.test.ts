@@ -8,7 +8,7 @@
 
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, it } from 'node:test'
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomUUID } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
 import type postgres from 'postgres'
@@ -165,7 +165,35 @@ describe('the HTTP surface', { skip }, () => {
 
   /* ---------------------------------------------------------------- events */
 
-  const post = async (payload: Record<string, unknown>, options: { secret?: string } = {}) => {
+  /**
+   * A delivery as one of the two producers on the wire today would actually make it.
+   *
+   * `'legacy'` is what `micro-wallet`'s relay sends RIGHT NOW — `wallet/src/outbox.ts:165,168`, a
+   * local `x-cloudsforge-signature` carrying `sha256=<hmac over the body>`. It is the default here
+   * for exactly that reason: the default has to be the thing that is really arriving, or this suite
+   * would prove that the migration works and nothing about whether withdrawals still get in.
+   *
+   * `'contract'` is what every producer sends once it adopts `signDelivery`, and what THIS service
+   * now sends. Both are exercised; see `verifyInbound` for why both are accepted and what deletes
+   * the legacy arm.
+   */
+  const deliveryHeaders = (
+    raw: string,
+    secret: string,
+    eventId: string,
+    scheme: 'legacy' | 'contract',
+  ): Record<string, string> =>
+    scheme === 'contract'
+      ? { 'cf-signature': signEvent(raw, secret), 'cf-event-id': eventId }
+      : {
+          'x-cloudsforge-signature': `sha256=${createHmac('sha256', secret).update(raw).digest('hex')}`,
+          'x-event-id': eventId,
+        }
+
+  const post = async (
+    payload: Record<string, unknown>,
+    options: { secret?: string; scheme?: 'legacy' | 'contract' } = {},
+  ) => {
     const envelope = {
       id: randomUUID(),
       topic: 'wallet.withdrawal.requested',
@@ -182,8 +210,7 @@ describe('the HTTP surface', { skip }, () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-cloudsforge-signature': signEvent(raw, options.secret ?? SECRET),
-        'x-event-id': envelope.id,
+        ...deliveryHeaders(raw, options.secret ?? SECRET, envelope.id, options.scheme ?? 'legacy'),
       },
       body: raw,
     })
@@ -199,14 +226,38 @@ describe('the HTTP surface', { skip }, () => {
   })
 
   /**
+   * The same event under the CONTRACT's scheme, which is what wallet's relay sends once it adopts
+   * `signDelivery`. Both arms are exercised at the HTTP layer, because the day one of them stops
+   * working is a day every withdrawal request is a 401 and nothing else in this suite would say so.
+   */
+  it('plans a withdrawal from an event signed the contract way too', async () => {
+    const { status, body } = await post(withdrawalPayload(), { scheme: 'contract' })
+    assert.equal(status, 200)
+    assert.deepEqual((body['decision'] as Record<string, unknown>)['kind'], 'planned')
+  })
+
+  /**
    * The signature is verified BEFORE the body is parsed. An unauthenticated body never reaches a
    * JSON parser, let alone the path that plans a payment.
    */
   it('refuses an event whose signature does not verify, and plans nothing', async () => {
-    const { status } = await post(withdrawalPayload(), { secret: 'the-wrong-secret-0000000000000000' })
-    assert.equal(status, 401)
-    const rows = await sql`select count(*)::int as n from outbound_transactions`
-    assert.equal(rows[0]!.n, 0)
+    for (const scheme of ['legacy', 'contract'] as const) {
+      const { status } = await post(withdrawalPayload(), {
+        secret: 'the-wrong-secret-0000000000000000',
+        scheme,
+      })
+      assert.equal(status, 401, `a forged ${scheme} signature must be refused`)
+      const rows = await sql`select count(*)::int as n from outbound_transactions`
+      assert.equal(rows[0]!.n, 0)
+    }
+  })
+
+  it('refuses a delivery with no signature header at all', async () => {
+    // Neither header present is not "no opinion", it is unauthenticated. Accepting the two schemes
+    // must not have turned an absent header into a third, silent one.
+    const raw = JSON.stringify({ id: randomUUID(), topic: 'wallet.withdrawal.requested', payload: {} })
+    const response = await fetch(`${base}/v1/events`, { method: 'POST', body: raw })
+    assert.equal(response.status, 401)
   })
 
   /**
@@ -216,11 +267,11 @@ describe('the HTTP surface', { skip }, () => {
    * pin a subscriber in a permanent retry loop over something neither side is wrong about.
    */
   it('answers 202 for a topic it does not consume', async () => {
-    const envelope = { id: randomUUID(), topic: 'indexer.deposit.confirmed', payload: {} }
-    const raw = JSON.stringify(envelope)
+    const id = randomUUID()
+    const raw = JSON.stringify({ id, topic: 'indexer.deposit.confirmed', payload: {} })
     const response = await fetch(`${base}/v1/events`, {
       method: 'POST',
-      headers: { 'x-cloudsforge-signature': signEvent(raw, SECRET) },
+      headers: deliveryHeaders(raw, SECRET, id, 'contract'),
       body: raw,
     })
     assert.equal(response.status, 202)

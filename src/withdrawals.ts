@@ -25,8 +25,8 @@
  * `settlement.outbound.failed`. `stuck` produces neither. That is deliberate: `stuck` is not a
  * terminal state, it is a state waiting on a human, and a `.failed` emitted there would either have
  * to lie about `refundable` or be followed by a second terminal event for the same withdrawal when
- * the operator adjudicates it. `settlement.outbound.stuck` exists for the operator surfaces and
- * nothing that settles money subscribes to it.
+ * the operator adjudicates it. `settlement.withdrawal.stuck` exists for the operator surfaces and
+ * for notify, and nothing that settles money subscribes to it.
  */
 
 import type { AssetCode, Network } from '@cloudsforge/contracts-chain'
@@ -48,8 +48,8 @@ import { planOutbound, type OutboundTransaction } from './outbound.ts'
 import {
   SETTLEMENT_OUTBOUND_CONFIRMED,
   SETTLEMENT_OUTBOUND_FAILED,
-  SETTLEMENT_OUTBOUND_STUCK,
   SETTLEMENT_WITHDRAWAL_COMPLETED,
+  SETTLEMENT_WITHDRAWAL_STUCK,
   WALLET_WITHDRAWAL_REQUESTED,
   withInbox,
   type Db,
@@ -492,13 +492,42 @@ export function failedEvents(
  *
  * No consumer that moves money subscribes to this topic, and that is the design: a stuck
  * transaction has bytes that may still land, so anything that acted on it financially would be
- * acting without evidence. This pages an operator and populates the queue they work from.
+ * acting without evidence. This pages an operator and tells the user their withdrawal is late.
+ *
+ * ## The name was wrong, and the fix was NOT to emit both names
+ *
+ * `settlement.withdrawal.stuck` is the REGISTERED name — `@cloudsforge/contracts-events` owns it,
+ * keyed `chain:network` — and **this service was not emitting it.** It emitted
+ * `settlement.outbound.stuck`, keyed by the outbound row id, which no registry names and nothing
+ * subscribes to. `activity/src/classify.ts:383` and `notify/src/catalogue.ts:433` both classify the
+ * registered name, the latter at `priority: 'high'` because "Silence here is a user who believes
+ * their money has vanished" — so both were dead code, and a stuck withdrawal notified nobody. The
+ * one event in this file whose entire purpose is to reach a person reached none. It is the same
+ * defect as `wallet.deposit.credited` against `wallet.deposit.confirmed`.
+ *
+ * **The first fix emitted both, and it was refused, correctly.** `micro-contracts` was asked to
+ * register the second name and declined: the two carried ONE payload and differed only in their
+ * partition, no subscriber existed for the narrow one, and the row id it was keyed by is already on
+ * the payload as `outboundId`. Registering it would have put two official names on one fact —
+ * which is `wallet.deposit.credited` again, deliberately this time. So the second emit is gone
+ * rather than quarantined: a quarantine entry for something that has been refused is a lie the
+ * self-emptying check can never resolve.
+ *
+ * The operator surfaces lose nothing. They read `GET /v1/outbound?state=stuck`, not a subscription.
+ *
+ * The payload carries the fields its two consumers actually read — `notify` looks for
+ * `withdrawalId`, `amount`, `assetCode` and `reason`, and `activity`'s `userFromPayload` looks for
+ * `userId` — which is why it is `base(row)` plus those rather than something narrower.
  */
 export function stuckEvents(row: OutboundTransaction, reason: string): readonly DomainEvent[] {
   return [
     {
-      topic: SETTLEMENT_OUTBOUND_STUCK,
-      key: row.id,
+      topic: SETTLEMENT_WITHDRAWAL_STUCK,
+      // `chain:network`, as the registry declares. NOT the row id: `keyedBy` is the ordering
+      // partition, so it is contract, and a producer that picks its own key silently reorders every
+      // consumer's view of the topic. Keyed by the row, every event would be a partition of one and
+      // the ordering guarantee would say nothing at all.
+      key: `${row.chain}:${row.network}`,
       payload: {
         ...base(row),
         withdrawalId: row.purpose === 'withdrawal' ? row.sourceRef : null,

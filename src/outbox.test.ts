@@ -9,6 +9,12 @@
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, it } from 'node:test'
 import type postgres from 'postgres'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  classifyEnvelope,
+  verifyDelivery,
+} from '@cloudsforge/contracts-events'
 import { createRelay, signEvent, verifyEventSignature, withInbox, withOutbox, type Db } from './outbox.ts'
 import { enabled, migrateTestDb, openDb, quietLogger, resetSettlement, skip } from './testsupport.ts'
 
@@ -62,7 +68,7 @@ describe('the outbox', { skip }, () => {
   })
 
   it('delivers to the live subscription set and marks published only when nothing is outstanding', async () => {
-    const delivered: Array<Record<string, unknown>> = []
+    const delivered: Array<{ body: Record<string, unknown>; headers: Record<string, string> }> = []
     await withOutbox(db, 'settlement', async (_tx, emit) => {
       emit({ topic: 'settlement.outbound.confirmed', key: 'w1', payload: { withdrawalId: 'w1' } })
     })
@@ -77,7 +83,10 @@ describe('the outbox', { skip }, () => {
       signingSecret: SECRET,
       clientFor: () => ({
         async request(_path, options) {
-          delivered.push(options!.body as Record<string, unknown>)
+          delivered.push({
+            body: options!.body as Record<string, unknown>,
+            headers: (options!.headers ?? {}) as Record<string, string>,
+          })
           return undefined as never
         },
       }),
@@ -88,9 +97,31 @@ describe('the outbox', { skip }, () => {
     })
 
     assert.equal(delivered.length, 1)
+    const sent = delivered[0]!
     // A subscriber added AFTER the event was written still receives it: the delivery set is computed
     // from the live subscription list on every pass rather than fixed when the event was produced.
-    assert.equal((delivered[0] as { topic: string }).topic, 'settlement.outbound.confirmed')
+    assert.equal(sent.body['topic'], 'settlement.outbound.confirmed')
+
+    // ── WHAT ACTUALLY GOES ON THE WIRE ──────────────────────────────────────────────────────────
+    // Every one of these was wrong, and every one of them was invisible because this suite only
+    // ever looked at the topic. A consumer refuses the delivery before it parses the body, so the
+    // symptom is not a wrong answer — it is silence.
+    assert.equal(sent.headers[SIGNATURE_HEADER], sent.headers['cf-signature'])
+    assert.match(sent.headers['cf-signature'] ?? '', /^t=\d+,v1=[0-9a-f]{64}$/)
+    assert.equal(sent.headers['cf-event-id'], sent.body['id'])
+    assert.equal(sent.headers[EVENT_ID_HEADER], sent.body['id'])
+    // The pre-contract names must be gone, not merely accompanied.
+    assert.equal(sent.headers['x-cloudsforge-signature'], undefined)
+    assert.equal(sent.headers['x-event-id'], undefined)
+    // "major.minor", never the stored integer. `actor` and `correlationId` are never null.
+    assert.equal(sent.body['version'], '1.0')
+    assert.equal(sent.body['actor'], 'service:settlement')
+    assert.equal(sent.body['correlationId'], sent.body['id'])
+    // And the whole envelope is one the contract's own verifier accepts, signed over exactly the
+    // bytes `HttpClient` will send.
+    assert.equal(classifyEnvelope(sent.body).ok, true)
+    assert.equal(verifyDelivery(JSON.stringify(sent.body), sent.headers['cf-signature']!, SECRET).ok, true)
+
     const published = await sql<Array<{ published_at: Date | null }>>`select published_at from outbox`
     assert.ok(published[0]!.published_at)
   })
