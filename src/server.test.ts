@@ -277,6 +277,114 @@ describe('the HTTP surface', { skip }, () => {
     assert.equal(response.status, 202)
   })
 
+  /* ---------------------------------------------------------------- erasure */
+
+  /**
+   * The SECOND topic this service consumes, on the SAME route.
+   *
+   * These exercise the seam rather than the handler — `erasure.test.ts` covers what erasure does to
+   * each table. What is asserted here is that the erasure reaches the database through the same
+   * signature check and the same inbox as the withdrawal path, because a subscriber that verifies
+   * differently on its second topic is a subscriber with two security postures.
+   */
+  const postErasure = async (
+    userId: string,
+    options: { id?: string; tombstoneAt?: string } = {},
+  ) => {
+    const id = options.id ?? randomUUID()
+    const raw = JSON.stringify({
+      id,
+      topic: 'identity.user.deleted',
+      key: userId,
+      occurredAt: new Date().toISOString(),
+      producer: 'identity',
+      version: 1,
+      actor: null,
+      correlationId: null,
+      payload: {
+        userId,
+        tombstoneAt: options.tombstoneAt ?? '2026-09-01T00:00:00.000Z',
+        reason: 'user_requested',
+      },
+    })
+    const response = await fetch(`${base}/v1/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...deliveryHeaders(raw, SECRET, id, 'contract'),
+      },
+      body: raw,
+    })
+    return {
+      status: response.status,
+      body: JSON.parse(await response.text()) as Record<string, unknown>,
+      id,
+    }
+  }
+
+  const ERASED_USER = '33333333-3333-4333-8333-333333333333'
+
+  it('erases a user from a correctly signed identity.user.deleted', async () => {
+    await post(withdrawalPayload({ userId: ERASED_USER }))
+    const before = await sql<Array<{ n: number }>>`
+      select count(*)::int as n from outbound_transactions where user_id = ${ERASED_USER}
+    `
+    assert.equal(before[0]!.n, 1)
+
+    const { status, body } = await postErasure(ERASED_USER)
+    assert.equal(status, 202)
+    assert.equal(body['status'], 'erased')
+
+    const after = await sql<Array<{ user_id: string | null; erased_at: Date | null; raw_tx: string | null }>>`
+      select user_id, erased_at, raw_tx from outbound_transactions
+    `
+    assert.equal(after[0]?.user_id, null)
+    assert.notEqual(after[0]?.erased_at, null)
+  })
+
+  it('dedupes a redelivered erasure through the inbox', async () => {
+    await post(withdrawalPayload({ userId: ERASED_USER }))
+    const first = await postErasure(ERASED_USER)
+    assert.equal(first.body['status'], 'erased')
+    // The same envelope id, as an at-least-once relay would resend it.
+    const again = await postErasure(ERASED_USER, { id: first.id })
+    assert.equal(again.status, 202)
+    assert.equal(again.body['status'], 'duplicate')
+  })
+
+  it('refuses a forged erasure, and erases nothing', async () => {
+    await post(withdrawalPayload({ userId: ERASED_USER }))
+    const id = randomUUID()
+    const raw = JSON.stringify({
+      id,
+      topic: 'identity.user.deleted',
+      payload: { userId: ERASED_USER },
+    })
+    const response = await fetch(`${base}/v1/events`, {
+      method: 'POST',
+      headers: deliveryHeaders(raw, 'the-wrong-secret-0000000000000000', id, 'contract'),
+      body: raw,
+    })
+    assert.equal(response.status, 401)
+    const rows = await sql<Array<{ n: number }>>`
+      select count(*)::int as n from outbound_transactions where user_id = ${ERASED_USER}
+    `
+    assert.equal(rows[0]!.n, 1)
+  })
+
+  it('a malformed erasure is 400 and stays visible, never absorbed into a 202', async () => {
+    // The relay will retry it for ever, which is correct: an erasure this service cannot read is a
+    // person whose data is still here while the deletion is being reported as done.
+    const id = randomUUID()
+    const raw = JSON.stringify({ id, topic: 'identity.user.deleted', payload: { userId: 'nope' } })
+    const response = await fetch(`${base}/v1/events`, {
+      method: 'POST',
+      headers: deliveryHeaders(raw, SECRET, id, 'contract'),
+      body: raw,
+    })
+    assert.equal(response.status, 400)
+  })
+
   /* ---------------------------------------------------------------- adjudication */
 
   async function aStuckTransaction(): Promise<string> {

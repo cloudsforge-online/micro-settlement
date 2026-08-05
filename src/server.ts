@@ -80,12 +80,19 @@ import {
   type WithdrawalDeps,
 } from './withdrawals.ts'
 import {
+  IDENTITY_USER_DELETED,
+  UUID,
+  eraseUser,
+  erasureInstant,
+} from './erasure.ts'
+import {
   EVENT_ID_HEADER,
   LEGACY_EVENT_ID_HEADER,
   LEGACY_SIGNATURE_HEADER,
   SIGNATURE_HEADER,
   WALLET_WITHDRAWAL_REQUESTED,
   verifyInbound,
+  withInbox,
 } from './outbox.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
@@ -880,6 +887,62 @@ async function handleEvent(ctx: RequestContext, deps: ServerDeps): Promise<Reply
       ctx.log.info('withdrawal request handled', { eventId, decision })
       return { status: 200, body: { handled: true, decision } }
     }
+
+    /*
+     * 03 §2 rule 6, and the second topic this service consumes.
+     *
+     * Added to THIS route rather than beside it. A second `POST /v1/events` would mean a second
+     * signature check, a second dedupe, a second definition of "a topic we ignore" — and the two
+     * would drift, which is how one of them ends up 4xx-ing an event and pinning a relay in a
+     * retry loop while the other looks fine.
+     *
+     * `withInbox` is what makes at-least-once delivery effectively-once: the insert of
+     * `(topic, event_id)` and the handler share one transaction, so a handler that fails leaves no
+     * inbox row and the redelivery is processed rather than swallowed.
+     */
+    if (topic === IDENTITY_USER_DELETED) {
+      const userId = payload['userId']
+      // A 400, and the relay will retry it for ever — the same choice the header makes for a
+      // malformed withdrawal, for the same reason. An erasure this service cannot read is a person
+      // whose data is still here while the deletion is being reported as done.
+      if (typeof userId !== 'string' || !UUID.test(userId)) {
+        return errorReply(
+          400,
+          'bad_payload',
+          `${IDENTITY_USER_DELETED} requires a uuid userId`,
+          ctx.requestId,
+        )
+      }
+      const at = erasureInstant(payload['tombstoneAt'])
+      const outcome = await withInbox(deps.outbound.sql, topic, eventId, (tx) =>
+        eraseUser(tx, userId, at),
+      )
+      deps.metrics.increment('settlement_events_total', {
+        topic,
+        outcome: outcome.status === 'duplicate' ? 'duplicate' : 'erased',
+      })
+      // Counts and field names only. The user id is never logged: writing the identifier of the
+      // person who asked to be forgotten into an aggregator with its own retention would recreate
+      // the data this handler just removed.
+      ctx.log.info('erasure processed', {
+        eventId,
+        outcome: outcome.status,
+        ...(outcome.status === 'processed' ? outcome.value : {}),
+      })
+      if (outcome.status === 'processed' && outcome.value.outboundInFlight > 0) {
+        // Not a failure — the payment continues untouched — but an operator should not learn this
+        // from a dashboard a week later.
+        ctx.log.warn('erasure landed while money was in flight', {
+          eventId,
+          outboundInFlight: outcome.value.outboundInFlight,
+        })
+      }
+      return {
+        status: 202,
+        body: { handled: true, status: outcome.status === 'duplicate' ? 'duplicate' : 'erased' },
+      }
+    }
+
     deps.metrics.increment('settlement_events_total', { topic, outcome: 'unsubscribed' })
     return { status: 202, body: { handled: false, reason: 'not a topic this service consumes' } }
   } finally {

@@ -545,6 +545,103 @@ export const MIGRATIONS: readonly Migration[] = [
         where depends_on is not null and state = 'planned';
     `,
   },
+  {
+    version: 9,
+    name: 'erasure',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- RIGHT TO ERASURE — THE HALF THAT BELONGS IN THE SCHEMA.
+      --
+      -- 03 §2 rule 6: every service storing a user reference subscribes to 'identity.user.deleted'
+      -- and erases. Which rows, and why each one is treated the way it is, is written out in
+      -- 'src/erasure.ts'. What is here is only what a handler cannot be trusted with.
+      --
+      -- ── WHY THIS SERVICE ANONYMISES RATHER THAN DELETES, IN ONE SENTENCE ────────────────────
+      --
+      -- Every row here is about a movement of coin on a public chain that cannot be un-made, and
+      -- 'outbound_transactions.raw_tx' holds the exact signed bytes that made it. Deleting the row
+      -- does not delete the transaction; it deletes the platform's own record of it — the record
+      -- that answers "was this withdrawal authorised, by whom, against which reservation" — while
+      -- leaving the movement itself in public view for ever.
+      --
+      -- 'erased_at' IS NOT DECORATION. 'user_id' is already nullable and a null already MEANS
+      -- something specific in this service: 'withdrawals.ts:544' documents it as "a row that
+      -- predates the column being written", for which "unreachable is the correct answer". Without
+      -- a second column those two states are indistinguishable, and an erasure would be invisible
+      -- to the audit that has to prove it happened. The timestamp is also the anchor for the
+      -- retention clock: it is set from the event's own 'tombstoneAt', not from now().
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+
+      alter table outbound_transactions add column if not exists erased_at timestamptz;
+      alter table sweep_sources        add column if not exists erased_at timestamptz;
+
+      -- An erased outbound transaction names nobody. Stated as a constraint because the handler
+      -- writes both columns in one statement today and a future path that writes only one would
+      -- otherwise produce a row that claims to be erased and still is not.
+      alter table outbound_transactions
+        add constraint outbound_erased_names_no_user
+        check (erased_at is null or user_id is null);
+
+      -- The access path for an operator asking what has been erased, and for any future retention
+      -- sweep. Partial, because in a healthy estate almost nothing is in it.
+      create index if not exists outbound_erased_idx
+        on outbound_transactions (erased_at)
+        where erased_at is not null;
+
+      -- ── THE TRANSITION, WHICH NO CHECK CAN SEE ──────────────────────────────────────────────
+      --
+      -- Once erased, a row cannot be re-attributed and cannot be un-erased — by anything, a psql
+      -- session included. Erasure that a later UPDATE can undo is not erasure.
+      create or replace function settlement_outbound_erasure_is_final() returns trigger as $$
+      begin
+        if old.erased_at is null then return new; end if;
+        if new.erased_at is null then
+          raise exception 'an erased outbound transaction cannot be un-erased (%)', old.id;
+        end if;
+        if new.user_id is not null then
+          raise exception 'an erased outbound transaction cannot be re-attributed (%)', old.id;
+        end if;
+        return new;
+      end;
+      $$ language plpgsql;
+
+      drop trigger if exists outbound_erasure_final on outbound_transactions;
+      create trigger outbound_erasure_final
+        before update on outbound_transactions
+        for each row execute function settlement_outbound_erasure_is_final();
+
+      -- ── SWEEP SOURCES ARE MARKED, NOT STRIPPED, AND THE BINDING IS WHY ──────────────────────
+      --
+      -- 'custody_user_id' on a sweep source is the end user's id: wallet mints a deposit address
+      -- with 'userId: input.userId' (wallet/src/deposits.ts) and settlement must restate that value
+      -- CHARACTER FOR CHARACTER or custody refuses to sign (custody/src/gates.ts:182, and the 403
+      -- deliberately does not say which field disagreed). Null it and every coin at that address is
+      -- stranded for ever, including coin that arrives after the deletion — 'src/server.ts:739'
+      -- already says "a guessed binding is a sweep refused every tick for ever".
+      --
+      -- So the row is marked and kept whole. What the trigger adds is that a marked row cannot be
+      -- quietly rebound to a different custody account: registration is an upsert keyed on
+      -- (chain, network, address_key), so without this a later register call could re-attribute an
+      -- erased person's address.
+      create or replace function settlement_sweep_source_erasure_is_final() returns trigger as $$
+      begin
+        if old.erased_at is null then return new; end if;
+        if new.erased_at is null then
+          raise exception 'an erased sweep source cannot be un-erased (%)', old.id;
+        end if;
+        if new.custody_user_id is distinct from old.custody_user_id then
+          raise exception 'an erased sweep source cannot be re-attributed (%)', old.id;
+        end if;
+        return new;
+      end;
+      $$ language plpgsql;
+
+      drop trigger if exists sweep_source_erasure_final on sweep_sources;
+      create trigger sweep_source_erasure_final
+        before update on sweep_sources
+        for each row execute function settlement_sweep_source_erasure_is_final();
+    `,
+  },
 ]
 
 /**
