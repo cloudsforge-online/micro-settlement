@@ -51,6 +51,7 @@ import {
   SETTLEMENT_WITHDRAWAL_COMPLETED,
   SETTLEMENT_WITHDRAWAL_STUCK,
   WALLET_WITHDRAWAL_REQUESTED,
+  emitInto,
   withInbox,
   type Db,
   type DomainEvent,
@@ -164,6 +165,13 @@ export type WithdrawalDecision =
   | { readonly kind: 'planned'; readonly outboundId: string }
   | { readonly kind: 'duplicate'; readonly outboundId: string | null }
   | { readonly kind: 'ignored'; readonly reason: string }
+  /**
+   * Accepted, refused, and the reservation released. **No outbound row exists and none ever will.**
+   *
+   * The one shape here that ends a withdrawal without a transaction to end it. See
+   * `refuseUnpayable` for the whole of why it has to exist.
+   */
+  | { readonly kind: 'refused'; readonly reason: string }
 
 export interface WithdrawalDeps extends TreasuryDeps {
   readonly producer: string
@@ -201,7 +209,16 @@ export async function handleWithdrawalRequested(
   }
 
   const outcome = await withInbox(deps.sql, WALLET_WITHDRAWAL_REQUESTED, input.eventId, async (tx: Tx) => {
-    const treasury = await resolveSource(deps, request.chain, request.network, tx)
+    let treasury: string
+    try {
+      treasury = await resolveSource(deps, request.chain, request.network, tx)
+    } catch (err) {
+      if (err instanceof NoTreasuryPinnedError) {
+        await refuseUnpayable(tx, deps.producer, request, input.correlationId)
+        return { refusal: err.message } as const
+      }
+      throw err
+    }
     const { outbound, created } = await planOutbound(tx, {
       purpose: 'withdrawal',
       chain: request.chain,
@@ -224,9 +241,93 @@ export async function handleWithdrawalRequested(
   })
 
   if (outcome.status === 'duplicate') return { kind: 'duplicate', outboundId: null }
+  if ('refusal' in outcome.value) return { kind: 'refused', reason: outcome.value.refusal }
   return outcome.value.created
     ? { kind: 'planned', outboundId: outcome.value.outbound.id }
     : { kind: 'duplicate', outboundId: outcome.value.outbound.id }
+}
+
+/**
+ * A chain nothing can be paid out of. **Accept the event, refuse the withdrawal, give the money
+ * back — now, in the same transaction, and never by leaving it queued.**
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ## THE DEFECT THIS CLOSES, MEASURED ON THE MAINNET ESTATE
+ *
+ * `resolveSource` used to let `NoTreasuryPinnedError` out of the inbox transaction, so the event
+ * was NOT marked received and the relay redelivered it. The comment that used to sit here argued
+ * that was "the right failure", because an operator who pins a treasury a minute later gets the
+ * withdrawal paid rather than refunded. Three things were wrong with it, and the third is the one
+ * that matters:
+ *
+ *   1. **The user is told nothing, for an hour.** `POST /v1/withdrawals` answered 201 `queued`, the
+ *      reservation held the balance, and no error existed anywhere a person could see. wallet's
+ *      `sweepStuck` moves it to `stuck` after `WALLET_WITHDRAWAL_STUCK_MINUTES`, which is an
+ *      operator page and STILL NOT A REFUND — `stuck` deliberately never auto-refunds, because it
+ *      means "a signed payment needs a human". Nothing here was ever signed. So the money sat
+ *      reserved, indefinitely, awaiting a manual release for a payment that was refused instantly.
+ *
+ *   2. **"An operator pins one a minute later" is not the case this fires in.** `requireTreasury`
+ *      throws this only when custody answers 404 AND this service holds no row of its own; a
+ *      custody outage or a bad credential raises `CustodyUnavailableError` or
+ *      `CustodySignRefusedError`, which still throw and are still redelivered. What is left is
+ *      genuinely "nobody has ever provisioned this chain" — permanent until an operator acts, and
+ *      an operator who acts in the next hour costs the user one re-request, which is cheaper than
+ *      an hour of held funds and a manual release.
+ *
+ *   3. **It blocked every other event to this service.** wallet's relay opens a circuit breaker per
+ *      subscriber. One unplannable withdrawal returned 500 on every redelivery — 1,315 attempts on
+ *      the estate, `circuit open for subscriber:settlement:4000` — so the channel carrying EVERY
+ *      wallet event to settlement was held open by a single row nobody could act on. That is
+ *      head-of-line blocking, on the money path, caused by a refusal being modelled as a fault.
+ *
+ * ## What is emitted, and why there is no row behind it
+ *
+ * `settlement.outbound.failed` with `refundable: true` — the same topic, the same shape and the
+ * same consumers as `failedEvents`, which is why this is a refusal and not a new topic. wallet's
+ * `POST /events` handler reads `refundable === true` and refunds the reservation; `activity` and
+ * `notify` resolve the person from `payload.userId`, which is why that field is here and is taken
+ * from the request rather than guessed from the key.
+ *
+ * It cannot go through `failedEvents` because that takes an `OutboundTransaction` and there is no
+ * transaction: the `from` address is the treasury, and the whole of this branch is that there
+ * isn't one. Writing a row with a null or invented `from` to reach a shared helper would put a
+ * transaction that can never be built into the state machine that exists to make every row
+ * reachable.
+ *
+ * `refundable: true` is a PROOF here, not an assumption, and it is the strongest form of it in the
+ * service: nothing was planned, so nothing was built, so nothing was signed, so nothing can be in
+ * a mempool. The rule this file is arranged around — never give money back for something that
+ * might still land — is satisfied by construction rather than by inspection.
+ *
+ * The inbox row IS written, inside the same transaction as the emit. A redelivery is therefore a
+ * `duplicate` and cannot refund twice, and the circuit breaker closes because the delivery
+ * succeeded.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+async function refuseUnpayable(
+  tx: Tx,
+  producer: string,
+  request: ReturnType<typeof parseWithdrawalRequested>,
+  correlationId: string,
+): Promise<void> {
+  await emitInto(tx, producer, [
+    {
+      topic: SETTLEMENT_OUTBOUND_FAILED,
+      key: request.withdrawalId,
+      payload: {
+        withdrawalId: request.withdrawalId,
+        userId: request.userId,
+        // The user's words, not the operator's. They cannot act on a treasury pin, so the message
+        // says what happened to their money and that trying again is worth doing.
+        reason:
+          `${request.assetCode} withdrawals are not available on this deployment yet, so this has ` +
+          'been returned to your balance. Please try again later.',
+        refundable: true,
+      },
+      correlationId,
+    },
+  ])
 }
 
 /**
@@ -238,10 +339,9 @@ export async function handleWithdrawalRequested(
  * derived from the chain and network alone, so a rotation would produce a 403 whose message says
  * nothing about which address it was for.
  *
- * A chain with no pinned treasury throws here, inside the inbox transaction, so the event is NOT
- * marked received and the relay redelivers it once an operator has provisioned one. That is the
- * right failure: the alternative is a `planned` row on a chain that cannot pay it, which is a
- * withdrawal that quietly refunds itself at the stuck deadline.
+ * A chain with no pinned treasury throws `NoTreasuryPinnedError`, which the caller turns into a
+ * refusal and a refund rather than a redelivery — see `refuseUnpayable`. Everything else it can
+ * throw is transient and still propagates, so the event is not marked received and is retried.
  */
 async function resolveSource(
   deps: WithdrawalDeps,

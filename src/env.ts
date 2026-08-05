@@ -23,6 +23,7 @@
  */
 
 import { hostname } from 'node:os'
+import { CREDENTIAL_PREFIX } from '@cloudsforge/auth'
 import type { Network } from '@cloudsforge/contracts-chain'
 
 /**
@@ -72,6 +73,24 @@ function requiredSecret(source: Source, name: string, minLength = 24): string {
   }
   // Length is a proxy for entropy and the only one available here. It is set above the point at
   // which a human-chosen string is plausible, so a memorable password fails this check too.
+  if (value.length < minLength) {
+    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
+  }
+  return value
+}
+
+/**
+ * `requiredSecret`'s checks, applied to a value that is allowed to be absent.
+ *
+ * Absent is `null`; PRESENT AND WEAK still throws. That asymmetry is the point: an optional secret
+ * whose checks were also optional is one a deployment can set to `changeme` and never hear about.
+ */
+function optionalSecret(source: Source, name: string, minLength = 24): string | null {
+  const value = source[name]?.trim()
+  if (!value) return null
+  if (PLACEHOLDERS.has(value.toLowerCase())) {
+    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
+  }
   if (value.length < minLength) {
     throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
   }
@@ -227,8 +246,51 @@ export interface Env {
   readonly custodyUrl: string
   readonly indexerUrl: string
   readonly ledgerUrl: string
-  /** The scoped service credential. Not shared: SD-05. */
-  readonly serviceToken: string
+
+  /**
+   * Where identity is, for `POST /service-tokens/exchange`.
+   *
+   * Defaults to `IDENTITY_ISSUER`, which is already required and is identity's own base URL — the
+   * issuer of a token is by definition where the token came from. `IDENTITY_URL` overrides it for a
+   * deployment where the two genuinely differ (an issuer behind a public name, dialled internally).
+   * Deriving rather than demanding a fourth identity variable keeps the two in step: a deployment
+   * that pointed the exchange at one identity and trusted the JWKS of another would fail with a
+   * signature error nobody would read as a configuration mistake.
+   */
+  readonly identityUrl: string
+
+  /**
+   * **The long-lived credential this service exchanges for short-lived tokens. SD-05: not shared.**
+   *
+   * It replaces `SETTLEMENT_SERVICE_TOKEN`, which was a 600-second token read once at boot. Ten
+   * minutes into every deployment it expired and every call to custody, the indexer and the ledger
+   * failed 401 — measured live, see `upstreams.ts`. A credential is not a token: it confers nothing
+   * by itself, it is revocable, and it survives a restart.
+   *
+   * **Read from `SETTLEMENT_IDENTITY_CREDENTIAL` first, then from `SETTLEMENT_SERVICE_TOKEN` when
+   * that value carries the `cfsc_` prefix.** The second is not sloppiness: settlement's compose
+   * block passes only `SETTLEMENT_SERVICE_TOKEN`, so on the live estate the credential the
+   * bootstrap mints reaches no container, and accepting it under either name lets the cliff be
+   * closed by changing one VALUE rather than by waiting for a deploy edit. The prefix decides, and
+   * it is unambiguous: identity's credentials begin `cfsc_` and its tokens are JWTs beginning
+   * `eyJ`.
+   *
+   * OPTIONAL, AND THAT IS DELIBERATE — but it is not "unconfigured is fine". Everything this
+   * service does crosses a service boundary, so settlement with no credential can sign nothing and
+   * broadcast nothing. It is optional because it must be possible to BOOT the image without one:
+   * CI's startup smoke test builds the container, migrates it and reads `/livez` with a fixed
+   * environment. `/readyz` is where the absence is enforced, as a HARD probe.
+   */
+  readonly identityCredential: string | null
+
+  /**
+   * Whether `SETTLEMENT_SERVICE_TOKEN` is still carrying an actual TOKEN rather than a credential.
+   *
+   * Read for exactly one purpose: to say so at boot. An operator who redeploys with the old value
+   * would otherwise get a service that looks configured and is not — which is the same defect,
+   * arriving ten minutes later and looking like custody's fault.
+   */
+  readonly legacyServiceTokenPresent: boolean
   readonly upstreamDeadlineMs: number
 
   /**
@@ -344,6 +406,16 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   // than about a list it never set.
   const outboxSigningSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET')
 
+  // The credential, from either name. See `Env.identityCredential` for why the second name is read
+  // at all, and `upstreams.ts` for what reading only the first would have cost on the live estate.
+  const declared = optionalSecret(source, 'SETTLEMENT_IDENTITY_CREDENTIAL')
+  const carried = optionalSecret(source, 'SETTLEMENT_SERVICE_TOKEN')
+  const carriesCredential = carried !== null && carried.startsWith(CREDENTIAL_PREFIX)
+  const identityCredential = declared ?? (carriesCredential ? carried : null)
+  // A `SETTLEMENT_SERVICE_TOKEN` that is not a credential is the retired ten-minute token. Kept
+  // only so `index.ts` can say so at boot; it is never presented to a peer.
+  const legacyToken = carriesCredential ? null : carried
+
   return {
     port: integer(source, 'PORT', 4000, 1, 65_535),
     env: optional(source, 'NODE_ENV', 'development'),
@@ -368,7 +440,9 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     custodyUrl: required(source, 'CUSTODY_URL'),
     indexerUrl: required(source, 'INDEXER_URL'),
     ledgerUrl: required(source, 'LEDGER_URL'),
-    serviceToken: requiredSecret(source, 'SETTLEMENT_SERVICE_TOKEN'),
+    identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
+    identityCredential,
+    legacyServiceTokenPresent: legacyToken !== null,
     upstreamDeadlineMs: integer(source, 'SETTLEMENT_UPSTREAM_DEADLINE_MS', 8_000, 250, 60_000),
 
     rpcUrls: jsonMap(source, 'SETTLEMENT_RPC_URLS', '{}'),

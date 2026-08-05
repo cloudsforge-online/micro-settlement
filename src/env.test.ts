@@ -17,6 +17,14 @@ import { describe, it } from 'node:test'
  * exit, with one structured fatal line and no test results. Every failure case below goes through
  * `loadEnv`, which is pure over its source and therefore testable without a child process.
  */
+/**
+ * A credential, not a token. The `cfsc_` prefix is what tells the two apart, and it is the whole of
+ * the decision `loadEnv` makes below — so the literal has to carry it.
+ */
+const CREDENTIAL = 'cfsc_TToR-eOeVTDnqhX1-nu6-u7DoCr4MCfa86g4g6kd404'
+/** A JWT-shaped value. Identity's tokens begin `eyJ`; this is the thing that dies in ten minutes. */
+const LEGACY_TOKEN = 'eyJhbGciOiJSUzI1NiJ9.a-real-service-token-00000000000.sig'
+
 const BASE: Record<string, string> = {
   SETTLEMENT_DATABASE_URL: 'postgres://settlement@localhost/settlement',
   IDENTITY_JWKS_URL: 'http://127.0.0.1:4001/.well-known/jwks.json',
@@ -25,7 +33,7 @@ const BASE: Record<string, string> = {
   CUSTODY_URL: 'http://127.0.0.1:4005',
   INDEXER_URL: 'http://127.0.0.1:4006',
   LEDGER_URL: 'http://127.0.0.1:4004',
-  SETTLEMENT_SERVICE_TOKEN: 'a-real-service-token-00000000000',
+  SETTLEMENT_IDENTITY_CREDENTIAL: CREDENTIAL,
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
 
@@ -55,6 +63,9 @@ describe('loadEnv', () => {
 
   it('names the variable that is missing', () => {
     for (const name of Object.keys(BASE)) {
+      // The credential is deliberately OPTIONAL — the image must boot without one so CI's startup
+      // smoke test can read /livez. `/readyz` is where its absence is enforced, as a hard probe.
+      if (name === 'SETTLEMENT_IDENTITY_CREDENTIAL') continue
       const source = { ...BASE }
       delete source[name]
       assert.throws(
@@ -63,6 +74,59 @@ describe('loadEnv', () => {
         `a missing ${name} must name itself`,
       )
     }
+  })
+
+  /**
+   * **The ten-minute cliff, at the only place it can still be reintroduced.**
+   *
+   * `index.ts:83` read `SETTLEMENT_SERVICE_TOKEN` — a 600-second JWT — once at boot and presented
+   * it to custody, the indexer and the ledger for the life of the process. On the mainnet estate
+   * that meant one exchange ever, on 2026-08-04, and every treasury-pin read since answering 401.
+   * What `loadEnv` now decides is which of the two variables holds a CREDENTIAL, and it decides it
+   * from the prefix rather than from the variable's name.
+   */
+  describe('the identity credential', () => {
+    it('takes SETTLEMENT_IDENTITY_CREDENTIAL when it is set', () => {
+      const env = loadEnv({ ...BASE, SETTLEMENT_SERVICE_TOKEN: LEGACY_TOKEN })
+      assert.equal(env.identityCredential, CREDENTIAL)
+      // Still reported, because an operator who leaves the retired variable set should hear so.
+      assert.equal(env.legacyServiceTokenPresent, true)
+    })
+
+    it('accepts a credential carried in SETTLEMENT_SERVICE_TOKEN', () => {
+      // Settlement's compose block passes only this variable, so this is how the live estate closes
+      // the cliff without a deploy edit. See `Env.identityCredential`.
+      const source: Record<string, string> = { ...BASE, SETTLEMENT_SERVICE_TOKEN: CREDENTIAL }
+      delete source['SETTLEMENT_IDENTITY_CREDENTIAL']
+      const env = loadEnv(source)
+      assert.equal(env.identityCredential, CREDENTIAL)
+      assert.equal(env.legacyServiceTokenPresent, false)
+    })
+
+    it('IGNORES a SETTLEMENT_SERVICE_TOKEN that is an actual token, and says so', () => {
+      const source: Record<string, string> = { ...BASE, SETTLEMENT_SERVICE_TOKEN: LEGACY_TOKEN }
+      delete source['SETTLEMENT_IDENTITY_CREDENTIAL']
+      const env = loadEnv(source)
+      // Never presented to a peer. Using it IS the defect — it would work for ten minutes.
+      assert.equal(env.identityCredential, null)
+      assert.equal(env.legacyServiceTokenPresent, true)
+    })
+
+    it('boots with neither, because the image must be startable', () => {
+      const source = { ...BASE }
+      delete source['SETTLEMENT_IDENTITY_CREDENTIAL']
+      const env = loadEnv(source)
+      assert.equal(env.identityCredential, null)
+      assert.equal(env.legacyServiceTokenPresent, false)
+    })
+
+    it('defaults the exchange URL to the issuer, and lets IDENTITY_URL override it', () => {
+      assert.equal(loadEnv(BASE).identityUrl, BASE['IDENTITY_ISSUER'])
+      assert.equal(
+        loadEnv({ ...BASE, IDENTITY_URL: 'http://identity:4000' }).identityUrl,
+        'http://identity:4000',
+      )
+    })
   })
 
   it('refuses a placeholder secret outright', () => {

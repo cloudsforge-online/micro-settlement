@@ -231,26 +231,92 @@ describe('taking wallet.withdrawal.requested', { skip }, () => {
   })
 
   /**
-   * A chain with no pinned treasury must NOT leave a planned row.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   * **A CHAIN WITH NO TREASURY REFUSES AND REFUNDS. IT DOES NOT QUEUE THE USER'S MONEY.**
    *
-   * The throw happens inside the inbox transaction, so the event is not marked received and the
-   * relay redelivers it once an operator has provisioned one. A planned row on a chain that cannot
-   * pay it is a withdrawal that quietly refunds itself at the stuck deadline instead.
+   * This asserted the opposite until today: `NoTreasuryPinnedError` was allowed out of the inbox
+   * transaction so the event stayed redeliverable, on the argument that an operator pinning a
+   * treasury a minute later would get the withdrawal paid rather than refunded. Measured on the
+   * mainnet estate, that argument cost three things:
+   *
+   *   * the user saw 201 `queued` and then nothing, with the balance reserved, for an hour — and
+   *     wallet's deadline moves it to `stuck`, which is an operator page and NOT a refund;
+   *   * this branch does not fire for a transient fault. Custody being down or a credential being
+   *     wrong raises `CustodyUnavailableError` / `CustodySignRefusedError`, which still throw and
+   *     are still redelivered. It fires only for "nobody ever provisioned this chain";
+   *   * wallet's relay opens a circuit breaker per subscriber, so one unplannable withdrawal
+   *     returning 500 on every redelivery — 1,315 attempts, `circuit open for
+   *     subscriber:settlement:4000` — held the channel carrying EVERY wallet event to this service.
+   *
+   * `refundable: true` is a proof rather than an assumption here: nothing was planned, so nothing
+   * was built, so nothing was signed, so nothing can be in a mempool.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
    */
-  it('refuses the event outright when no treasury is pinned, leaving nothing behind', async () => {
+  it('refuses and refunds when no treasury is pinned, rather than queueing for ever', async () => {
     const deps = harness(sql)
+    const decision = await handleWithdrawalRequested(deps.withdrawals, {
+      eventId: randomUUID(),
+      payload: withdrawalPayload(),
+      correlationId: 'r',
+    })
+
+    assert.equal(decision.kind, 'refused')
+    const outbound = await sql`select count(*)::int as n from outbound_transactions`
+    assert.equal(outbound[0]!.n, 0, 'no row that can never be built')
+
+    // ACCEPTED, so the relay stops retrying and its circuit breaker closes.
+    const inbox = await sql`select count(*)::int as n from inbox`
+    assert.equal(inbox[0]!.n, 1)
+
+    // The terminal event wallet refunds on. Same topic, same shape, same consumers as every other
+    // failure — a refusal is not a new contract.
+    const events = await sql<{ topic: string; key: string; payload: Record<string, unknown> }[]>`
+      select topic, key, payload from outbox
+    `
+    assert.equal(events.length, 1)
+    assert.equal(events[0]!.topic, 'settlement.outbound.failed')
+    assert.equal(events[0]!.key, '11111111-1111-4111-8111-111111111111')
+    assert.equal(events[0]!.payload['refundable'], true)
+    // The field without which the event reaches nobody: `activity` and `notify` both resolve the
+    // person from the payload, never from the key — which is also a uuid and would be wrong.
+    assert.equal(events[0]!.payload['userId'], '22222222-2222-4222-8222-222222222222')
+    assert.match(String(events[0]!.payload['reason']), /returned to your balance/)
+  })
+
+  it('refunds once however often the refusal is redelivered', async () => {
+    const deps = harness(sql)
+    const eventId = randomUUID()
+    const payload = withdrawalPayload()
+    const first = await handleWithdrawalRequested(deps.withdrawals, { eventId, payload, correlationId: 'r' })
+    const again = await handleWithdrawalRequested(deps.withdrawals, { eventId, payload, correlationId: 'r' })
+
+    assert.equal(first.kind, 'refused')
+    // The inbox row and the emit share one transaction, so a redelivery cannot refund a second time.
+    assert.equal(again.kind, 'duplicate')
+    const events = await sql`select count(*)::int as n from outbox`
+    assert.equal(events[0]!.n, 1)
+  })
+
+  /**
+   * The transient half, and it must stay transient. A custody that cannot be reached is not a chain
+   * with no treasury: the pin may well exist, and refunding on "we could not ask" would give money
+   * back for a withdrawal that is about to be perfectly payable.
+   */
+  it('still redelivers when custody could not be asked', async () => {
+    const deps = harness(sql)
+    deps.custody.failTreasuryPin(new CustodyUnavailableError('custody is down'))
     await assert.rejects(
       handleWithdrawalRequested(deps.withdrawals, {
         eventId: randomUUID(),
         payload: withdrawalPayload(),
         correlationId: 'r',
       }),
-      NoTreasuryPinnedError,
+      CustodyUnavailableError,
     )
-    const outbound = await sql`select count(*)::int as n from outbound_transactions`
     const inbox = await sql`select count(*)::int as n from inbox`
-    assert.equal(outbound[0]!.n, 0)
+    const events = await sql`select count(*)::int as n from outbox`
     assert.equal(inbox[0]!.n, 0, 'the event must stay redeliverable')
+    assert.equal(events[0]!.n, 0, 'and nothing may be refunded on a fault')
   })
 
   /**

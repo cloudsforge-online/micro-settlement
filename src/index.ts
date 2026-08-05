@@ -20,7 +20,7 @@
 import postgres from 'postgres'
 import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
-import { Verifier } from '@cloudsforge/auth'
+import { Verifier, serviceTokenProbe } from '@cloudsforge/auth'
 import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
 import { SERVICE, env } from './env.ts'
@@ -28,9 +28,7 @@ import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer, implementedChains, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
 import { rpcFactory } from './registry.ts'
-import { httpCustodyClient } from './custodyclient.ts'
-import { httpIndexerClient } from './indexerclient.ts'
-import { httpLedgerClient } from './ledgerclient.ts'
+import { buildUpstreams } from './upstreams.ts'
 import type { Db } from './outbox.ts'
 import type { OutboundDeps } from './outbound.ts'
 import type { WorkerDeps } from './worker.ts'
@@ -78,25 +76,51 @@ try {
   process.exit(1)
 }
 
-// 5. The upstreams. Constructed before the Lifecycle so its probes can close over their URLs, and
-//    all three take the same scoped service token — never a shared one (SD-05).
-const token = () => env.serviceToken
-const custody = httpCustodyClient({
-  baseUrl: env.custodyUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
-})
-const indexer = httpIndexerClient({
-  baseUrl: env.indexerUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
-})
-const ledger = httpLedgerClient({
-  baseUrl: env.ledgerUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
+// 5. The upstreams, and the credential that authenticates every call to them. Constructed before
+//    the Lifecycle so its probes can close over them, and all three take the same scoped credential
+//    — never a shared one (SD-05). The wiring itself lives in `./upstreams.ts` and is covered by
+//    `servicetoken.test.ts`: it was untestable here, and what was untestable here was wrong for
+//    months. See that file.
+const { identityTokens, custody, indexer, ledger } = buildUpstreams(env, {
   originatingService: SERVICE,
+  onEvent: (event) => {
+    if (event.kind === 'exchange_failed') {
+      // `warn`, not `error`, while a usable token is still held: the 20% slack after the refresh
+      // point exists precisely so a few of these are survivable and uninteresting.
+      const level = event.hadUsableToken ? 'warn' : 'error'
+      logger[level]('service token exchange failed', {
+        err: event.err,
+        hadUsableToken: event.hadUsableToken,
+      })
+    } else if (event.kind === 'minted') {
+      logger.info('service token minted', {
+        service: event.service,
+        expiresIn: event.expiresIn,
+        refreshInMs: event.refreshInMs,
+      })
+    } else {
+      logger.warn('service token', { event: event.kind, url: event.url })
+    }
+  },
 })
+
+if (!identityTokens) {
+  // Not `fatal` and exit: the image must be able to boot without this so CI's startup smoke test
+  // can read /livez, and a service that refuses to start is a service whose logs nobody reads.
+  // `/readyz` is where the absence is enforced — the `identity-credential` probe below is hard, so
+  // an unconfigured replica takes no traffic.
+  logger.error('no identity credential is configured; every call to a peer will fail 503', {
+    hint:
+      'set SETTLEMENT_IDENTITY_CREDENTIAL, or put the cfsc_… credential in SETTLEMENT_SERVICE_TOKEN. ' +
+      'deploy/scripts/estate-bootstrap.sh already mints it into compose/estate/tokens.env',
+  })
+}
+if (env.legacyServiceTokenPresent) {
+  logger.error('SETTLEMENT_SERVICE_TOKEN carries a TOKEN, not a credential, and is IGNORED', {
+    hint: 'it is a 600-second token read once at boot; a cfsc_… credential replaces it',
+  })
+}
+
 const rpc = rpcFactory({ urls: env.rpcUrls, deadlineMs: env.rpcDeadlineMs })
 
 // 6. The Lifecycle and its probes, before the routes, because `/readyz` is a route and it needs
@@ -125,6 +149,12 @@ lifecycle
     ),
   )
   .addProbe(httpProbe('identity-jwks', env.identityJwksUrl, { kind: 'soft' }))
+  // HARD, and the only hard probe here besides the database. Unlike the three below, this does not
+  // report a peer having a bad minute — it fails only when no credential is configured at all,
+  // which is a deployment that can neither sign nor broadcast and will not fix itself. An identity
+  // OUTAGE returns warn, deliberately, so one bad minute in identity does not empty every balancer
+  // in the estate at once.
+  .addProbe(serviceTokenProbe(identityTokens))
   // SOFT, all three, and deliberately. Custody being down means no new signature can be made — but
   // this service must stay in its balancer to keep ADVANCING transactions that are already signed,
   // which is the state where a user's money is actually at risk. Marking any of them hard would

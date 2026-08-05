@@ -401,6 +401,15 @@ export interface FakeCustody extends CustodyClient {
   refuseSigning(code: string, message: string): void
   failSigning(err: Error): void
   /**
+   * Make the next `treasuryPin` read FAIL rather than answer "nothing is pinned".
+   *
+   * The two are different facts and `handleWithdrawalRequested` now acts on the difference: a 404
+   * is "no operator has provisioned this chain", which refuses and refunds, while a fault is "we
+   * could not ask", which must be redelivered. A fake that could not tell them apart would let the
+   * refund branch be reached by an outage.
+   */
+  failTreasuryPin(err: Error): void
+  /**
    * Called just before each signature is produced. The concurrency test uses it to interleave two
    * workers deliberately, so the proof is not an accident of scheduling.
    *
@@ -418,6 +427,7 @@ export function fakeCustody(options: { readonly mint?: string } = {}): FakeCusto
   const tokens: CustodyTokenContract[] = []
   let refusal: { code: string; message: string } | null = null
   let failure: Error | null = null
+  let pinFailure: Error | null = null
   let minted = 0
 
   const fake: FakeCustody = {
@@ -440,6 +450,9 @@ export function fakeCustody(options: { readonly mint?: string } = {}): FakeCusto
     },
     failSigning(err) {
       failure = err
+    },
+    failTreasuryPin(err) {
+      pinFailure = err
     },
     async sign(request: SignRequest): Promise<SignedResult> {
       requests.push(request)
@@ -467,6 +480,7 @@ export function fakeCustody(options: { readonly mint?: string } = {}): FakeCusto
       return { signedTx, auditId: `audit-${signatures.length}` }
     },
     async treasuryPin(chain, network) {
+      if (pinFailure) throw pinFailure
       return pins.get(`${chain}:${network}`) ?? null
     },
     async mintTreasury(chain, network): Promise<TreasuryCandidate> {

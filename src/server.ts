@@ -884,7 +884,14 @@ async function handleEvent(ctx: RequestContext, deps: ServerDeps): Promise<Reply
         correlationId: ctx.requestId,
       })
       deps.metrics.increment('settlement_events_total', { topic, outcome: decision.kind })
-      ctx.log.info('withdrawal request handled', { eventId, decision })
+      if (decision.kind === 'refused') {
+        // WARN, not info: a person has just been told their withdrawal will not happen, and the
+        // cause is an operator's omission rather than anything they or this service did wrong. The
+        // fix is `POST /v1/treasuries/:chain/:network/provision`, and the reason carries it.
+        ctx.log.warn('withdrawal refused and refunded — this chain cannot pay', { eventId, decision })
+      } else {
+        ctx.log.info('withdrawal request handled', { eventId, decision })
+      }
       return { status: 200, body: { handled: true, decision } }
     }
 
