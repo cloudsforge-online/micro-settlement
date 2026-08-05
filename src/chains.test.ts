@@ -78,11 +78,17 @@ describe('the registry', () => {
     }
   })
 
-  it('implements ember, eth, btc and sol today', () => {
+  it('implements ember, eth, btc, ltc and sol today — xrp alone is not', () => {
     // BTC joined when `bitcoin.ts` landed and SOL when `solana.ts` did. Both were once refused for
     // reasons about custody that this repository had written down and that are no longer true —
     // see the block at the head of `registry.ts` for how each claim was wrong.
-    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'eth', 'sol'])
+    //
+    // LTC joined without an adapter of its own: it is `bitcoinChain('ltc')`, the same code with
+    // Litecoin's network parameters, dust threshold and confirmation depth. That it needed no new
+    // adapter is exactly why it needed this list to be checked — a chain can be added here with a
+    // one-word edit, and the one-word edit is what would have shipped Bitcoin's parameters under
+    // Litecoin's name.
+    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'eth', 'ltc', 'sol'])
   })
 
   /**

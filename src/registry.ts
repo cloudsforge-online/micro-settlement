@@ -53,7 +53,17 @@ import { solanaChain } from './solana.ts'
 const CHAINS: Readonly<Record<ChainId, OutboundChain>> = Object.freeze({
   ember: evmChain('ember'),
   eth: evmChain('eth'),
-  btc: bitcoinChain(),
+  btc: bitcoinChain('btc'),
+  /*
+   * **LITECOIN IS THE SAME ADAPTER AND NOT THE SAME PARAMETERS**, and the argument it is given is
+   * the whole of the difference. `bitcoinChain` resolves the bech32 HRP, the base58 version bytes,
+   * the dust threshold, the supply cap and the confirmation DEPTH from it — 12 for Litecoin against
+   * Bitcoin's 6, read from the exact-pinned `contracts-chain` rather than restated.
+   *
+   * There is no `unimplementedChain` entry for `ltc` and there should not be: Litecoin speaks the
+   * same JSON-RPC, so unlike XRP the gap was never the protocol, only the parameters.
+   */
+  ltc: bitcoinChain('ltc'),
   sol: solanaChain(),
   xrp: unimplementedChain(
     'xrp',

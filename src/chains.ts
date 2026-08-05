@@ -69,9 +69,16 @@ import {
  * `shard` is deliberately absent. SHARD is in `CHAINS` only so that record is total; it never
  * exists on a chain and an outbound transaction for it could only ever be a lie.
  */
-export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp'
+export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp' | 'ltc'
 
-export const CHAIN_IDS: readonly ChainId[] = Object.freeze(['ember', 'eth', 'btc', 'sol', 'xrp'])
+export const CHAIN_IDS: readonly ChainId[] = Object.freeze([
+  'ember',
+  'eth',
+  'btc',
+  'sol',
+  'xrp',
+  'ltc',
+])
 
 const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
   ember: 'EMBER',
@@ -79,6 +86,7 @@ const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
   btc: 'BTC',
   sol: 'SOL',
   xrp: 'XRP',
+  ltc: 'LTC',
 })
 
 const CHAIN_FOR_ASSET: Readonly<Partial<Record<AssetCode, ChainId>>> = Object.freeze({
@@ -87,6 +95,7 @@ const CHAIN_FOR_ASSET: Readonly<Partial<Record<AssetCode, ChainId>>> = Object.fr
   BTC: 'btc',
   SOL: 'sol',
   XRP: 'xrp',
+  LTC: 'ltc',
 })
 
 export function isChainId(value: string): value is ChainId {
@@ -113,13 +122,20 @@ export function familyOf(chain: ChainId): ChainFamily {
 /**
  * The chain name custody stores against an address, which is NOT always this service's slug.
  *
- * Custody's `CHAIN_ASSET` is keyed by chain NAME — `ethereum`, `bitcoin`, `solana`, `xrp`,
- * `ember` — because those are the values the rows it adopted from forge-keyvault already carry.
- * This service's slug is the asset code lowercased. The two agree on four of five and disagree on
- * exactly one, `eth` versus `ethereum`, and that one disagreement is a `binding_mismatch` at
- * signing time: custody compares the caller's restated `chain` against the stored row character
- * for character. So the translation is a table with a name rather than a `toLowerCase()` that
- * happens to work for the other four.
+ * Custody's `CHAIN_ASSET` is keyed by chain NAME — `ethereum`, `bitcoin`, `litecoin`, `solana`,
+ * `xrp`, `ember` — because those are the values the rows it adopted from forge-keyvault already
+ * carry. This service's slug is the asset code lowercased. The two agree on four of six and
+ * disagree on exactly two, `eth` versus `ethereum` and `ltc` versus `litecoin`, and each
+ * disagreement is a `binding_mismatch` at signing time: custody compares the caller's restated
+ * `chain` against the stored row character for character. So the translation is a table with a name
+ * rather than a `toLowerCase()` that happens to work for the other four.
+ *
+ * **`ltc → 'litecoin'` IS THE SECOND ENTRY THAT EARNS THIS TABLE**, and it earns it twice over.
+ * Getting it wrong is not a 500: custody resolves the signing parameters from the row's stored
+ * chain name (`custody/src/chains.ts`, `bitcoinNetwork`), so `'ltc'` sent where `'litecoin'` is
+ * expected is refused outright, and — worse — a name that resolved to `'bitcoin'` would sign a
+ * Litecoin PSBT with a Bitcoin key. The value here is verified against
+ * `custody/src/chains.ts:CHAIN_ASSET`, which spells it `litecoin`.
  */
 const CUSTODY_CHAIN: Readonly<Record<ChainId, string>> = Object.freeze({
   ember: 'ember',
@@ -127,6 +143,7 @@ const CUSTODY_CHAIN: Readonly<Record<ChainId, string>> = Object.freeze({
   btc: 'bitcoin',
   sol: 'solana',
   xrp: 'xrp',
+  ltc: 'litecoin',
 })
 
 export function custodyChainOf(chain: ChainId): string {

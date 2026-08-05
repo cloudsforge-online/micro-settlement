@@ -76,50 +76,168 @@ import {
 /* ------------------------------------------------------------------ networks */
 
 /**
- * The estate's `testnet` is Bitcoin's `testnet`.
+ * The chains this one adapter serves. **Two chains, one implementation, and that is the hazard.**
  *
- * `bitcoin.networks.testnet` also covers signet and regtest for address encoding purposes — they
- * share version bytes — so an operator pointing at any of the three gets consistent behaviour.
- * What matters is that mainnet and not-mainnet never mix, and they cannot: the version bytes
- * differ, so a mainnet address simply fails to decode against the testnet network and vice versa.
- * That is the same binding custody enforces from the other side, where `ECPair.fromWIF` throws
- * when the WIF's network byte disagrees.
+ * Litecoin's `ChainFamily` is `'bitcoin'` and genuinely is: it speaks the same JSON-RPC, has the
+ * same transaction structure and the same script language, which is why `listunspent`, the coin
+ * selector, the PSBT encoder, the broadcast and the UTXO-based death proof are all reused unchanged.
+ * What it does NOT share is the network parameters — see the block below — so every function here
+ * that used to close over Bitcoin's now takes the chain.
  */
-export function networkFor(network: Network): bitcoin.Network {
-  return network === 'mainnet' ? bitcoin.networks.bitcoin : bitcoin.networks.testnet
+export type BitcoinFamilyChainId = Extract<ChainId, 'btc' | 'ltc'>
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **LITECOIN'S NETWORK PARAMETERS. THESE ARE CUSTODY'S, RESTATED, AND THE RESTATEMENT IS PINNED.**
+ *
+ * `bitcoinjs-lib` ships `networks.bitcoin` and `networks.testnet` and nothing else, so an adapter
+ * that resolves parameters from the FAMILY answers Bitcoin's for Litecoin. On this side of the
+ * estate that produces two failures, and neither of them throws:
+ *
+ *   * `validateAddress` accepts a `bc1…` destination for an LTC withdrawal, and the coins go to a
+ *     Litecoin output nobody holds the key to;
+ *   * `encodePsbt` builds the PSBT under Bitcoin's parameters, so `toOutputScript` on a genuine
+ *     `ltc1…` address throws and every Litecoin payment fails at build.
+ *
+ * Every value is from `litecoin-project/litecoin`, `src/chainparams.cpp`, and each is identical to
+ * the table custody derives and signs under (`custody/src/chains.ts`, `LITECOIN_MAINNET`). They
+ * MUST be identical: custody's `ECPair.fromWIF` binds the key to its own parameters, so a PSBT
+ * built here under different ones is refused at signing — after the row is committed and this
+ * chain's single outbound slot is claimed. `bitcoin.test.ts` asserts every field of both tables
+ * against Litecoin Core's own published address vectors rather than against custody's copy.
+ *
+ * **`bip32` IS `xpub`/`xprv`, NOT SLIP-0132's `Ltub`/`Ltpv`.** Litecoin Core has used Bitcoin's
+ * BIP-32 version bytes in every tag from v0.13.2; `Ltub` is a wallet DISPLAY convention. It makes
+ * no difference to an address — these bytes appear only when an extended key is serialised, which
+ * this service never does — and it is stated because the belief is common and would make any future
+ * xpub export disagree with Core.
+ *
+ * **`scriptHash` IS 50, NOT 5.** Litecoin has two P2SH prefixes: `key_io.cpp` decodes both 5 (`3…`,
+ * byte-identical to Bitcoin's) and 50 (`M…`) and encodes only 50. Carrying 50 here is what makes
+ * `toOutputScript` refuse a Bitcoin `3…` address on the Litecoin path, and it is the same narrowing
+ * `wallet/src/addresses.ts` makes for the same reason.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const LITECOIN_MAINNET: bitcoin.Network = Object.freeze({
+  messagePrefix: '\x19Litecoin Signed Message:\n',
+  bip32: { public: 0x0488b21e, private: 0x0488ade4 },
+  /** `ltc1q…`. The HRP is inside the bech32 checksum, so it is a binding and not a label. */
+  bech32: 'ltc',
+  /** 48 → `L…`. */
+  pubKeyHash: 0x30,
+  /** 50 → `M…`, SCRIPT_ADDRESS2, the one Core encodes. */
+  scriptHash: 0x32,
+  /** 176 → a compressed WIF beginning `T`. Never used here; custody holds the keys. */
+  wif: 0xb0,
+})
+
+const LITECOIN_TESTNET: bitcoin.Network = Object.freeze({
+  messagePrefix: '\x19Litecoin Signed Message:\n',
+  bip32: { public: 0x043587cf, private: 0x04358394 },
+  /** `tltc1q…` — distinct from Bitcoin testnet's `tb1q…`. */
+  bech32: 'tltc',
+  /** 111. **THE SAME BYTE AS BITCOIN TESTNET'S**, which is a collision in the chains and not a
+   * mistake here: a legacy `m…`/`n…` testnet address is byte-for-byte both. It does not exist on
+   * mainnet, where 0 and 48 are disjoint. */
+  pubKeyHash: 0x6f,
+  /** 58 → SCRIPT_ADDRESS2. Core also decodes 196; this encodes and accepts 58 only. */
+  scriptHash: 0x3a,
+  wif: 0xef,
+})
+
+const NETWORKS: Readonly<
+  Record<BitcoinFamilyChainId, Readonly<Record<Network, bitcoin.Network>>>
+> = Object.freeze({
+  btc: Object.freeze({ mainnet: bitcoin.networks.bitcoin, testnet: bitcoin.networks.testnet }),
+  ltc: Object.freeze({ mainnet: LITECOIN_MAINNET, testnet: LITECOIN_TESTNET }),
+})
+
+/**
+ * The bitcoinjs network for a (chain, network).
+ *
+ * The estate's `testnet` is each chain's own `testnet`. Bitcoin's testnet parameters also cover
+ * signet and regtest for address-encoding purposes — they share version bytes — so an operator
+ * pointing at any of the three gets consistent behaviour. What matters is that mainnet and
+ * not-mainnet never mix, and they cannot: the version bytes differ, so a mainnet address simply
+ * fails to decode against the testnet network and vice versa. That is the same binding custody
+ * enforces from the other side, where `ECPair.fromWIF` throws when the WIF's network byte
+ * disagrees.
+ *
+ * **IT THROWS FOR A CHAIN WITH NO ENTRY RATHER THAN DEFAULTING TO BITCOIN'S.** A default here is
+ * the exact defect this table exists to close, one chain later: the next Bitcoin-derived chain
+ * would silently accept and build Bitcoin addresses under its own name, every test would stay
+ * green, and the first evidence would be a customer's missing coins.
+ */
+export function networkFor(chain: BitcoinFamilyChainId, network: Network): bitcoin.Network {
+  const params = NETWORKS[chain]
+  if (!params) {
+    throw new AddressError(
+      `no bitcoin-family network parameters are defined for '${chain}' — refusing to encode with ` +
+        "another chain's, which would be a valid address on the wrong chain",
+    )
+  }
+  return params[network]
 }
 
 /* ------------------------------------------------------------------ amounts and sizes */
 
-/** Satoshis per BTC. Core speaks BTC on the wire for amounts; this service speaks satoshis. */
+/** Smallest units per coin. Both chains are 8 decimals; `contracts-chain` is the authority. */
 const SATS_PER_BTC = 100_000_000n
 
-/** 21 million BTC. A value above it did not come from Bitcoin. */
-export const MAX_SATOSHIS = 2_100_000_000_000_000n
+/**
+ * The supply cap of each chain, in smallest units. **LITECOIN'S IS FOUR TIMES BITCOIN'S.**
+ *
+ * `MAX_MONEY` is `21000000 * COIN` in `bitcoin/src/consensus/amount.h` and `84000000 * COIN` in
+ * `litecoin/src/consensus/amount.h`. Reusing Bitcoin's for Litecoin would refuse a genuine node
+ * answer as malformed; reusing Litecoin's for Bitcoin would accept an impossible one as real. It is
+ * a sanity bound on a number that arrived over JSON, and a sanity bound calibrated to the wrong
+ * chain is not one.
+ */
+const MAX_UNITS: Readonly<Record<BitcoinFamilyChainId, bigint>> = Object.freeze({
+  btc: 2_100_000_000_000_000n,
+  ltc: 8_400_000_000_000_000n,
+})
+
+/** Retained for the existing Bitcoin call sites and tests. @see MAX_UNITS */
+export const MAX_SATOSHIS = MAX_UNITS.btc
 
 /**
- * BTC (as Core serialises it) → satoshis.
+ * A coin amount as Core serialises it → smallest units.
  *
  * The same argument as the indexer's `btcToSats`, and it has to be made again here because this is
  * a different service: Core reports amounts as JSON numbers, so the decimal has been through an
- * IEEE-754 double before this code runs. The largest valid amount is 21e6 BTC, the ULP of a double
- * there is about 3.7e-9, and scaled by 1e8 that is an error under half a satoshi against a true
- * value that is an exact multiple of one. So `Math.round` recovers the exact amount rather than
- * merely approaching it — inside the valid range, which is therefore checked and not assumed.
+ * IEEE-754 double before this code runs. `Math.round` therefore has to RECOVER an exact multiple of
+ * one smallest unit rather than merely approach it, and whether it can is a property of the
+ * magnitude:
+ *
+ *   * A double's ULP at 21e6 is about 3.7e-9. Scaled by 1e8 that is 0.37, so the representation
+ *     error is under half a unit everywhere in Bitcoin's range and `Math.round` is exact. That is
+ *     the argument the original comment made and it is still correct **for Bitcoin**.
+ *   * **It does not extend to Litecoin's whole range, and it is worth saying so rather than
+ *     re-using the sentence.** The error stays under half a unit only while the ULP is under 1e-8,
+ *     which holds up to 2^25.4 ≈ 44.7e6 coins. Above that — between roughly 44.7 and 84 million
+ *     LTC in ONE output — a returned amount could round to a neighbouring litoshi.
+ *
+ * That residue is left rather than engineered away, and deliberately: a single UTXO holding 45
+ * million LTC is over half the coins that will ever exist, `listunspent` is asked only about this
+ * estate's own treasury and deposit addresses, and the alternative — refusing amounts above 44.7e6
+ * — would turn an impossible input into an outage on the day somebody tested it. `bitcoin.test.ts`
+ * pins the boundary so it is a known limit rather than a surprise.
  */
-export function btcToSats(value: unknown): bigint {
+export function btcToSats(value: unknown, chain: BitcoinFamilyChainId = 'btc'): bigint {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new AddressError(`a bitcoin amount was expected and ${String(value)} arrived`)
+    throw new AddressError(`a ${chain} amount was expected and ${String(value)} arrived`)
   }
-  if (value < 0) throw new AddressError(`a bitcoin amount may not be negative: ${value}`)
+  if (value < 0) throw new AddressError(`a ${chain} amount may not be negative: ${value}`)
   const sats = BigInt(Math.round(value * 1e8))
-  if (sats > MAX_SATOSHIS) {
-    throw new AddressError(`${value} BTC exceeds the 21,000,000 supply cap`)
+  const cap = MAX_UNITS[chain]
+  if (sats > cap) {
+    throw new AddressError(`${value} exceeds the ${chain.toUpperCase()} supply cap`)
   }
   return sats
 }
 
-/** Satoshis → the BTC number Core expects in a parameter. */
+/** Smallest units → the coin-denominated number Core expects in a parameter. */
 export function satsToBtc(sats: bigint): number {
   return Number(sats) / Number(SATS_PER_BTC)
 }
@@ -159,16 +277,21 @@ export function vsizeOf(inputs: number, outputs: number): number {
  * unsupported witness version all fail at the point they would otherwise become an unspendable
  * output.
  */
-export function validateAddress(address: string, network: Network): string {
+export function validateAddress(
+  chain: BitcoinFamilyChainId,
+  address: string,
+  network: Network,
+): string {
   const trimmed = address.trim()
-  if (trimmed.length === 0) throw new AddressError('a bitcoin address may not be empty')
+  if (trimmed.length === 0) throw new AddressError(`a ${chain} address may not be empty`)
   try {
-    bitcoin.address.toOutputScript(trimmed, networkFor(network))
+    bitcoin.address.toOutputScript(trimmed, networkFor(chain, network))
   } catch {
     throw new AddressError(
-      `${trimmed} is not a valid bitcoin ${network} address — note that a mainnet address is ` +
-        'rejected on testnet and the reverse, which is the binding that stops a payment being ' +
-        'broadcastable on the chain it was not meant for',
+      `${trimmed} is not a valid ${chain} ${network} address — note that a mainnet address is ` +
+        'rejected on testnet and the reverse, and that a Bitcoin address is rejected on Litecoin ' +
+        'and the reverse. Both are the binding that stops a payment being broadcastable, or ' +
+        'unspendable, on a chain it was not meant for',
     )
   }
   return trimmed
@@ -259,6 +382,8 @@ export function selectCoins(
   target: bigint,
   feeRatePerVb: bigint,
   dustThreshold: bigint,
+  /** Only so the refusal names the right chain in an operator's `failure_reason`. */
+  chain: BitcoinFamilyChainId = 'btc',
 ): Selection {
   const chosen: Utxo[] = []
   let total = 0n
@@ -288,7 +413,7 @@ export function selectCoins(
       return { inputs: chosen, change: 0n, fee: total - target }
     }
   }
-  throw new InsufficientTreasuryError('btc', total, target)
+  throw new InsufficientTreasuryError(chain, total, target)
 }
 
 export function totalOf(utxos: readonly Utxo[]): bigint {
@@ -370,18 +495,67 @@ export function assertUnderCustodysCeiling(
   psbt: bitcoin.Psbt,
   fee: bigint,
   shape: OutboundShape,
+  /**
+   * Only so the refusal names the right chain. **The CEILINGS are deliberately not per-chain**,
+   * because custody's are not: `signBitcoin` reads one pair of constants whatever the row's chain
+   * (`custody/src/signing.ts:858-859,925`). They are a rate in the chain's own smallest unit per
+   * vbyte, so 5,000 is a looser bound in value terms for LTC than for BTC — which is the safe
+   * direction for a CEILING, and inventing a tighter Litecoin number here would mean this service
+   * refusing PSBTs custody would happily sign, in a place no operator would think to look.
+   */
+  chain: BitcoinFamilyChainId = 'btc',
 ): void {
   const ceiling = shape === 'sweep' ? CUSTODY_MAX_SWEEP_SAT_PER_VB : CUSTODY_MAX_PAYMENT_SAT_PER_VB
   const vsize = BigInt(finalisedVsize(psbt))
   if (fee / vsize >= ceiling) {
-    throw new FeeOutOfBandError('btc', 'above', fee, ceiling * vsize)
+    throw new FeeOutOfBandError(chain, 'above', fee, ceiling * vsize)
   }
 }
 
 /* ------------------------------------------------------------------ the adapter */
 
-const DEFAULT_DUST = 546n
-/** Core's own relay floor. Below it a transaction is not forwarded at all. */
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **DUST IS TEN TIMES HIGHER ON LITECOIN, AND THIS IS THE ONE CONSTANT WHERE REUSING BITCOIN'S
+ * NUMBER PRODUCES A TRANSACTION NO NODE WILL RELAY.**
+ *
+ * Core derives the dust threshold of an output from `DUST_RELAY_TX_FEE` and the size of the output
+ * plus the input that would one day spend it (`policy.cpp`, `GetDustThreshold`). The fee rate is
+ * where the two chains part:
+ *
+ *     bitcoin/src/policy/policy.h    DUST_RELAY_TX_FEE = 3'000
+ *     litecoin/src/policy/policy.h   DUST_RELAY_TX_FEE = 30'000
+ *
+ * Ten times, because a litoshi is worth a small fraction of a satoshi and the threshold exists to
+ * stop outputs that cost more to spend than they hold. The sizes are identical — same serialisation
+ * — so the thresholds are simply ten times apart: a P2PKH output is dust below 546 satoshis and
+ * below 5,460 litoshi, and a P2WPKH output below 294 and 2,940 respectively.
+ *
+ * **Using 546 for Litecoin is not conservative, it is wrong in the dangerous direction.** It sits
+ * BELOW Litecoin's real threshold, so the coin selector would happily create a 1,000-litoshi change
+ * output, and `sendrawtransaction` would answer `dust` — a whole withdrawal refused at broadcast,
+ * after signing, with this chain's single outbound slot claimed and the user's money reserved.
+ * Every other constant in this file survives the copy from Bitcoin. This one does not, and it is
+ * the reason the dust threshold is a per-chain table rather than one number with a comment.
+ *
+ * The P2PKH figure is used for both chains rather than the P2WPKH one, unchanged from before: every
+ * output this service creates is P2WPKH, so the higher number is a deliberate margin, and a margin
+ * on dust costs a few satoshis of miner fee where being under costs the transaction.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const DEFAULT_DUST: Readonly<Record<BitcoinFamilyChainId, bigint>> = Object.freeze({
+  btc: 546n,
+  ltc: 5_460n,
+})
+
+/**
+ * Core's own relay floor, in smallest units per vbyte. Below it a transaction is not forwarded.
+ *
+ * **One for both, and that was checked rather than assumed.** `DEFAULT_MIN_RELAY_TX_FEE` is 1000
+ * per kilo-vbyte in `bitcoin/src/validation.h` and 1000 in `litecoin/src/validation.h` — the two
+ * chains agree here even though they disagree by a factor of ten on dust, which is exactly why
+ * neither was taken on trust from the other.
+ */
 const MIN_RELAY_SAT_PER_VB = 1n
 /** How many blocks `estimatesmartfee` is asked to target. */
 const FEE_TARGET_BLOCKS = 3
@@ -450,9 +624,24 @@ export interface BitcoinChainOptions {
   readonly dustThreshold?: bigint
 }
 
-export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
-  const dust = options.dustThreshold ?? DEFAULT_DUST
-  const spec = chainSpec(assetOf('btc'))
+/**
+ * The adapter for ONE bitcoin-family chain.
+ *
+ * **The chain is a parameter and it used not to be.** Everything below that reads a constant reads
+ * it through `chain`: the network parameters an address is validated and a PSBT encoded under, the
+ * dust threshold, the supply cap, the confirmation depth, and the chain named in every refusal.
+ *
+ * The depth in particular comes free and must: `chainSpec('LTC').confirmations` is **12**, not
+ * Bitcoin's 6, because Litecoin's blocks are ~2.5 minutes rather than ~10 on a fraction of the
+ * hashrate. It is read from the exact-pinned `contracts-chain` and never restated, so `listunspent`
+ * asks for coins at Litecoin's own depth and `status` calls a payment confirmed at it.
+ */
+export function bitcoinChain(
+  chain: BitcoinFamilyChainId = 'btc',
+  options: BitcoinChainOptions = {},
+): OutboundChain {
+  const dust = options.dustThreshold ?? DEFAULT_DUST[chain]
+  const spec = chainSpec(assetOf(chain))
 
   /**
    * sat/vB from the node, bounded by the ceiling for THIS shape.
@@ -468,7 +657,7 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
     // `feerate` is BTC per kilovbyte. Absent means the node has too little data to estimate, which
     // is a real state on a fresh node and on testnet — the floor is used rather than guessing high.
     if (typeof row['feerate'] !== 'number') return MIN_RELAY_SAT_PER_VB
-    const perKvb = btcToSats(row['feerate'])
+    const perKvb = btcToSats(row['feerate'], chain)
     const perVb = perKvb / 1_000n
     if (perVb < MIN_RELAY_SAT_PER_VB) return MIN_RELAY_SAT_PER_VB
     if (perVb > ceiling) return ceiling
@@ -546,16 +735,45 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
    * a sweep through the withdrawal builder used to produce.
    */
   async function buildOutbound(call: ChainCall, input: BuildInput): Promise<UnsignedOutbound> {
-    const net = networkFor(call.network)
-    validateAddress(input.from, call.network)
-    validateAddress(input.to, call.network)
+    const net = networkFor(chain, call.network)
+    validateAddress(chain, input.from, call.network)
+    validateAddress(chain, input.to, call.network)
     if (input.value <= 0n) {
       // A zero-value output is refused by the relay as dust and by custody as an output that pays
       // nothing. Refusing here makes it a classified build failure rather than a 403.
-      throw new FeeOutOfBandError('btc', 'below', input.value, 1n)
+      throw new FeeOutOfBandError(chain, 'below', input.value, 1n)
+    }
+    if (input.shape !== 'sweep' && input.value <= dust) {
+      /*
+       * **A PAYMENT AT OR BELOW THE DUST THRESHOLD, REFUSED AT BUILD RATHER THAN AT BROADCAST.**
+       *
+       * **THE PAYMENT SHAPE ONLY, AND THE EXCLUSION IS LOAD-BEARING.** A sweep's `value` is
+       * `total − fee` of whatever coins the address actually holds, and `sweepPlan` already refuses
+       * a plan at or below the threshold from the coins themselves. Applying this guard to a sweep
+       * as well would answer "this amount is dust" for an address that simply has nothing at depth
+       * yet — turning a TREASURY failure, which is retried, into a fee refusal, which is permanent,
+       * for the ordinary recurring state of almost every deposit address.
+       *
+       * This used to read `input.value <= 0n`, which caught only the degenerate case. Every value
+       * between one and the threshold produced a well-formed PSBT that custody signed and that
+       * `sendrawtransaction` then answered `dust` to — a refusal from the far side of a signature,
+       * with this chain's single outbound slot claimed and the user's money still reserved.
+       *
+       * It was reachable before Litecoin and is more reachable with it. wallet's floor is
+       * `fee × WALLET_WITHDRAWAL_MIN_FEE_MULTIPLE`, which at the relay floor is 141 × 3 = 423
+       * smallest units — under Bitcoin's 546 and far under Litecoin's 5,460. So the two services
+       * disagreed about the smallest withdrawal that can exist, and the gap between them was a
+       * transaction no node would forward.
+       *
+       * Refused HERE and not only there because this is the service that knows the chain's dust
+       * threshold; a build failure is classified, releases the row and refunds, and a broadcast
+       * refusal after signing is the state that needs an operator. The message names the number so
+       * the refusal is actionable rather than merely correct.
+       */
+      throw new FeeOutOfBandError(chain, 'below', input.value, dust + 1n)
     }
     if (input.fee > input.bounds.maxFeeWei) {
-      throw new FeeOutOfBandError('btc', 'above', input.fee, input.bounds.maxFeeWei)
+      throw new FeeOutOfBandError(chain, 'above', input.fee, input.bounds.maxFeeWei)
     }
 
     const rate = await feeRate(call, input.shape)
@@ -570,24 +788,24 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
       if (!plan) {
         // Nothing at depth, or not enough to be worth moving. Either way the coins are not there,
         // which classifies as a treasury failure and is retried rather than refunded on the spot.
-        throw new InsufficientTreasuryError('btc', totalOf(utxos), input.value + input.fee)
+        throw new InsufficientTreasuryError(chain, totalOf(utxos), input.value + input.fee)
       }
       // **The plan must still be the plan the ROW was written from.** `planSweep` quoted this same
       // UTXO set through this same function; a disagreement means coins arrived or left in between,
       // and the difference between the two numbers is a fee nobody agreed to pay. Refused rather
       // than silently re-quoted, exactly as a withdrawal's locked fee is.
       if (plan.value !== input.value || plan.fee !== input.fee) {
-        throw new FeeOutOfBandError('btc', plan.fee > input.fee ? 'below' : 'above', input.fee, plan.fee)
+        throw new FeeOutOfBandError(chain, plan.fee > input.fee ? 'below' : 'above', input.fee, plan.fee)
       }
       inputs = plan.inputs
       fee = plan.fee
     } else {
-      const selection = selectCoins(utxos, input.value, rate, dust)
+      const selection = selectCoins(utxos, input.value, rate, dust, chain)
       // The locked fee is what the user agreed to. It is checked, never re-quoted: re-quoting here
       // would sign a transaction that does not match the row it was built from, and the fee bounds
       // exist so a node having a bad minute cannot spend a user's balance on miner revenue.
       if (selection.fee > input.fee) {
-        throw new FeeOutOfBandError('btc', 'below', input.fee, selection.fee)
+        throw new FeeOutOfBandError(chain, 'below', input.fee, selection.fee)
       }
       inputs = selection.inputs
       fee = selection.fee
@@ -599,7 +817,7 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
     }
 
     const psbt = encodePsbt(net, input.from, inputs, outputs)
-    assertUnderCustodysCeiling(psbt, fee, input.shape)
+    assertUnderCustodysCeiling(psbt, fee, input.shape, chain)
 
     return {
       // A base64 PSBT string, which is what `signBitcoin` requires. See `UnsignedOutbound.payload`.
@@ -619,7 +837,7 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
   }
 
   return {
-    chain: 'btc',
+    chain,
     family: 'bitcoin',
     unimplementedPhase: null,
     // Bitcoin has no token model, so there is nothing here and never will be. Null rather than an
@@ -629,7 +847,7 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
 
     canonicalise(address) {
       // The identity, validated. See `validateAddress` for why lower-casing would be a bug.
-      return validateAddress(address, 'mainnet')
+      return validateAddress(chain, address, 'mainnet')
     },
     addressKey(address) {
       return address.trim()
@@ -639,7 +857,7 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
       // network-specific check happens in `build`, where the network is known.
       for (const network of ['mainnet', 'testnet'] as const) {
         try {
-          validateAddress(address, network)
+          validateAddress(chain, address, network)
           return true
         } catch {
           /* try the other */
@@ -660,7 +878,7 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
       const rate = await feeRate(call, 'payment')
       const fee = rate * BigInt(vsizeOf(1, 2))
       if (fee > bounds.maxFeeWei) {
-        throw new FeeOutOfBandError('btc', 'above', fee, bounds.maxFeeWei)
+        throw new FeeOutOfBandError(chain, 'above', fee, bounds.maxFeeWei)
       }
       return fee
     },
@@ -683,7 +901,7 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
       const plan = sweepPlan(await listUnspent(call, address, spec.confirmations), rate, dust)
       if (!plan) return null
       if (plan.fee > bounds.maxFeeWei) {
-        throw new FeeOutOfBandError('btc', 'above', plan.fee, bounds.maxFeeWei)
+        throw new FeeOutOfBandError(chain, 'above', plan.fee, bounds.maxFeeWei)
       }
       return { value: plan.value, fee: plan.fee }
     },
@@ -842,11 +1060,19 @@ export async function buildSweepPsbt(
   treasury: string,
   feeRatePerVb: bigint,
   minConfirmations: number,
-  dustThreshold: bigint = DEFAULT_DUST,
+  /**
+   * The chain, last and defaulted so the existing Bitcoin call sites are untouched.
+   *
+   * Defaulted rather than required ONLY here, and only because this function has no production
+   * caller — it is an operator's and a test's entry point. `bitcoinChain` above takes it first and
+   * without a default, which is where it matters.
+   */
+  chain: BitcoinFamilyChainId = 'btc',
+  dustThreshold: bigint = DEFAULT_DUST[chain],
 ): Promise<{ psbtBase64: string; value: bigint; fee: bigint } | null> {
-  const net = networkFor(call.network)
-  validateAddress(from, call.network)
-  validateAddress(treasury, call.network)
+  const net = networkFor(chain, call.network)
+  validateAddress(chain, from, call.network)
+  validateAddress(chain, treasury, call.network)
 
   const plan = sweepPlan(await listUnspent(call, from, minConfirmations), feeRatePerVb, dustThreshold)
   if (plan === null) return null
@@ -862,7 +1088,7 @@ export async function buildSweepPsbt(
     })
   }
   psbt.addOutput({ address: treasury, value: Number(plan.value) })
-  assertUnderCustodysCeiling(psbt, plan.fee, 'sweep')
+  assertUnderCustodysCeiling(psbt, plan.fee, 'sweep', chain)
 
   return { psbtBase64: psbt.toBase64(), value: plan.value, fee: plan.fee }
 }

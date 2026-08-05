@@ -178,7 +178,7 @@ describe('the registry', () => {
     // The previous entry said the blocker was "ENTIRELY CUSTODY-SIDE AND IT BLOCKS BOTH HALVES".
     // `SolanaPolicy` has a transfer shape and a pinned sweep shape now, so it blocks neither.
     assert.equal(chainFor('sol').unimplementedPhase, null)
-    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'eth', 'sol'])
+    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'eth', 'ltc', 'sol'])
     assert.match(String(chainFor('xrp').unimplementedPhase), /XRPL adapter/)
   })
 })

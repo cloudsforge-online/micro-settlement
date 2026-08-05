@@ -171,11 +171,36 @@ withdrawal path to pay it back — leaving the tokens at the deposit address is 
 
 ## Chains
 
-`ember` and `eth` are one implementation (`src/evm.ts`); `btc` is `src/bitcoin.ts` and `sol` is
-`src/solana.ts`. `xrp` is a **real object on the real interface that throws `NotImplementedError`
-naming its phase** — not absent from the registry, not a stub returning zero. `chainFor` is total, so
-an unsupported chain is a classified, immediately-refunded build failure rather than a `TypeError`
-in a job handler.
+`ember` and `eth` are one implementation (`src/evm.ts`); `btc` and `ltc` are another
+(`src/bitcoin.ts`) and `sol` is `src/solana.ts`. `xrp` is a **real object on the real interface that
+throws `NotImplementedError` naming its phase** — not absent from the registry, not a stub returning
+zero. `chainFor` is total, so an unsupported chain is a classified, immediately-refunded build
+failure rather than a `TypeError` in a job handler.
+
+**Litecoin is `bitcoinChain('ltc')` — the same code, and deliberately not the same constants.** It
+speaks the same JSON-RPC and has the same transaction structure, so the follower, the coin selector,
+the PSBT encoder and the UTXO death proof are reused unchanged. What the chain argument selects is
+everything that is a property of the chain rather than of the software:
+
+| | BTC | LTC | why it is not shared |
+|---|---|---|---|
+| bech32 HRP | `bc` / `tb` | `ltc` / `tltc` | the HRP is inside the checksum, so this is a binding |
+| P2PKH / P2SH version | 0 / 5 | 48 / 50 | Core encodes `SCRIPT_ADDRESS2` 50, not the 5 it also decodes |
+| confirmations | 6 | **12** | ~2.5-minute blocks on a fraction of the hashrate |
+| dust threshold | 546 | **5,460** | `DUST_RELAY_TX_FEE` is 3,000 against 30,000 |
+| supply cap | 21e6 | 84e6 | a sanity bound on a node's JSON answer |
+
+The dust threshold is the one where copying Bitcoin's number is not merely inaccurate: 546 sits
+*below* Litecoin's real threshold, so a change output between the two would be built, signed, and
+refused by every node as `dust` — a broadcast failure after a signature. The fee ceilings are
+deliberately NOT per-chain, because custody's are not; see `assertUnderCustodysCeiling`.
+
+**Taproot destinations are refused on both chains.** `bitcoinjs-lib` routes witness version 1
+through `p2tr`, which throws without `initEccLib`, and nothing in this estate calls it — not this
+service, which has no secp256k1 package, and not custody, which has one it never initialises. So a
+`bc1p…` or `ltc1p…` address cannot be built for or signed, and `wallet` refuses one at request time
+rather than reserving a balance against it. Making them payable means a native binding in both
+services, for a destination form rather than a chain; it was not done in the change that found it.
 
 A withdrawal and a sweep are built to **different shapes**, because custody applies a different
 signing policy to each: a sweep's destination is chosen by the vault and not by this service, and on

@@ -30,7 +30,16 @@ import {
   vsizeOf,
   type Utxo,
 } from './bitcoin.ts'
-import { AddressError, FeeOutOfBandError, InsufficientTreasuryError, type ChainCall } from './chains.ts'
+import {
+  AddressError,
+  FeeOutOfBandError,
+  InsufficientTreasuryError,
+  assetOf,
+  chainForAsset,
+  custodyChainOf,
+  custodyFamilyOf,
+  type ChainCall,
+} from './chains.ts'
 import { chainFor, implementedChains } from './registry.ts'
 
 /* ------------------------------------------------------------------ fixtures */
@@ -207,11 +216,11 @@ describe('transaction size', () => {
 
 describe('addresses', () => {
   it('binds an address to its network in BOTH directions', () => {
-    assert.equal(validateAddress(TREASURY, 'testnet'), TREASURY)
-    assert.equal(validateAddress(MAINNET_ADDRESS, 'mainnet'), MAINNET_ADDRESS)
+    assert.equal(validateAddress('btc', TREASURY, 'testnet'), TREASURY)
+    assert.equal(validateAddress('btc', MAINNET_ADDRESS, 'mainnet'), MAINNET_ADDRESS)
     // The binding that stops a payment being broadcastable on the chain it was not meant for.
-    assert.throws(() => validateAddress(MAINNET_ADDRESS, 'testnet'), AddressError)
-    assert.throws(() => validateAddress(TREASURY, 'mainnet'), AddressError)
+    assert.throws(() => validateAddress('btc', MAINNET_ADDRESS, 'testnet'), AddressError)
+    assert.throws(() => validateAddress('btc', TREASURY, 'mainnet'), AddressError)
   })
 
   it('does NOT case-normalise, because base58check is case-significant', () => {
@@ -222,9 +231,12 @@ describe('addresses', () => {
   })
 
   it('refuses a checksum failure and an empty string', () => {
-    assert.throws(() => validateAddress('', 'testnet'), AddressError)
-    assert.throws(() => validateAddress('tb1qnotanaddress', 'testnet'), AddressError)
-    assert.throws(() => validateAddress('1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN3', 'mainnet'), AddressError)
+    assert.throws(() => validateAddress('btc', '', 'testnet'), AddressError)
+    assert.throws(() => validateAddress('btc', 'tb1qnotanaddress', 'testnet'), AddressError)
+    assert.throws(
+      () => validateAddress('btc', '1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN3', 'mainnet'),
+      AddressError,
+    )
   })
 })
 
@@ -831,8 +843,338 @@ describe('build, for a sweep', () => {
 
 describe('the network binding', () => {
   it('maps the estate networks onto bitcoin networks and keeps them apart', () => {
-    assert.equal(networkFor('mainnet'), bitcoin.networks.bitcoin)
-    assert.equal(networkFor('testnet'), bitcoin.networks.testnet)
-    assert.notEqual(networkFor('mainnet').bech32, networkFor('testnet').bech32)
+    assert.equal(networkFor('btc', 'mainnet'), bitcoin.networks.bitcoin)
+    assert.equal(networkFor('btc', 'testnet'), bitcoin.networks.testnet)
+    assert.notEqual(networkFor('btc', 'mainnet').bech32, networkFor('btc', 'testnet').bech32)
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * LITECOIN — one adapter, two chains, and everything that is NOT shared.
+ *
+ * The tests above prove the adapter. These prove it is being given Litecoin's parameters rather
+ * than Bitcoin's wearing Litecoin's name, which is a different claim and the one that costs money:
+ * `family` is `'bitcoin'` for both, so any resolution that goes through the family alone silently
+ * answers Bitcoin and produces a `bc1…` address published as a Litecoin destination.
+ *
+ * ── EVERY ADDRESS BELOW IS A PUBLISHED VECTOR, AND THE SCRIPT IS ASSERTED TOO ─────────────────
+ *
+ * `litecoin-project/litecoin`, `src/test/data/key_io_valid.json` — the file Litecoin Core's own
+ * `key_io_tests` runs against. It gives address AND the script Core decodes it to, so this asserts
+ * the full mapping rather than "it did not throw": a parameter table that was wrong in a way that
+ * still decoded would produce a different script and be caught. Bitcoin's come from the same file
+ * in `bitcoin/bitcoin`.
+ *
+ * A vector generated in this repository would agree with any mistake this repository makes. That
+ * is the whole reason these are quoted rather than derived, and it is why the addresses used for
+ * BUILDING below are derived while the addresses used for VALIDATING are not.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/** `litecoin/src/test/data/key_io_valid.json`, chain `main`: address → the script Core decodes. */
+const LTC_MAINNET_VECTORS: readonly (readonly [string, string])[] = [
+  ['LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA', '76a914558dbca7118cd5894502767c7b2ffc21a22f54db88ac'],
+  ['LbfVMz974gbbGFqXF7FZUpSBWSbwBHDwR5', '76a914b4565f467408e9e1c1d2a3b0ccdeff84db3a3b9388ac'],
+  ['MHrYRxAiMNBTku3eoDHwhA1LQGDjUStZW2', 'a9146d328a5b2a20d943a641c8d29b6cc3c2d2df85d387'],
+  ['M9dw1FAoWpHC6PcMzoCHhqQ9McvTyG5Ywj', 'a914130ef8742ad7492b389509252c6721775fb1127387'],
+  ['ltc1qhdhvrwe6rgqns8fz28tee0hphr5x7ulw5exv4w', '0014bb6ec1bb3a1a01381d2251d79cbee1b8e86f73ee'],
+  [
+    'ltc1qa9dykljtgeayhm8ygx25sc22p0wzgudpe4hw9dyvaz0ye3j5kduq9mf68z',
+    '0020e95a4b7e4b467a4bece4419548614a0bdc2471a1cd6ee2b48ce89e4cc654b378',
+  ],
+] as const
+
+/**
+ * Also from Core's file, also perfectly valid, and NOT PAYABLE BY THIS ESTATE — on either chain.
+ *
+ * `bitcoinjs-lib@6.1.7` routes witness version 1 through its `p2tr` payment, which throws
+ * `No ECC Library provided. You must call initEccLib()`. Nothing here calls it: this service has no
+ * secp256k1 package at all, and custody has one it never initialises. So a Taproot destination
+ * cannot be decoded by the builder OR by the signer. `wallet` refuses it at the boundary now so a
+ * user's balance is never reserved against it; this pins the far side of that decision.
+ */
+const UNPAYABLE_TAPROOT: readonly string[] = [
+  'ltc1ppu2gv0tujus0f6eggrk7eqmaf0567x6zer4fcuhz4z7ztzq9u9yseqxltc',
+  'bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0',
+] as const
+
+/** The same file, chain `test`. */
+const LTC_TESTNET_VECTORS: readonly (readonly [string, string])[] = [
+  ['tltc1qpftpsvdn6mjp8celrkj0qxqy4jlapl959rlwg9', '00140a561831b3d6e413e33f1da4f01804acbfd0fcb4'],
+  ['tltc1quf7ycjczjpjd6u9a8mpa00jl7g9aplhy8e0vf7', '0014e27c4c4b029064dd70bd3ec3d7be5ff20bd0fee4'],
+] as const
+
+/** `bitcoin/src/test/data/key_io_valid.json`. All valid Bitcoin; none of them Litecoin. */
+const BTC_VECTORS: readonly string[] = [
+  '1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo',
+  '36j4NfKv6Akva9amjWrLG6MuSQym1GuEmm',
+  'bc1qvyq0cc6rahyvsazfdje0twl7ez82ndmuac2lhv',
+] as const
+
+const LTC_TESTNET = networkFor('ltc', 'testnet')
+
+/** A deterministic Litecoin testnet P2WPKH address. Derived: it is a fixture, not a claim. */
+function ltcP2wpkh(seed: number): string {
+  const address = bitcoin.payments.p2wpkh({
+    hash: Buffer.alloc(20, seed),
+    network: LTC_TESTNET,
+  }).address
+  if (!address) throw new Error('could not derive a test address')
+  return address
+}
+
+const LTC_TREASURY = ltcP2wpkh(0x44)
+const LTC_USER = ltcP2wpkh(0x55)
+
+/** The Bitcoin fake, re-pointed at Litecoin's parameters. */
+function fakeLtcNode(options: FakeBtcNodeOptions = {}): { call: ChainCall; broadcast: string[] } {
+  const broadcast: string[] = []
+  const utxos = options.utxos ?? []
+  const rpc = async (method: string, params: readonly unknown[]): Promise<unknown> => {
+    switch (method) {
+      case 'estimatesmartfee':
+        return options.feerate === null || options.feerate === undefined
+          ? {}
+          : { feerate: options.feerate, blocks: 3 }
+      case 'listunspent': {
+        const minConf = Number(params[0])
+        return utxos
+          .filter((u) => (u.confirmations ?? 12) >= minConf)
+          .map((u) => ({
+            txid: u.txid,
+            vout: u.vout,
+            amount: satsToBtc(u.sats),
+            scriptPubKey: bitcoin.address.toOutputScript(LTC_TREASURY, LTC_TESTNET).toString('hex'),
+            confirmations: u.confirmations ?? 12,
+            spendable: true,
+          }))
+      }
+      case 'getblockcount':
+        return options.height ?? 3_000_000
+      case 'getrawtransaction': {
+        const confirmations = options.confirmationsByTxid?.[String(params[0])]
+        if (confirmations === undefined) throw new Error('-5: No such mempool or blockchain transaction')
+        return { txid: String(params[0]), confirmations }
+      }
+      case 'sendrawtransaction': {
+        const hex = String(params[0])
+        broadcast.push(hex)
+        return bitcoin.Transaction.fromHex(hex).getId()
+      }
+      default:
+        throw new Error(`unexpected method ${method}`)
+    }
+  }
+  return { call: { network: 'testnet', rpc }, broadcast }
+}
+
+describe('litecoin', () => {
+  it("decodes Core's own published vectors to Core's own published scripts", () => {
+    // NOT "does not throw". The script is asserted, so a parameter table that was wrong in a way
+    // that still decoded — a swapped version byte, say — produces a different script and fails.
+    for (const [address, script] of LTC_MAINNET_VECTORS) {
+      assert.equal(validateAddress('ltc', address, 'mainnet'), address)
+      assert.equal(
+        bitcoin.address.toOutputScript(address, networkFor('ltc', 'mainnet')).toString('hex'),
+        script,
+        `${address} decoded to the wrong script`,
+      )
+    }
+    for (const [address, script] of LTC_TESTNET_VECTORS) {
+      assert.equal(validateAddress('ltc', address, 'testnet'), address)
+      assert.equal(
+        bitcoin.address.toOutputScript(address, LTC_TESTNET).toString('hex'),
+        script,
+        `${address} decoded to the wrong script`,
+      )
+    }
+  })
+
+  it('REFUSES a Bitcoin address as a Litecoin destination, which is the defect that loses coins', () => {
+    for (const address of BTC_VECTORS) {
+      // Valid Bitcoin — which is what makes it dangerous rather than merely wrong. A rejection
+      // that fired on a malformed string would prove nothing.
+      assert.equal(validateAddress('btc', address, 'mainnet'), address)
+      assert.throws(
+        () => validateAddress('ltc', address, 'mainnet'),
+        AddressError,
+        `${address} is a Bitcoin address and was accepted as a Litecoin destination`,
+      )
+      assert.equal(chainFor('ltc').isValidDestination(address), false, address)
+    }
+    // And the reverse, because the rule is symmetric and a one-way check is half a check.
+    for (const [address] of LTC_MAINNET_VECTORS) {
+      assert.throws(() => validateAddress('btc', address, 'mainnet'), AddressError)
+      assert.equal(chainFor('btc').isValidDestination(address), false, address)
+      assert.equal(chainFor('ltc').isValidDestination(address), true, address)
+    }
+  })
+
+  it("uses Litecoin's own confirmation depth of 12, not Bitcoin's 6", async () => {
+    // Read from the exact-pinned contracts-chain, so this fails if the package and the adapter
+    // ever disagree — which is money credited, or spent, at the wrong depth.
+    assert.equal(chainSpec('LTC').confirmations, 12)
+    assert.equal(chainSpec('BTC').confirmations, 6)
+
+    // Coins at 6 confirmations are BTC-spendable and NOT LTC-spendable. Same fake, same coins.
+    const coins = [{ txid: '1'.repeat(64), vout: 0, sats: 500_000n, confirmations: 6 }]
+    assert.equal(await chainFor('ltc').spendableBalance(fakeLtcNode({ utxos: coins }).call, LTC_TREASURY), 0n)
+    assert.equal(
+      await chainFor('ltc').spendableBalance(
+        fakeLtcNode({ utxos: [{ ...coins[0]!, confirmations: 12 }] }).call,
+        LTC_TREASURY,
+      ),
+      500_000n,
+    )
+  })
+
+  it("uses Litecoin's dust threshold of 5,460 — ten times Bitcoin's, and NOT copied from it", async () => {
+    /*
+     * `DUST_RELAY_TX_FEE` is 3'000 in Bitcoin and 30'000 in Litecoin, so every dust threshold is ten
+     * times apart. This is the one constant in the whole adapter where reusing Bitcoin's number is
+     * not merely inaccurate: 546 sits BELOW Litecoin's real threshold, so a change or payment output
+     * between the two would be built, signed, and refused by every node as `dust` — a broadcast
+     * failure after a signature, which is the state that needs an operator rather than a refund.
+     */
+    const node = fakeLtcNode({ utxos: [{ txid: '1'.repeat(64), vout: 0, sats: 500_000n }], feerate: 0.00001 })
+    const under = chainFor('ltc').build(node.call, {
+      from: LTC_TREASURY,
+      to: LTC_USER,
+      // Above Bitcoin's 546 and below Litecoin's 5,460 — the window that only Litecoin's own
+      // number closes. A test at 100 would pass against Bitcoin's threshold too and prove nothing.
+      value: 1_000n,
+      fee: 10_000n,
+      bounds: BOUNDS,
+      shape: 'payment',
+    })
+    await assert.rejects(under, FeeOutOfBandError)
+
+    // And the same payment just above Litecoin's threshold builds, so this is a threshold and not
+    // a ban on small withdrawals.
+    const over = await chainFor('ltc').build(node.call, {
+      from: LTC_TREASURY,
+      to: LTC_USER,
+      value: 5_461n,
+      fee: 10_000n,
+      bounds: BOUNDS,
+      shape: 'payment',
+    })
+    assert.ok(over.payload)
+
+    // Bitcoin keeps its own number, so this is a per-chain table and not a global raise.
+    const btcNode = fakeBtcNode({ utxos: [{ txid: '1'.repeat(64), vout: 0, sats: 500_000n }], feerate: 0.00001 })
+    const btcJustAbove = await chainFor('btc').build(btcNode.call, {
+      from: TREASURY,
+      to: USER,
+      value: 547n,
+      fee: 10_000n,
+      bounds: BOUNDS,
+      shape: 'payment',
+    })
+    assert.ok(btcJustAbove.payload)
+  })
+
+  it('builds a PSBT that decodes under Litecoin parameters and NOT under Bitcoin ones', async () => {
+    const node = fakeLtcNode({ utxos: [{ txid: '1'.repeat(64), vout: 0, sats: 500_000n }], feerate: 0.00001 })
+    const built = await chainFor('ltc').build(node.call, {
+      from: LTC_TREASURY,
+      to: LTC_USER,
+      value: 100_000n,
+      fee: 50_000n,
+      bounds: BOUNDS,
+      shape: 'payment',
+    })
+
+    const psbt = bitcoin.Psbt.fromBase64(built.payload as string, { network: LTC_TESTNET })
+    // The payment output pays the Litecoin address that was asked for, byte for byte.
+    assert.deepEqual(
+      psbt.txOutputs[0]!.script,
+      bitcoin.address.toOutputScript(LTC_USER, LTC_TESTNET),
+      'the first output must pay the Litecoin destination',
+    )
+    // Change returns to the source, never to a fresh key this service invented.
+    if (psbt.txOutputs.length > 1) {
+      assert.deepEqual(
+        psbt.txOutputs[1]!.script,
+        bitcoin.address.toOutputScript(LTC_TREASURY, LTC_TESTNET),
+      )
+    }
+    // Every input carries its value, which is the only thing that makes a segwit signature
+    // possible and the thing custody's `signBitcoin` refuses a PSBT for lacking.
+    for (const input of psbt.data.inputs) {
+      assert.ok(input.witnessUtxo, 'every input must carry a witnessUtxo')
+      assert.equal(input.sighashType, bitcoin.Transaction.SIGHASH_ALL)
+    }
+    // And the destination is not a Bitcoin address, which is the assertion the whole file is for.
+    assert.throws(() => bitcoin.address.toOutputScript(LTC_USER, bitcoin.networks.testnet))
+  })
+
+  it('refuses a Bitcoin destination at BUILD, not merely at validation', async () => {
+    // The seam that matters: `isValidDestination` is advisory and `build` is where money moves.
+    const node = fakeLtcNode({ utxos: [{ txid: '1'.repeat(64), vout: 0, sats: 500_000n }], feerate: 0.00001 })
+    await assert.rejects(
+      chainFor('ltc').build(node.call, {
+        from: LTC_TREASURY,
+        to: USER, // a Bitcoin testnet P2WPKH address
+        value: 100_000n,
+        fee: 50_000n,
+        bounds: BOUNDS,
+        shape: 'payment',
+      }),
+      AddressError,
+    )
+  })
+
+  it('CANNOT pay a Taproot address — on Litecoin OR Bitcoin, and that is a live Bitcoin gap', () => {
+    /*
+     * Found while adding Litecoin and recorded here rather than quietly worked around, because it
+     * is not a Litecoin limitation: the same call fails identically for `bc1p…` and has since this
+     * adapter was written. The estate mints P2WPKH, so no deposit address is affected; this bounds
+     * only where a user may withdraw TO.
+     *
+     * Made payable by calling `initEccLib` with a secp256k1 binding HERE and in custody — a native
+     * dependency added to the two services that build and sign money movements, to gain a
+     * destination form rather than a chain. Deliberately not done in this change.
+     */
+    for (const address of UNPAYABLE_TAPROOT) {
+      const chain = address.startsWith('ltc') ? 'ltc' : 'btc'
+      assert.throws(
+        () => validateAddress(chain, address, 'mainnet'),
+        AddressError,
+        `${address} is not payable and was accepted`,
+      )
+      assert.equal(chainFor(chain).isValidDestination(address), false, address)
+    }
+    // Version 0 is unaffected on both chains, so this bounds the output type and not segwit.
+    assert.equal(chainFor('btc').isValidDestination('bc1qvyq0cc6rahyvsazfdje0twl7ez82ndmuac2lhv'), true)
+    assert.equal(chainFor('ltc').isValidDestination('ltc1qhdhvrwe6rgqns8fz28tee0hphr5x7ulw5exv4w'), true)
+  })
+
+  it('is an implemented chain, and hands custody the name custody stores', () => {
+    assert.equal(chainFor('ltc').unimplementedPhase, null)
+    assert.equal(chainFor('ltc').chain, 'ltc')
+    assert.equal(chainFor('ltc').family, 'bitcoin')
+    // Bitcoin has no token model and neither does Litecoin. Null, not a throwing object.
+    assert.equal(chainFor('ltc').tokens, null)
+    assert.ok(implementedChains().includes('ltc'))
+    // `ltc` is this service's slug; `litecoin` is the string custody compares character for
+    // character before it signs. A mismatch is a `binding_mismatch` at signing time.
+    assert.equal(custodyChainOf('ltc'), 'litecoin')
+    assert.equal(custodyFamilyOf('ltc'), 'bitcoin')
+    assert.equal(chainForAsset('LTC'), 'ltc')
+    assert.equal(assetOf('ltc'), 'LTC')
+  })
+
+  it("bounds the amount by Litecoin's supply cap and not Bitcoin's", () => {
+    // 84 million, `litecoin/src/consensus/amount.h`. Reusing Bitcoin's 21 million would refuse a
+    // genuine node answer as malformed.
+    assert.equal(btcToSats(84_000_000, 'ltc'), 8_400_000_000_000_000n)
+    assert.throws(() => btcToSats(84_000_001, 'ltc'), AddressError)
+    assert.throws(() => btcToSats(21_000_001, 'btc'), AddressError)
+    // And the double round-trip is exact well past Bitcoin's range, up to the boundary the header
+    // states: the ULP of a double stays under 1e-8 below 2^25.4 ≈ 44.7 million coins.
+    for (const coins of [1, 21_000_000, 44_000_000]) {
+      assert.equal(btcToSats(coins, 'ltc'), BigInt(coins) * 100_000_000n, `${coins} did not survive`)
+    }
   })
 })
