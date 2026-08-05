@@ -46,17 +46,45 @@ jobs:
       postgres-version: '17'
       # The image smoke test boots the real service, and src/env.ts validates its configuration at
       # import — so the container needs the variables it declares, not just a database, or it exits
-      # before it can serve /livez. CI-only NON-secrets: the two secrets only have to clear a
-      # length check, and the upstream URLs are never dialled because /livez needs no upstream.
-      # Never a real credential.
+      # before it can serve /livez. The upstream URLs are never dialled, because /livez makes no
+      # outbound call.
+      #
+      # THE SENTENCE THAT USED TO BE HERE — "the two secrets only have to clear a length check" —
+      # WAS THE DEFECT STATED OUT LOUD IN CONFIGURATION. A length check is what let micro-org
+      # #142's 40-character `estate-only-outbox-secret-…` onto 44 containers on both networks.
+      # `src/env.ts` now runs `@cloudsforge/secrets`, which checks the SHAPE of a generated value —
+      # base64 or hex, 32 decoded BYTES, an entropy floor — and has no CI exemption on purpose,
+      # because an escape hatch is reached for in exactly the hurry that produced the defect. The
+      # literal that used to sit below normalises to a string containing `cionly` and `notareal`,
+      # so it is refused twice over.
+      #
+      # The answer is not a weaker guard. CI does not need a WEAK secret, it needs A secret —
+      # nothing in the smoke test verifies a signature against anything else — so the shared
+      # workflow expands `=@generate` into a fresh `openssl rand -base64 48` per run and throws it
+      # away (micro-org `service-ci.yml`, the `env_args` loop).
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        OUTBOX_SIGNING_SECRET=@generate
         CUSTODY_URL=http://127.0.0.1:4005
         INDEXER_URL=http://127.0.0.1:4006
         LEDGER_URL=http://127.0.0.1:4004
-        SETTLEMENT_SERVICE_TOKEN=ci-only-not-a-real-token-0000000000000
+        # `SETTLEMENT_SERVICE_TOKEN` IS DELIBERATELY ABSENT NOW, AND SO IS
+        # `SETTLEMENT_IDENTITY_CREDENTIAL`.
+        #
+        # It used to be `ci-only-not-a-real-token-0000000000000`, which has no `cfsc_` prefix — so
+        # `env.ts` reads it as the RETIRED ten-minute token: reported at boot, presented to nobody,
+        # conferring nothing. Supplying it made every smoke run assert that a retired variable was
+        # configured, and a variable nothing obeys is a value nothing needed.
+        #
+        # There is no `@generate` form for a `cfsc_` credential, because identity mints those
+        # against a row and a random string with the prefix glued on is a lie the guard exists to
+        # catch. Nor
+        # is one wanted here: absence is the SUPPORTED mode and it is the one worth smoking —
+        # `env.ts` returns `null`, `index.ts` logs that no credential is configured, `/readyz` (not
+        # `/livez`) is where the absence is enforced as a hard probe, and the image boots. That
+        # last property is the entire reason `env.ts` gives up requiring a credential, so this job
+        # is what proves it still holds.
     secrets:
       # @cloudsforge/* resolves through link:../runtime and link:../contracts rather than a
       # registry, so the workflow checks out micro-runtime and micro-contracts as siblings. Both are
