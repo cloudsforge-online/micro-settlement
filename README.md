@@ -137,6 +137,38 @@ so the sweeper is demand-driven: every coin in the treasury is inside the blast 
 signing credential and every coin left in a deposit address is outside it. `sweep_sources.swept`
 advances at confirmation and never at broadcast.
 
+### ERC-20 sweeps are two transactions, in order
+
+A token balance sits at a deposit address whose native balance is zero — the sender paid the gas —
+so moving it needs the address funded first. That is **two** `outbound_transactions`, planned in one
+database transaction:
+
+| # | `purpose` | from → to | shape |
+| --- | --- | --- | --- |
+| A | `gas_topup` | treasury → the deposit address, native value | custody's `transfer` |
+| B | `token_sweep` | the deposit address → the token contract, calldata `transfer(<pin>, amount)` | custody's `token_sweep` |
+
+B carries `depends_on = A.id` and **cannot be built until A has `confirmed`** — not merely
+broadcast, because a node that has accepted bytes can still drop them. `nextPlanned` skips a blocked
+row and the trigger `outbound_dependency_confirmed_trg` refuses the transition anyway, which is the
+same relationship `outbound_in_flight_uniq` has to the chain lease: the query is the design, the
+constraint is what makes it true when something reaches a row by another route.
+
+Both rows are written at once so there is **no window** in which the top-up exists and its sweep
+does not. The naive shape — "plan the sweep when the top-up confirms" — double-funds on a crash in
+that gap, because the token balance the planner keys on does not change when gas arrives.
+
+`to_address` is the treasury on both, because it means WHO IS PAID; the contract has a column of its
+own. `outbound_token_contract_ck` makes that column present if and only if the purpose is
+`token_sweep`.
+
+**`SETTLEMENT_TOKEN_SWEEP_ENABLED` is off by default and must stay off until `micro-wallet` credits
+token deposits.** Wallet currently refuses them (`token_deposit_unsupported`) because it has no
+decimals registry, and that refusal is correct. Sweeping a balance the ledger has recorded no
+liability for moves customer money into the treasury with no record that it is owed and no
+withdrawal path to pay it back — leaving the tokens at the deposit address is strictly safer. See
+`env.ts` on `tokenSweepEnabled` for the full argument.
+
 ## Chains
 
 `ember` and `eth` are one implementation (`src/evm.ts`); `btc` is `src/bitcoin.ts` and `sol` is

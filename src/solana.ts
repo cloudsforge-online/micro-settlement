@@ -433,6 +433,12 @@ export function solanaChain(): OutboundChain {
     chain: 'sol',
     family: 'solana',
     unimplementedPhase: null,
+    // SPL is a token model and this is deliberately not it. An SPL sweep needs a custody shape that
+    // does not exist — `signSolana` admits exactly one native System Transfer under `sweep`, and SPL
+    // Transfer is refused under all three shapes — and an SPL deposit additionally needs an
+    // Associated Token Account rent-funded before the money can even arrive. Answering anything but
+    // null here would have this service plan sweeps custody cannot sign.
+    tokens: null,
 
     canonicalise: validateAddress,
     // The identity, and deliberately not a case fold. Base58 is case-significant: `toLowerCase` on

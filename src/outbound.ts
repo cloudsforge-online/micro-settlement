@@ -45,7 +45,27 @@ import type { CustodyClient } from './custodyclient.ts'
 import type { IndexerClient } from './indexerclient.ts'
 import { emitInto, type Db, type DomainEvent, type Tx } from './outbox.ts'
 
-export type OutboundPurpose = 'withdrawal' | 'sweep' | 'treasury_move' | 'deploy'
+/**
+ * Why a transaction exists. The purpose picks the signing policy, and for the two the token path
+ * adds it also fixes the ORDER the two of them must run in.
+ *
+ *   * `gas_topup`   — treasury → a deposit address, native value, custody's `transfer` shape. The
+ *     treasury already has that shape and SDR-05 already accepts that it may name ANY destination,
+ *     so aiming one at a deposit address adds no capability a holder of `custody:sign:treasury`
+ *     did not have. Solving the gas problem the other way round — a shape letting the DEPOSIT key
+ *     move native value — would have created one, over a customer's key, to save a transaction.
+ *   * `token_sweep` — a deposit address → a token contract, calldata `transfer(<pin>, amount)`.
+ *     Custody refines this shape out of `sweep` FROM THE PAYLOAD and never from a field a caller
+ *     sends, so this value does not select it. What it does is carry the dependency and keep the
+ *     operator surface honest about which of two very different transactions a row is.
+ */
+export type OutboundPurpose =
+  | 'withdrawal'
+  | 'sweep'
+  | 'treasury_move'
+  | 'deploy'
+  | 'gas_topup'
+  | 'token_sweep'
 export type OutboundState =
   | 'planned'
   | 'building'
@@ -94,6 +114,17 @@ export interface OutboundTransaction {
   readonly ledgerEntryId: string | null
   readonly failureReason: string | null
   readonly sourceRef: string | null
+  /** The ERC-20 contract, on a `token_sweep` and on nothing else. The schema enforces the iff. */
+  readonly tokenContract: string | null
+  /**
+   * The transaction that must have CONFIRMED before this one may be built.
+   *
+   * Only a `token_sweep` has one today, naming its `gas_topup`. It is a general column rather than
+   * a token-specific one because the ordering constraint is general — "these bytes cannot be
+   * broadcast until those ones have landed" — and a second use of it should not need a second
+   * mechanism.
+   */
+  readonly dependsOn: string | null
   readonly userId: string | null
   readonly reservationEntryId: string | null
   readonly correlationId: string | null
@@ -127,6 +158,8 @@ interface OutboundRow {
   readonly ledger_entry_id: string | null
   readonly failure_reason: string | null
   readonly source_ref: string | null
+  readonly token_contract: string | null
+  readonly depends_on: string | null
   readonly user_id: string | null
   readonly reservation_entry_id: string | null
   readonly correlation_id: string | null
@@ -161,6 +194,8 @@ function toOutbound(row: OutboundRow): OutboundTransaction {
     ledgerEntryId: row.ledger_entry_id,
     failureReason: row.failure_reason,
     sourceRef: row.source_ref,
+    tokenContract: row.token_contract,
+    dependsOn: row.depends_on,
     userId: row.user_id,
     reservationEntryId: row.reservation_entry_id,
     correlationId: row.correlation_id,
@@ -183,8 +218,8 @@ const COLUMNS = `
   amount::text as amount, fee::text as fee, state, raw_tx, signed_nonce, signed_expiry,
   custody_audit_id, tx_hash, confirmations, mined_height::text as mined_height,
   signed_at, broadcast_at, confirmed_at, matured_at, ledger_entry_id, failure_reason,
-  source_ref, user_id, reservation_entry_id, correlation_id, idempotency_key,
-  created_at, updated_at
+  source_ref, token_contract, depends_on, user_id, reservation_entry_id, correlation_id,
+  idempotency_key, created_at, updated_at
 `
 
 /* ------------------------------------------------------------------ planning */
@@ -200,6 +235,10 @@ export interface PlanInput {
   readonly fee: bigint
   readonly idempotencyKey: string
   readonly sourceRef?: string
+  /** Required on a `token_sweep` and refused on everything else. `outbound_token_contract_ck`. */
+  readonly tokenContract?: string
+  /** @see OutboundTransaction.dependsOn */
+  readonly dependsOn?: string
   readonly userId?: string
   readonly reservationEntryId?: string
   readonly correlationId?: string
@@ -227,13 +266,18 @@ export async function planOutbound(
   const inserted = await sql<OutboundRow[]>`
     insert into outbound_transactions (
       purpose, chain, network, from_address, from_address_key, to_address, to_address_key,
-      asset_code, amount, fee, state, source_ref, user_id, reservation_entry_id,
-      correlation_id, idempotency_key
+      asset_code, amount, fee, state, source_ref, token_contract, depends_on, user_id,
+      reservation_entry_id, correlation_id, idempotency_key
     ) values (
       ${input.purpose}, ${input.chain}, ${input.network},
       ${from}, ${adapter.addressKey(from)}, ${to}, ${adapter.addressKey(to)},
       ${input.assetCode}, ${input.amount.toString()}, ${input.fee.toString()}, 'planned',
-      ${input.sourceRef ?? null}, ${input.userId ?? null}, ${input.reservationEntryId ?? null},
+      ${input.sourceRef ?? null},
+      -- Lower-cased on the way in, because outbound_token_contract_ck accepts one spelling and
+      -- custody's allowlist stores that same one. A checksummed contract reaching the database is
+      -- a 23514 here rather than a shape_refused after the chain's slot has been claimed.
+      ${input.tokenContract?.toLowerCase() ?? null}, ${input.dependsOn ?? null},
+      ${input.userId ?? null}, ${input.reservationEntryId ?? null},
       ${input.correlationId ?? null}, ${input.idempotencyKey}
     )
     on conflict (idempotency_key) do nothing
@@ -319,16 +363,94 @@ export async function nextPlanned(
   sql: Db,
   chain: ChainId,
   network: Network,
-  purposes: readonly OutboundPurpose[] = ['withdrawal', 'sweep', 'treasury_move'],
+  /**
+   * **EVERY PURPOSE THE WORKER DRIVES, AND ADDING ONE HERE IS NOT OPTIONAL.**
+   *
+   * A purpose missing from this list is a purpose whose rows are planned and then never offered to
+   * anybody — they sit in `planned` for ever, invisible to the worker, indistinguishable from a
+   * queue that is merely slow, while the metric that counts them says the work was scheduled. That
+   * is exactly what happened to `gas_topup` and `token_sweep` the first time they were added: the
+   * pair was written correctly, the schema accepted it, the planner reported `planned`, and nothing
+   * ever moved. `deploy` is deliberately still absent — it is driven by its own route, not by the
+   * chain tick.
+   */
+  purposes: readonly OutboundPurpose[] = [
+    'withdrawal',
+    'sweep',
+    'treasury_move',
+    'gas_topup',
+    'token_sweep',
+  ],
 ): Promise<OutboundTransaction | null> {
   const rows = await sql<OutboundRow[]>`
-    select ${sql.unsafe(COLUMNS)} from outbound_transactions
-     where chain = ${chain} and network = ${network} and state = 'planned'
-       and purpose = any(${sql.array(purposes as string[])}::text[])
-     order by (purpose = 'sweep') desc, created_at
+    select ${sql.unsafe(COLUMNS)} from outbound_transactions o
+     where o.chain = ${chain} and o.network = ${network} and o.state = 'planned'
+       and o.purpose = any(${sql.array(purposes as string[])}::text[])
+       -- ────────────────────────────────────────────────────────────────────────────────────────
+       -- A ROW BLOCKED ON ITS DEPENDENCY IS NOT QUEUED, IT IS WAITING.
+       --
+       -- A token_sweep whose gas_topup has not confirmed cannot be built: the deposit address
+       -- still holds no native coin, so the build would fail on the balance check, release back to
+       -- planned, and be picked again on the very next tick — a hot loop that costs an RPC round
+       -- trip per tick and stops the chain making progress on anything behind it.
+       --
+       -- state = 'confirmed' and not "anything past broadcast". A broadcast top-up has not moved
+       -- the money yet; a node that has accepted the bytes can still drop them. Building against a
+       -- balance that is only probably there is the mistake this whole ordering exists to avoid.
+       --
+       -- The trigger outbound_dependency_confirmed_trg says the same thing to anyone who reaches
+       -- a row by another route. This clause is what keeps the worker from having to be refused.
+       -- ────────────────────────────────────────────────────────────────────────────────────────
+       and (
+         o.depends_on is null
+         or exists (
+           select 1 from outbound_transactions d
+            where d.id = o.depends_on and d.state = 'confirmed'
+         )
+       )
+     -- A sweep still overtakes a withdrawal, and a token_sweep is a sweep for this purpose: it
+     -- brings money to the treasury rather than spending it, so promoting it can only make the
+     -- withdrawal behind it more likely to succeed. A gas_topup deliberately does NOT overtake —
+     -- it SPENDS the treasury, so letting it jump a queued withdrawal would take money from the
+     -- user who is waiting to fund a sweep that has not happened yet.
+     order by (o.purpose in ('sweep','token_sweep')) desc, o.created_at
      limit 1
   `
   return rows[0] ? toOutbound(rows[0]) : null
+}
+
+/**
+ * Every planned row waiting on a dependency that can never confirm, failed with it.
+ *
+ * **A CASCADE, IN THE SAME TRANSACTION AS THE FAILURE THAT CAUSED IT.** A `token_sweep` whose
+ * `gas_topup` was refunded is a row that can never be built — the trigger refuses it and
+ * `nextPlanned` will not offer it — so leaving it `planned` leaves a permanent entry in a queue
+ * nothing will ever drain, which is indistinguishable from a sweep that is merely slow.
+ *
+ * GUARDED ON `state = 'planned'`, and the guard is provably sufficient rather than merely careful.
+ * A dependent can only be past `planned` if it was allowed into `building`, which the trigger
+ * permits only when its dependency is `confirmed` — and `confirmed` is terminal-success, which
+ * `markFailed` cannot reach (its WHERE clause is `planned`/`building`). So there is no ordering in
+ * which this could retire a row that has signed something.
+ */
+async function failDependents(
+  tx: Tx,
+  producer: string,
+  id: string,
+  reason: string,
+  events: (row: OutboundTransaction) => readonly DomainEvent[],
+): Promise<readonly OutboundTransaction[]> {
+  const rows = await tx<OutboundRow[]>`
+    update outbound_transactions
+       set state = 'failed',
+           failure_reason = ${`the transaction this one depended on failed: ${reason}`.slice(0, 2_000)},
+           updated_at = now()
+     where depends_on = ${id} and state = 'planned'
+    returning ${tx.unsafe(COLUMNS)}
+  `
+  const failed = rows.map(toOutbound)
+  for (const row of failed) await emitInto(tx, producer, events(row))
+  return failed
 }
 
 /** Every `(chain, network)` with open work, so the tick job knows which leases to ask for. */
@@ -561,6 +683,8 @@ export async function markFailed(
     if (!row) return { value: null }
     const failed = toOutbound(row)
     await emitInto(tx, producer, events(failed))
+    // In the SAME transaction, so a crash cannot leave a dead dependency and a live dependent.
+    await failDependents(tx, producer, failed.id, reason, events)
     return { value: failed }
   })
   return outcome.value
@@ -657,6 +781,13 @@ export async function resolveWithProof(
       values (${resolved.id}, ${input.action}, ${input.proof}, ${input.actor}, ${input.correlationId})
     `
     await emitInto(tx, producer, input.events(resolved))
+    if (input.action === 'refund') {
+      // The other route to `failed`, and it needs the same cascade for the same reason. A refunded
+      // gas top-up leaves its token sweep waiting on a dependency that will never confirm, and the
+      // adjudication path is the one an OPERATOR drives — so an orphan created here is one somebody
+      // is already looking at a screen for.
+      await failDependents(tx, producer, resolved.id, input.proof, input.events)
+    }
     return { value: resolved }
   })
   return outcome.value

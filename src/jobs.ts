@@ -53,7 +53,7 @@ import { isChainId, isNetwork, type ChainId } from './chains.ts'
 import { implementedChains } from './registry.ts'
 import { createRelay, type Db, type RelayDeps } from './outbox.ts'
 import { bookFee, unbookedFees, type FeeDeps } from './fees.ts'
-import { planSweep, type SweepDeps } from './sweeps.ts'
+import { planSweep, planTokenSweep, type TokenSweepDeps } from './sweeps.ts'
 import { driveChain, type WorkerDeps } from './worker.ts'
 import {
   NoTreasuryPinnedError,
@@ -191,7 +191,7 @@ export interface JobDeps {
   readonly metrics: Metrics
   readonly signingSecret: string
   readonly worker: WorkerDeps
-  readonly sweeps: SweepDeps
+  readonly sweeps: TokenSweepDeps
   readonly fees: FeeDeps
   readonly treasuryWatch: TreasuryWatchDeps
 }
@@ -275,6 +275,32 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
           network,
           outboundId: outcome.outboundId,
           amount: outcome.amount.toString(),
+        })
+      }
+      /*
+       * THE TOKEN PAIR, PLANNED IN THE SAME HANDLER AND UNDER THE SAME LEASE.
+       *
+       * It belongs here rather than in a job of its own for the reason the header gives: this
+       * handler shares a lease key with `chain.outbound` and that is safe FOR ONE REASON ONLY —
+       * it never signs. `planTokenSweep` writes two `planned` rows and does nothing else, so the
+       * property is unchanged. A separate kind would be a third row on the jobs table contending
+       * for nothing, and — worse — a second place from which somebody could later add a signature
+       * without reading this paragraph.
+       *
+       * It runs even when `planSweep` above returned `satisfied`. The native shortfall says nothing
+       * about tokens: a treasury with all the ETH it needs can still be leaving USDT stranded at
+       * addresses that cannot pay their own gas.
+       */
+      const tokenOutcome = await planTokenSweep(deps.sweeps, chain, network)
+      if (tokenOutcome.kind === 'planned') {
+        deps.metrics.increment('settlement_token_sweeps_planned_total', { chain })
+        deps.logger.info('token sweep planned, with the gas top-up it depends on', {
+          chain,
+          network,
+          topUpId: tokenOutcome.topUpId,
+          sweepId: tokenOutcome.sweepId,
+          contract: tokenOutcome.contract,
+          amount: tokenOutcome.amount.toString(),
         })
       }
     } catch (err) {

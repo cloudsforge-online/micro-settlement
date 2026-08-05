@@ -147,15 +147,34 @@ async function start(deps: WorkerDeps, row: OutboundTransaction): Promise<StartO
       await adapter.estimateFee(call, deps.bounds)
     }
     const binding = await bindingFor(deps, row)
-    unsigned = await adapter.build(call, {
-      from: row.fromAddress,
-      to: row.toAddress,
-      value: row.amount,
-      fee: row.fee,
-      bounds: deps.bounds,
-      // Read off the SAME object that carries the purpose claimed to custody. See `signingPolicy`.
-      shape: binding.shape,
-    })
+    unsigned = await adapter.build(
+      call,
+      binding.shape === 'token_sweep'
+        ? {
+            from: row.fromAddress,
+            // The PIN — who is paid — which the builder puts inside the calldata. The contract is
+            // the transaction's own `to` and travels separately, in `token`.
+            to: row.toAddress,
+            value: row.amount,
+            fee: row.fee,
+            bounds: deps.bounds,
+            shape: 'token_sweep',
+            // Non-null by `outbound_token_contract_ck`, which makes the column present if and only
+            // if the purpose is `token_sweep`. Thrown rather than defaulted anyway: a token sweep
+            // whose contract went missing must not fall back to any address at all.
+            token: { contract: tokenContractOf(row) },
+          }
+        : {
+            from: row.fromAddress,
+            to: row.toAddress,
+            value: row.amount,
+            fee: row.fee,
+            bounds: deps.bounds,
+            // Read off the SAME object that carries the purpose claimed to custody. See
+            // `signingPolicy`.
+            shape: binding.shape,
+          },
+    )
     const result = await deps.custody.sign({
       address: row.fromAddress,
       chain: custodyChainOf(row.chain),
@@ -228,16 +247,63 @@ export function signingPolicy(purpose: OutboundPurpose): {
   readonly custodyPurpose: 'treasury' | 'deposit'
   readonly shape: OutboundShape
 } {
-  return purpose === 'sweep'
-    ? { custodyPurpose: 'deposit', shape: 'sweep' }
-    : // A withdrawal, a treasury move and a deploy all spend the TREASURY and all name their own
-      // destination, which is custody's `payment`/`transfer` shape. There is deliberately no
-      // fallback to `sweep` here, unlike custody's own `…ShapeForPurpose`: custody fails toward the
-      // shape it cannot resolve a pin for, and therefore signs nothing, whereas this service
-      // failing toward `sweep` would build a change-free PSBT for a withdrawal and silently pay the
-      // user's whole balance minus a fee to a single output. Failing toward `payment` produces
-      // bytes custody REFUSES, which is the direction that costs a retry rather than money.
-      { custodyPurpose: 'treasury', shape: 'payment' }
+  if (purpose === 'sweep') return { custodyPurpose: 'deposit', shape: 'sweep' }
+  /*
+   * A TOKEN SWEEP CLAIMS `deposit` TO CUSTODY, EXACTLY AS A NATIVE ONE DOES.
+   *
+   * There is no `purpose: 'token_sweep'` on custody's side to claim and there must not be. Custody
+   * refines the shape out of `sweep` FROM THE PAYLOAD — "a `deposit` payload with empty calldata is
+   * a `sweep` and one with calldata is a `token_sweep`" — precisely so that the choice between two
+   * policies is never a caller-supplied field. Sending a shape name would put that choice back in
+   * the request, which is the smaller version of the thing custody's whole signing file exists to
+   * refuse.
+   *
+   * So this value is not transmitted. It selects which BYTES this service builds, and custody
+   * independently reaches the same conclusion by looking at them. The two agreeing is a property
+   * worth having; the two being told is not.
+   */
+  if (purpose === 'token_sweep') return { custodyPurpose: 'deposit', shape: 'token_sweep' }
+  /*
+   * A GAS TOP-UP IS A TREASURY PAYMENT AND NOTHING MORE.
+   *
+   * It spends the treasury and names its own destination, which is custody's `transfer` shape — the
+   * one the treasury already has. SDR-05 already accepts that a treasury transfer may pay ANY
+   * address, so aiming one at a deposit address adds no capability a holder of
+   * `custody:sign:treasury` did not already have. That direction is the entire reason this is safe;
+   * the other direction, a shape letting a DEPOSIT key move native value, would have created one
+   * over a customer's key to save a transaction.
+   */
+  // A withdrawal, a treasury move, a deploy and a gas top-up all spend the TREASURY and all name
+  // their own destination. There is deliberately no fallback to `sweep` here, unlike custody's own
+  // `…ShapeForPurpose`: custody fails toward the shape it cannot resolve a pin for, and therefore
+  // signs nothing, whereas this service failing toward `sweep` would build a change-free PSBT for a
+  // withdrawal and silently pay the user's whole balance minus a fee to a single output. Failing
+  // toward `payment` produces bytes custody REFUSES, which is the direction that costs a retry
+  // rather than money.
+  return { custodyPurpose: 'treasury', shape: 'payment' }
+}
+
+/** The purposes whose confirmation is a sweep arriving at the treasury. */
+const SWEEP_PURPOSES: ReadonlySet<OutboundPurpose> = new Set<OutboundPurpose>(['sweep', 'token_sweep'])
+
+/**
+ * The contract a token sweep calls, or a loud failure.
+ *
+ * `outbound_token_contract_ck` makes the column non-null for exactly this purpose, so the null
+ * branch is unreachable through the database. It is checked anyway and it THROWS rather than
+ * defaulting, because the only two things a default could be are the treasury — which would make
+ * this a native transfer of a token amount, a number in the wrong unit sent to the right place —
+ * and the zero address. A build failure is classified, logged and retried; a wrong contract is a
+ * signature.
+ */
+function tokenContractOf(row: OutboundTransaction): string {
+  if (!row.tokenContract) {
+    throw new Error(
+      `token sweep ${row.id} has no token contract recorded — there is no address this service ` +
+        'may substitute for one, so nothing is built',
+    )
+  }
+  return row.tokenContract
 }
 
 /** Which binding custody will demand be restated for the address this row spends from. */
@@ -368,7 +434,18 @@ export async function advance(deps: WorkerDeps, row: OutboundTransaction): Promi
       deps.producer,
       row.id,
       status.confirmations,
-      (r) => (r.purpose === 'sweep' ? sweepCompletedEvents(r) : confirmedEvents(r)),
+      // A GAS TOP-UP EMITS NOTHING, and that is the point of routing on the purpose rather than on
+      // "is there a sourceRef". `confirmedEvents` announces a WITHDRAWAL settling, which a top-up
+      // is not — publishing one would tell wallet a user's payment had landed when what landed was
+      // the platform funding its own address. `sweepCompletedEvents` is equally wrong: nothing
+      // arrived at the treasury, money left it. The top-up's confirmation is what unblocks its
+      // dependent, and that is a database fact rather than an announcement.
+      (r) =>
+        SWEEP_PURPOSES.has(r.purpose)
+          ? sweepCompletedEvents(r)
+          : r.purpose === 'gas_topup'
+            ? []
+            : confirmedEvents(r),
     )
     if (confirmed) {
       deps.metrics.increment('settlement_confirmed_total', { chain: row.chain, purpose: row.purpose })
@@ -378,7 +455,10 @@ export async function advance(deps: WorkerDeps, row: OutboundTransaction): Promi
         txHash: row.txHash,
         confirmations: status.confirmations,
       })
-      // A sweep's accounting is gated on DEPTH and this is the depth. See `matureSweepFor`.
+      // A sweep's accounting is gated on DEPTH and this is the depth. See `matureSweepFor`, which
+      // refuses a `token_sweep` on its own guard: `sweep_sources.swept` is a NATIVE high-water mark
+      // and adding a token amount to it would corrupt the number every later native sweep is
+      // ordered and skipped by.
       if (confirmed.purpose === 'sweep') await matureSweepFor(deps, confirmed)
     }
     return

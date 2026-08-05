@@ -34,7 +34,7 @@ import { httpLedgerClient } from './ledgerclient.ts'
 import type { Db } from './outbox.ts'
 import type { OutboundDeps } from './outbound.ts'
 import type { WorkerDeps } from './worker.ts'
-import type { SweepDeps } from './sweeps.ts'
+import { tokensFor, type TokenSweepDeps } from './sweeps.ts'
 
 // 1. Environment. Importing `./env.ts` validated it; a missing or placeholder secret has already
 //    exited with a structured line naming the variable.
@@ -155,13 +155,20 @@ const outbound: OutboundDeps = {
 }
 const worker: WorkerDeps = { ...outbound, metrics, logger: logger.child({ component: 'worker' }) }
 const treasuries = { sql: db, custody, network: env.network }
-const sweeps: SweepDeps = {
+const sweeps: TokenSweepDeps = {
   ...outbound,
   ...treasuries,
   treasuryTargets: env.treasuryTargets,
   minFeeMultiple: env.sweepMinFeeMultiple,
   probeLimit: 10,
   enabled: env.sweepEnabled,
+  tokenSweepEnabled: env.tokenSweepEnabled,
+  minimumTokenSweep: env.minTokenSweep,
+  // Read from custody on every pass rather than cached at boot. A token an operator registers must
+  // become sweepable without a redeploy, and — the direction that matters more — one they REMOVE
+  // must stop being swept immediately. A cache here would be this service's own second copy of the
+  // allowlist, which is the exact thing reading from custody exists to avoid.
+  tokens: async (chain, network) => tokensFor(await custody.tokenContracts(), chain, network),
   logger: logger.child({ component: 'sweeper' }),
 }
 

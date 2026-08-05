@@ -38,7 +38,7 @@
  */
 
 import { chainSpec, type Network } from '@cloudsforge/contracts-chain'
-import { assetOf, type ChainId } from './chains.ts'
+import { assetOf, custodyChainOf, type ChainId } from './chains.ts'
 import { chainFor } from './registry.ts'
 import { assertSweepable, floatTarget, type TreasuryDeps } from './treasury.ts'
 import {
@@ -47,6 +47,7 @@ import {
   type OutboundDeps,
   type OutboundTransaction,
 } from './outbound.ts'
+import type { CustodyTokenContract } from './custodyclient.ts'
 import { SETTLEMENT_SWEEP_COMPLETED, type Db, type DomainEvent } from './outbox.ts'
 
 /* ------------------------------------------------------------------ sources */
@@ -231,11 +232,56 @@ export async function unmaturedByAddress(
   const rows = await sql<Array<{ from_address_key: string; total: string }>>`
     select from_address_key, sum(amount + fee)::text as total
       from outbound_transactions
+     -- NATIVE SWEEPS ONLY, and the exclusion of 'token_sweep' is deliberate rather than an
+     -- oversight. A token sweep's amount is denominated in the TOKEN and its fee in native wei,
+     -- so adding it to this total would produce a number in no unit at all — and this total is
+     -- read by an operator answering "how much of this address is already moving". A quantity that
+     -- is sometimes wei and sometimes six-decimal USDT is worse than no quantity.
+     --
+     -- The SET of addresses to leave alone is a different question and it is answered by
+     -- addressesInFlight, which both planners consult. Splitting the two is what lets this one
+     -- keep a meaning.
      where chain = ${chain} and network = ${network} and purpose = 'sweep'
        and state in ('planned','building','signed','broadcast')
      group by from_address_key
   `
   return new Map(rows.map((r) => [r.from_address_key, BigInt(r.total)]))
+}
+
+/**
+ * Every address with an unretired outbound movement off it, of any purpose.
+ *
+ * **A SET RATHER THAN A SUM, because the question is "leave this alone?" and not "how much?".**
+ * Mixing a token amount into a wei total gives a number in no unit; mixing them into a set gives
+ * exactly the right answer, because membership does not have a unit.
+ *
+ * `planned` is included, which is the clause that makes the two-phase plan safe: from the instant
+ * the pair commits, the deposit address is in this set, so no later pass observes it, probes it, or
+ * funds it a second time. That is rule 2 of `signing.ts` — fund once — enforced by a query rather
+ * than by a planner remembering to.
+ */
+export async function addressesInFlight(
+  sql: Db,
+  chain: ChainId,
+  network: Network,
+): Promise<ReadonlySet<string>> {
+  const rows = await sql<Array<{ from_address_key: string; to_address_key: string }>>`
+    select from_address_key, to_address_key
+      from outbound_transactions
+     where chain = ${chain} and network = ${network}
+       and purpose in ('sweep','token_sweep','gas_topup')
+       and state in ('planned','building','signed','broadcast')
+  `
+  // BOTH ENDS, and the destination end is the one that matters for a top-up: a `gas_topup` moves
+  // FROM the treasury TO the deposit address, so keying it only by its source would put the
+  // treasury in the set — true and useless — while leaving the address it funds looking untouched.
+  // That is precisely the address a second pass must not fund again.
+  const keys = new Set<string>()
+  for (const row of rows) {
+    keys.add(row.from_address_key)
+    keys.add(row.to_address_key)
+  }
+  return keys
 }
 
 /**
@@ -336,10 +382,16 @@ export async function planSweep(
   const multiple = BigInt(Math.max(1, deps.minFeeMultiple))
 
   const unmatured = await unmaturedByAddress(deps.sql, chain, network)
+  const inFlight = await addressesInFlight(deps.sql, chain, network)
   const candidates = await sweepCandidates(deps.sql, chain, network, deps.probeLimit)
 
   for (const source of candidates) {
     if (source.addressKey === treasury.addressKey) continue
+    // Anything moving off OR onto this address, of any purpose. Checked before the probe, because
+    // an address with a token sweep pair outstanding is one whose native balance is about to change
+    // by exactly the gas that pair delivers — so a native quote taken now is a quote of a number
+    // that is already stale.
+    if (inFlight.has(source.addressKey)) continue
     // One probe per candidate per pass, bounded by `probeLimit`. Without the bound this is one RPC
     // per deposit address ever created, per tick, for ever — and most of them have never held a
     // coin. That unbounded scan is the shape of forge-pay's watcher, which AD-07 records.
@@ -396,6 +448,262 @@ export async function planSweep(
     if (!created) continue
     needed -= value
     return { kind: 'planned', outboundId: outbound.id, amount: value }
+  }
+
+  return { kind: 'nothing_to_sweep' }
+}
+
+/* ------------------------------------------------------------------ the token path */
+
+/**
+ * A token an operator registered, as this service needs it.
+ *
+ * Read from CUSTODY rather than configured here, and that is the load-bearing decision. Custody's
+ * `custody_token_contracts` is the allowlist `assertTokenSweep` checks a candidate against, so a
+ * contract this service planned a sweep for and custody has not registered is a `shape_refused`
+ * arriving after the row is committed and the chain's single outbound slot is claimed. One
+ * authority, read by the service that must not disagree with it.
+ */
+export interface RegisteredToken {
+  readonly chain: ChainId
+  readonly network: Network
+  /** Lower-cased. Both sides' schemas enforce that. */
+  readonly contract: string
+  readonly symbol: string
+  readonly decimals: number
+}
+
+export interface TokenSweepDeps extends SweepDeps {
+  /**
+   * Whether this deployment sweeps tokens at all. **Separate from `enabled`, deliberately.**
+   *
+   * A deployment that sweeps native coin correctly is not thereby ready to sweep tokens: the
+   * precondition is that `micro-wallet` credits token deposits, which it does not yet, and until it
+   * does a token sweep moves customer money the ledger has recorded no liability for. `env.ts` on
+   * `tokenSweepEnabled` carries the whole argument. One flag for both would make that decision by
+   * accident.
+   */
+  readonly tokenSweepEnabled: boolean
+  /** The registry, read from custody. Empty is the ordinary state and is never an error. */
+  readonly tokens: (chain: ChainId, network: Network) => Promise<readonly RegisteredToken[]>
+  /** @see env.minTokenSweep. Zero disables the floor. */
+  readonly minimumTokenSweep: bigint
+}
+
+/**
+ * The ledger asset code a token balance is denominated in.
+ *
+ * `TOKEN:<chain>:<network>:<contract>` — the urn shape `contracts-money` already defines
+ * (`TokenAssetCode`), where two deployments of one brand are two ledger assets PERMANENTLY.
+ *
+ * **NOTHING HERE MAY EVER WRITE `USDT`.** A single `USDT` asset code forces one decimals value onto
+ * a token that has six on Ethereum, six on Tron and eighteen on BSC, and the wrong decimals on a
+ * stablecoin is a balance wrong by a factor of 10^12. It also silently asserts that a USDT balance
+ * is one thing, when a deposit on one chain cannot be paid out on another without a bridge this
+ * platform is not and must never become. "USDT" is a display grouping for a frontend; it is never a
+ * code. It is a function rather than an inline template so the one place that spells this is
+ * testable in isolation.
+ */
+export function tokenAssetCode(token: RegisteredToken): string {
+  return `TOKEN:${token.chain}:${token.network}:${token.contract}`
+}
+
+/**
+ * Custody's registry, narrowed to one chain and network and translated into this service's slug.
+ *
+ * **THE TRANSLATION IS THE WHOLE OF THIS FUNCTION AND IT IS NOT A `toLowerCase()`.** Custody stores
+ * `ethereum` where this service's slug is `eth` — the one disagreement of five, and at signing time
+ * it is a `binding_mismatch` custody deliberately will not explain. Filtering custody's rows by this
+ * service's slug would silently match nothing on Ethereum, which is the only chain that has tokens,
+ * so the bug would present as "tokens are registered and nothing is ever swept".
+ *
+ * The `contract` is lower-cased again on the way out even though custody's CHECK constraint already
+ * guarantees it. That is not distrust of the constraint; it is that this value is compared against
+ * `outbound_token_contract_ck` and against custody's allowlist by two different mechanisms, and a
+ * normalisation that happens in exactly one place cannot be the one that is skipped.
+ */
+export function tokensFor(
+  all: readonly CustodyTokenContract[],
+  chain: ChainId,
+  network: Network,
+): readonly RegisteredToken[] {
+  const custodyChain = custodyChainOf(chain)
+  return all
+    .filter((row) => row.chain === custodyChain && row.network === network)
+    .map((row) => ({
+      chain,
+      network,
+      contract: row.contract.toLowerCase(),
+      symbol: row.symbol,
+      decimals: row.decimals,
+    }))
+}
+
+export type TokenSweepOutcome =
+  | { readonly kind: 'disabled' }
+  | { readonly kind: 'no_tokens' }
+  | { readonly kind: 'nothing_to_sweep' }
+  | {
+      readonly kind: 'planned'
+      readonly topUpId: string
+      readonly sweepId: string
+      readonly amount: bigint
+      readonly contract: string
+    }
+
+/**
+ * Plan a gas top-up and the ERC-20 sweep it pays for — **two rows, one transaction, in order**.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ## Why both rows are written at once, when only the first can run
+ *
+ * The obvious shape is "top up now, plan the sweep when the top-up confirms". It has a window, and
+ * the window costs money every time it is hit: a crash between the top-up confirming and the sweep
+ * being planned leaves a deposit address holding gas, with nothing on file saying why. The next
+ * pass reads the TOKEN balance — which the top-up did not change — decides a sweep is warranted,
+ * and funds the address a second time. `signing.ts` states the rule this breaks as its rule 2:
+ * "the top-up and the sweep are two transactions with a confirmation between them; a planner that
+ * does not treat the top-up as in-flight will fund the same address on every tick until it
+ * confirms."
+ *
+ * Writing both rows in one transaction removes the window entirely rather than narrowing it. After
+ * it commits, the sweep row exists in `planned` with `depends_on` set, and `unmaturedByAddress`
+ * — which counts `planned` — takes this address out of every later pass until the pair retires.
+ * There is no state in which the top-up is on file and the sweep is not.
+ *
+ * ## What a crash at each point costs, stated exhaustively
+ *
+ *   * **Before the commit.** Nothing exists. The next pass re-observes the same token balance and
+ *     plans the same pair. No transaction was signed, so nothing moved.
+ *   * **After the commit, before the top-up is signed.** Two `planned` rows. The worker claims the
+ *     top-up (the sweep is skipped by `nextPlanned`'s dependency clause) and proceeds.
+ *   * **Mid top-up.** The ordinary outbound recovery: bytes are committed before they are
+ *     broadcast, and a `signed` row re-sends the identical bytes rather than re-signing.
+ *   * **After the top-up confirms, before the sweep starts.** The sweep is `planned` and now
+ *     unblocked; the next tick picks it up. This is the window the naive design double-funds in,
+ *     and here it is simply the queue working.
+ *   * **Mid sweep.** The same outbound recovery again.
+ *
+ * ## Why this cannot double-spend
+ *
+ * Three independent mechanisms, and they catch different things:
+ *
+ *   1. **Both idempotency keys are derived from the same tuple**, including the observed token
+ *      balance. A second pass that observes the same balance computes the same two keys and
+ *      `planOutbound` returns `created: false` for both. A balance that HAS moved is a different
+ *      pair of keys, which is a new sweep rather than a conflict with a stale one.
+ *   2. **`unmaturedByAddress` counts `planned`**, so the address is out of the candidate set from
+ *      the instant the pair commits until the sweep matures.
+ *   3. **`outbound_in_flight_uniq`** permits one in-flight transaction per chain, so the top-up and
+ *      the sweep cannot be in the air together even if everything above failed.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export async function planTokenSweep(
+  deps: TokenSweepDeps,
+  chain: ChainId,
+  network: Network,
+): Promise<TokenSweepOutcome> {
+  // BOTH flags, and `tokenSweepEnabled` is the one that is off by default. A deployment that has
+  // turned sweeping off entirely must not sweep tokens either; a deployment that sweeps native coin
+  // has said nothing about tokens.
+  if (!deps.enabled || !deps.tokenSweepEnabled) return { kind: 'disabled' }
+  const adapter = chainFor(chain)
+  // A family with no token model, or a chain this service cannot move a coin on at all. Both are
+  // silent and permanent, and neither is an error: `tokens: null` is Bitcoin's ordinary state.
+  if (adapter.unimplementedPhase || !adapter.tokens) return { kind: 'no_tokens' }
+
+  const registered = await deps.tokens(chain, network)
+  if (registered.length === 0) return { kind: 'no_tokens' }
+
+  // The pin, read fresh and echoed exactly as custody published it. `assertTokenSweep` compares the
+  // calldata's recipient against this same value, so a stale copy is a refusal.
+  const { treasury, pin } = await assertSweepable(deps, chain, network)
+
+  const call = callFor(deps, chain)
+  const inFlight = await addressesInFlight(deps.sql, chain, network)
+  const candidates = await sweepCandidates(deps.sql, chain, network, deps.probeLimit)
+  const tokens = adapter.tokens
+
+  for (const source of candidates) {
+    if (source.addressKey === treasury.addressKey) continue
+    // Anything at all already moving off this address — a native sweep, a token sweep, or the
+    // `planned` half of a pair from a previous pass — takes it out of this pass entirely. Checked
+    // BEFORE any RPC, because the whole point is to not spend a probe on an address we have already
+    // decided about.
+    if (inFlight.has(source.addressKey)) continue
+
+    for (const token of registered) {
+      const balance = await tokens.balanceOf(call, source.address, token.contract)
+      if (balance <= 0n) continue
+      // A floor an operator sets, in the token's own smallest units. Below it the two transactions
+      // this takes cost more in native gas than the tokens are worth, and sweeping anyway would be
+      // spending the platform's coin to move a dust balance into the blast radius of the signing
+      // credential. Zero disables the floor, which is the default and is deliberate: a number
+      // nobody has chosen must not silently strand a real deposit.
+      if (deps.minimumTokenSweep > 0n && balance < deps.minimumTokenSweep) continue
+
+      const gasFee = await tokens.transferFee(call, deps.bounds)
+      // What the TOP-UP itself costs to send, on top of what it delivers.
+      const topUpFee = await adapter.estimateFee(call, deps.bounds)
+
+      const key = `${chain}:${network}:${source.id}:${token.contract}:${balance.toString()}`
+      const planned = await deps.sql.begin(async (tx) => {
+        // ── PHASE A ────────────────────────────────────────────────────────────────────────────
+        // Treasury → the deposit address, delivering EXACTLY the sweep's locked fee. Not more: gas
+        // parked at a deposit address is dust that must itself be swept later, at a fee, from
+        // however many addresses accumulated it (`signing.ts`, rule 1 — fund on demand, never in
+        // advance). Not less: an under-funded sweep runs out of gas, burns the fee and moves
+        // nothing.
+        const topUp = await planOutbound(tx, {
+          purpose: 'gas_topup',
+          chain,
+          network,
+          from: treasury.address,
+          to: source.address,
+          assetCode: assetOf(chain),
+          amount: gasFee,
+          fee: topUpFee,
+          idempotencyKey: `settlement:gastopup:${key}`,
+          sourceRef: source.id,
+        })
+
+        // ── PHASE B ────────────────────────────────────────────────────────────────────────────
+        // The deposit address → the treasury, in the token. `to` is the PIN — who is paid — and the
+        // contract travels in its own column; the builder puts the first inside the calldata and
+        // the second in the transaction's `to`.
+        //
+        // `fee` is `gasFee`, the identical value phase A delivers. That equality is the whole
+        // sequencing contract between the two rows: A sends exactly what B's locked fee will be
+        // divided by `TOKEN_TRANSFER_GAS` to recover a gas price from.
+        const sweep = await planOutbound(tx, {
+          purpose: 'token_sweep',
+          chain,
+          network,
+          from: source.address,
+          to: pin,
+          assetCode: tokenAssetCode(token),
+          amount: balance,
+          fee: gasFee,
+          idempotencyKey: `settlement:tokensweep:${key}`,
+          sourceRef: source.id,
+          tokenContract: token.contract,
+          dependsOn: topUp.outbound.id,
+        })
+        return { value: { topUp, sweep } }
+      })
+
+      // Neither was created: an identical pair is already on file from a previous pass that
+      // observed the same balance. Ordinary, and the address is left alone.
+      if (!planned.value.topUp.created && !planned.value.sweep.created) continue
+
+      return {
+        kind: 'planned',
+        topUpId: planned.value.topUp.outbound.id,
+        sweepId: planned.value.sweep.outbound.id,
+        amount: balance,
+        contract: token.contract,
+      }
+    }
   }
 
   return { kind: 'nothing_to_sweep' }

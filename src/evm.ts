@@ -68,6 +68,45 @@ import { keccak256 } from './keccak.ts'
  */
 export const TRANSFER_GAS = 21_000n
 
+/**
+ * Gas for one ERC-20 `transfer`. Fixed, for `TRANSFER_GAS`'s reason, and the number matters twice.
+ *
+ * An ERC-20 transfer is the 21,000 intrinsic cost plus the contract's storage work — roughly 14k
+ * for a warm recipient slot and up to ~50k for a cold one, with USDT near the top of that band
+ * because it writes more than the minimum. 100,000 sits above every real one and below custody's
+ * ceiling of 200,000 (`assertTokenSweep` shares `MAX_TRANSFER_GAS` with the treasury's own
+ * transfers), so a top-up computed from it is enough and a sweep priced by it is signable.
+ *
+ * **IT IS ALSO THE DIVISOR THE LOCKED FEE IS RECOVERED WITH.** `gasPriceForLockedFee` reconstructs
+ * a gas price by dividing, so a token sweep divided by `TRANSFER_GAS` would recover a price nearly
+ * five times too high and refuse the row as out of band. That is why the divisor is a parameter
+ * rather than a constant folded into the function.
+ *
+ * OVER-FUNDING IS THE SAFE DIRECTION AND IT IS NOT FREE. The top-up sends `gas × price` and the
+ * transaction spends what it actually uses, so a little native value is left at the deposit address
+ * afterwards. `signing.ts` names that as rule 3: it is not a reconciliation break, it is swept by
+ * the ordinary native path when it is worth a fee or left as dust when it is not. Under-funding, by
+ * contrast, is a signed transaction that runs out of gas — the fee is burnt and the tokens do not
+ * move — so the asymmetry is deliberate.
+ */
+export const TOKEN_TRANSFER_GAS = 100_000n
+
+/**
+ * `transfer(address,uint256)`, `balanceOf(address)` — the first four bytes of each keccak-256 hash.
+ *
+ * Written as literals and CHECKED against a keccak of the signature in the tests, exactly as
+ * custody writes its own copy of the transfer selector: the constant a reader can see is the
+ * constant that is broadcast, and a typo fails a test rather than silently calling a different
+ * function. Custody holds the mirror of the first one (`ERC20_TRANSFER_SELECTOR`) and compares it
+ * against the calldata built here, so a divergence between the two is a `shape_refused` rather than
+ * a wrong transfer — but the test is what makes it a build failure instead.
+ *
+ * There is no `transferFrom` here and there must never be, for custody's reason: it moves somebody
+ * ELSE's balance, which is not a sweep of this address at all.
+ */
+const ERC20_TRANSFER_SELECTOR = 'a9059cbb'
+const ERC20_BALANCE_OF_SELECTOR = '70a08231'
+
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 const EVM_SHAPE = /^0x[0-9a-fA-F]{40}$/
 const HEX_QUANTITY = /^0x[0-9a-fA-F]+$/
@@ -159,24 +198,108 @@ export function gasPriceBid(quoted: bigint, bounds: FeeBounds, chain: ChainId): 
  * Exported and pure, because "an out-of-band fee is refused" is a property that must be assertable
  * without a node.
  */
-export function gasPriceForLockedFee(fee: bigint, bounds: FeeBounds, chain: ChainId): bigint {
+export function gasPriceForLockedFee(
+  fee: bigint,
+  bounds: FeeBounds,
+  chain: ChainId,
+  /**
+   * The gas limit the fee was quoted at. `TRANSFER_GAS` for a native movement and
+   * `TOKEN_TRANSFER_GAS` for an ERC-20 one.
+   *
+   * **A PARAMETER RATHER THAN A CONSTANT, AND DEFAULTED TO THE NATIVE ONE.** A token sweep's fee
+   * divided by 21,000 recovers a gas price nearly five times the real one, which sails past
+   * `maxGasPriceWei` and refuses the row as out of band — a permanent refusal of a perfectly good
+   * sweep, with a message pointing at the wrong number. The default keeps every existing native
+   * call site reading as it did, so the only rows that take the new divisor are the ones whose
+   * purpose demanded it.
+   */
+  gas: bigint = TRANSFER_GAS,
+): bigint {
   // The ABSOLUTE ceiling first, before the divisibility. Ordering matters only for which sentence
   // an operator reads, and this is the more useful one: a fee ten times the ceiling is a repricing
   // or a corrupt row, and telling them it "is not a whole gas price" sends them looking at the
   // wrong digit.
   if (fee > bounds.maxFeeWei) throw new FeeOutOfBandError(chain, 'above', fee, bounds.maxFeeWei)
-  if (fee <= 0n) throw new FeeOutOfBandError(chain, 'below', fee, TRANSFER_GAS * bounds.minGasPriceWei)
-  if (fee % TRANSFER_GAS !== 0n) {
-    throw new FeeOutOfBandError(chain, 'below', fee, TRANSFER_GAS * bounds.minGasPriceWei)
+  if (fee <= 0n) throw new FeeOutOfBandError(chain, 'below', fee, gas * bounds.minGasPriceWei)
+  if (fee % gas !== 0n) {
+    throw new FeeOutOfBandError(chain, 'below', fee, gas * bounds.minGasPriceWei)
   }
-  const gasPrice = fee / TRANSFER_GAS
+  const gasPrice = fee / gas
   if (gasPrice < bounds.minGasPriceWei) {
-    throw new FeeOutOfBandError(chain, 'below', fee, bounds.minGasPriceWei * TRANSFER_GAS)
+    throw new FeeOutOfBandError(chain, 'below', fee, bounds.minGasPriceWei * gas)
   }
   if (gasPrice > bounds.maxGasPriceWei) {
-    throw new FeeOutOfBandError(chain, 'above', fee, bounds.maxGasPriceWei * TRANSFER_GAS)
+    throw new FeeOutOfBandError(chain, 'above', fee, bounds.maxGasPriceWei * gas)
   }
   return gasPrice
+}
+
+/* ------------------------------------------------------------------ ERC-20 calldata */
+
+/**
+ * One 32-byte ABI word, as 64 lower-case hex characters and no `0x`.
+ *
+ * Refuses a value that does not fit rather than truncating it. A silently-truncated uint256 is a
+ * transfer of the wrong amount, signed, and nothing downstream would notice — the calldata would be
+ * well-formed, custody would accept it (its own decode checks the shape, not the arithmetic), and
+ * the chain would move whatever the low 32 bytes happened to say.
+ */
+function abiWord(value: bigint): string {
+  if (value < 0n || value >= 1n << 256n) {
+    throw new Error(`${value} does not fit in a uint256 ABI word`)
+  }
+  return value.toString(16).padStart(64, '0')
+}
+
+/**
+ * `transfer(recipient, amount)` calldata — exactly 68 bytes, built to what custody will accept.
+ *
+ * **CONSTRUCTED TO THE BYTE, BECAUSE THE THING THAT VALIDATES IT DECODES BY HAND.** Custody's
+ * `assertTokenSweep` does not use an ABI decoder, deliberately: "a decoder's job is to be permissive
+ * about encodings that mean the same thing; this function's job is the opposite". It requires the
+ * recipient word's twelve-byte left pad to be all zero, the total length to be exactly 68 bytes with
+ * nothing appended, and the amount to be positive. So this builder produces that and only that, and
+ * an `AbiCoder` is not used here either — an encoder that one day emits an equivalent-but-different
+ * encoding would produce calldata custody refuses AFTER the row is committed and the chain's single
+ * outbound slot is claimed.
+ *
+ * The recipient is lower-cased into the word. Custody compares the decoded recipient against the
+ * pin lower-cased — the opposite of `assertSweep`'s character-for-character `to` comparison, and
+ * right for the opposite reason: an ABI word has no casing at all, so insisting on a spelling would
+ * refuse correct calldata for a cosmetic reason.
+ */
+export function erc20TransferCalldata(recipient: string, amount: bigint): string {
+  const address = canonicaliseEvm(recipient).toLowerCase().slice(2)
+  if (amount <= 0n) {
+    // Custody refuses this outright ("a signature is permanent and a zero-amount transfer is not a
+    // sweep of anything"). Refusing here makes it a classified build failure rather than a 403.
+    throw new Error('an ERC-20 transfer of a non-positive amount is not a sweep of anything')
+  }
+  return `0x${ERC20_TRANSFER_SELECTOR}${address.padStart(64, '0')}${abiWord(amount)}`
+}
+
+/** `balanceOf(owner)` calldata. A read, and the only other function this service ever encodes. */
+export function erc20BalanceOfCalldata(owner: string): string {
+  const address = canonicaliseEvm(owner).toLowerCase().slice(2)
+  return `0x${ERC20_BALANCE_OF_SELECTOR}${address.padStart(64, '0')}`
+}
+
+/**
+ * A `uint256` returned by `eth_call`, refusing anything that is not one.
+ *
+ * An empty `0x` is what a node returns for a call to an address with NO CODE, which is exactly what
+ * a mistyped or wrong-network contract address looks like. Reading it as zero would make every such
+ * misconfiguration indistinguishable from "this address holds no tokens" — silent, permanent, and
+ * discovered only when somebody asks why a registered token has never been swept. So it throws.
+ */
+export function decodeUint256(result: unknown, what: string): bigint {
+  if (typeof result !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(result)) {
+    throw new Error(
+      `${what}: expected a 32-byte uint256, got ${JSON.stringify(result)} — an empty result means ` +
+        'the address holds no contract code, which is a wrong contract address rather than a zero balance',
+    )
+  }
+  return BigInt(result)
 }
 
 /* ------------------------------------------------------------------ the transaction id */
@@ -308,6 +431,39 @@ export function evmChain(chain: ChainId): OutboundChain {
     // other's purpose by accident.
     quantity(await call.rpc('eth_getBalance', [address, 'latest']), 'eth_getBalance')
 
+  /**
+   * The node's chain id, checked against the one `contracts-chain` publishes.
+   *
+   * ONE IMPLEMENTATION SHARED BY BOTH BUILD BRANCHES, deliberately. Custody binds the chain id
+   * independently from the address's own row and refuses a disagreement with a 403, so this is not
+   * redundancy — it turns "custody refused for a reason you cannot see" into "this node is not the
+   * chain you configured", which is a different fix. A token sweep that skipped it would be the one
+   * transaction shape in this service whose signature could be made against the wrong network with
+   * only custody standing behind it.
+   */
+  const assertChainId = (raw: unknown, network: Network): number => {
+    const chainId = Number(quantity(raw, 'eth_chainId'))
+    if (!Number.isSafeInteger(chainId) || chainId <= 0) {
+      throw new Error('the node reported an unusable chain id')
+    }
+    const expected = spec.chainId?.[network]
+    if (expected !== undefined && expected !== chainId) {
+      throw new Error(
+        `the ${chain} ${network} node reports chain id ${chainId}, not the ${expected} ` +
+          'this build is pinned to — a signature made against it would be valid on the wrong network',
+      )
+    }
+    return chainId
+  }
+
+  const assertNonce = (raw: unknown): number => {
+    const nonce = Number(quantity(raw, 'eth_getTransactionCount'))
+    if (!Number.isSafeInteger(nonce) || nonce < 0) {
+      throw new Error('the node reported an unusable nonce')
+    }
+    return nonce
+  }
+
   const statusOf = async (call: ChainCall, txHash: string): Promise<OutboundStatus> => {
     const receipt = (await call.rpc('eth_getTransactionReceipt', [txHash])) as EvmReceipt | null
     // A receipt is the whole answer: absent means not mined — mempool, dropped, or never accepted,
@@ -336,6 +492,29 @@ export function evmChain(chain: ChainId): OutboundChain {
     chain,
     family,
     unimplementedPhase: null,
+
+    /**
+     * The ERC-20 reads. Two `eth_call`s and nothing else — no state is touched and no key is used.
+     *
+     * `balanceOf` is asked at **latest**, matching `balanceAt` and for the same reason: it answers
+     * "is there something here worth two transactions right now", and a node answers from its own
+     * head. The confirmation depth that makes an incoming token deposit real is the indexer's
+     * question, asked on the credit path, and the two must not be confused — which is why they are
+     * different methods with different block tags rather than one shared read.
+     */
+    tokens: {
+      async balanceOf(call, address, contract) {
+        const result = await call.rpc('eth_call', [
+          { to: canonicaliseEvm(contract), data: erc20BalanceOfCalldata(address) },
+          'latest',
+        ])
+        return decodeUint256(result, `balanceOf(${address})`)
+      },
+      async transferFee(call, bounds) {
+        const quoted = quantity(await call.rpc('eth_gasPrice', []), 'eth_gasPrice')
+        return gasPriceBid(quoted, bounds, chain) * TOKEN_TRANSFER_GAS
+      },
+    },
 
     canonicalise: canonicaliseEvm,
     addressKey: (address) => canonicaliseEvm(address).toLowerCase(),
@@ -375,13 +554,75 @@ export function evmChain(chain: ChainId): OutboundChain {
     },
 
     async build(call, input): Promise<UnsignedOutbound> {
+      const isToken = input.shape === 'token_sweep'
+      const gas = isToken ? TOKEN_TRANSFER_GAS : TRANSFER_GAS
       // Refused BEFORE the node is asked anything: a fee this service will not build for is a
       // permanent property of the row, and finding that out after four round trips is four round
-      // trips spent on a refusal.
-      const gasPrice = gasPriceForLockedFee(input.fee, input.bounds, chain)
+      // trips spent on a refusal. The DIVISOR is the row's own gas limit — see `TOKEN_TRANSFER_GAS`.
+      const gasPrice = gasPriceForLockedFee(input.fee, input.bounds, chain, gas)
       const to = canonicaliseEvm(input.to)
       const from = canonicaliseEvm(input.from)
       if (to.toLowerCase() === ZERO_ADDRESS) throw new UnsupportedDestinationError(chain, to)
+
+      if (isToken) {
+        // ──────────────────────────────────────────────────────────────────────────────────────
+        // THE TOKEN SWEEP. `to` is the treasury pin and it goes INSIDE the calldata; the
+        // transaction's own `to` is the contract. `value` is zero, which custody requires.
+        //
+        // The three checks the native branch makes below are each replaced rather than skipped:
+        //
+        //   * `eth_getCode` on the destination is INVERTED. A native transfer refuses a
+        //     destination that runs code; a token sweep requires one, because a `transfer` call to
+        //     an address with no code succeeds silently on chain — it is a plain value transfer of
+        //     zero — and would burn the gas the top-up just paid for while moving nothing and
+        //     reporting success. A registered contract that has no code is a wrong address or a
+        //     wrong network, and both are permanent.
+        //   * the balance check is against the FEE ALONE, because the amount is denominated in the
+        //     token and the native balance has nothing to do with it. This is the check that fails
+        //     when the gas top-up has not landed, and it is why it must be an
+        //     `InsufficientTreasuryError` — that classification releases the row back to `planned`
+        //     rather than refunding it, so the sweep waits for its gas instead of being abandoned.
+        //   * `value > 0` is replaced by the calldata's own positive-amount rule, which
+        //     `erc20TransferCalldata` enforces.
+        // ──────────────────────────────────────────────────────────────────────────────────────
+        const contract = canonicaliseEvm(input.token.contract)
+        const data = erc20TransferCalldata(to, input.value)
+        const [chainIdHex, nonceHex, balance, contractCode] = await Promise.all([
+          call.rpc('eth_chainId', []),
+          call.rpc('eth_getTransactionCount', [from, 'pending']),
+          balanceAt(call, from),
+          call.rpc('eth_getCode', [contract, 'latest']),
+        ])
+        if (typeof contractCode !== 'string' || contractCode === '0x' || contractCode === '') {
+          throw new UnsupportedDestinationError(chain, contract)
+        }
+        if (balance < input.fee) throw new InsufficientTreasuryError(chain, balance, input.fee)
+
+        const chainId = assertChainId(chainIdHex, call.network)
+        const nonce = assertNonce(nonceHex)
+        return {
+          payload: {
+            type: 0,
+            chainId,
+            nonce,
+            to: contract,
+            // Zero as a DECIMAL STRING, not the number 0 and not omitted. Custody's `quantity`
+            // takes either, but the whole payload is decimal strings for amounts and consistency
+            // here is what keeps a reader from wondering whether the omission means something.
+            value: '0',
+            data,
+            gasLimit: TOKEN_TRANSFER_GAS.toString(),
+            gasPrice: gasPrice.toString(),
+          },
+          // The TOKEN amount, unchanged, in the token's own smallest units. Nothing in this service
+          // converts it, and nothing should: the decimals live on the registry row.
+          value: input.value,
+          fee: input.fee,
+          nonce: String(nonce),
+          expiry: null,
+        }
+      }
+
       if (input.value <= 0n) {
         // Custody refuses a non-positive `value` on a transfer, so this would be a 403. Refusing
         // here makes it a classified build failure with a refund instead.
@@ -402,25 +643,8 @@ export function evmChain(chain: ChainId): OutboundChain {
       const needed = input.value + input.fee
       if (balance < needed) throw new InsufficientTreasuryError(chain, balance, needed)
 
-      const chainId = Number(quantity(chainIdHex, 'eth_chainId'))
-      const nonce = Number(quantity(nonceHex, 'eth_getTransactionCount'))
-      if (!Number.isSafeInteger(chainId) || chainId <= 0) {
-        throw new Error('the node reported an unusable chain id')
-      }
-      if (!Number.isSafeInteger(nonce) || nonce < 0) {
-        throw new Error('the node reported an unusable nonce')
-      }
-      // The node's chain id must be the one contracts-chain publishes for this network, when it
-      // publishes one. Custody checks this independently and refuses a disagreement with a 403, so
-      // checking here is not redundancy — it turns "custody refused for a reason you cannot see"
-      // into "this node is not the chain you configured", which is a different fix.
-      const expected = spec.chainId?.[call.network]
-      if (expected !== undefined && expected !== chainId) {
-        throw new Error(
-          `the ${chain} ${call.network} node reports chain id ${chainId}, not the ${expected} ` +
-            'this build is pinned to — a signature made against it would be valid on the wrong network',
-        )
-      }
+      const chainId = assertChainId(chainIdHex, call.network)
+      const nonce = assertNonce(nonceHex)
 
       return {
         // Exactly custody's `EVM_FIELDS` allowlist and no more. `signEvm` refuses "a field this

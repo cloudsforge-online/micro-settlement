@@ -396,6 +396,155 @@ export const MIGRATIONS: readonly Migration[] = [
         where indexer_watched_key is null or indexer_watched_key is distinct from address_key;
     `,
   },
+  {
+    version: 8,
+    name: 'token-sweeps',
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * THE TWO-PHASE SWEEP: a gas top-up that must land before the token sweep it pays for.
+     *
+     * An ERC-20 balance sits at a deposit address whose native balance is zero — the sender paid
+     * the gas, so the tokens arrived and cannot leave. Moving them is TWO transactions:
+     *
+     *   A. `gas_topup`    treasury → deposit address, native value, custody's `transfer` shape.
+     *   B. `token_sweep`  deposit address → the token contract, calldata `transfer(<pin>, amount)`,
+     *                     `value == 0`, custody's `token_sweep` shape.
+     *
+     * B cannot be built before A has CONFIRMED — not merely broadcast — because until then the
+     * address still cannot pay for B, and a B signed against an unfunded address is a signature
+     * that exists for ever over bytes no node will accept.
+     *
+     * ── WHY THE DEPENDENCY IS A COLUMN AND A TRIGGER RATHER THAN A CONVENTION ──────────────────
+     *
+     * The obvious implementation is "plan A now, plan B when A confirms". It is wrong in the one
+     * way that costs money: a crash between A confirming and B being planned leaves a funded
+     * deposit address and no record of why it was funded, and the next planning pass — which reads
+     * the TOKEN balance, unchanged by the top-up — funds it again. `signing.ts` names this
+     * exactly: "a planner that does not treat the top-up as in-flight will fund the same address on
+     * every tick until it confirms."
+     *
+     * So both rows are written in ONE transaction, and B carries `depends_on = A.id`. Either both
+     * exist or neither does; there is no window. `nextPlanned` skips a row whose dependency has not
+     * confirmed, and the trigger below refuses the transition anyway, for `outbound_in_flight_uniq`'s
+     * reason: the query is the design and the constraint is what makes it true when a future
+     * refactor, an operator's one-off script or a lost lease gets past the query.
+     *
+     * ── WHY `to_address` IS THE TREASURY AND NOT THE CONTRACT ─────────────────────────────────
+     *
+     * A token sweep's transaction `to` is the contract, and its real beneficiary is the first ABI
+     * argument of the calldata. Storing the CONTRACT in `to_address` would make every existing
+     * query about where money went silently wrong — `sweepCompletedEvents` publishes `to`, the
+     * operator surface lists it, and reconciliation reads it. So `to_address` keeps its meaning,
+     * WHO IS PAID, and the contract gets its own column. The builder puts `to_address` inside the
+     * calldata and `token_contract` in the transaction's `to`, which is also the order custody
+     * checks them in.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    up: `
+      -- The ERC-20 contract a token sweep calls. Null for every other purpose.
+      alter table outbound_transactions add column if not exists token_contract text;
+
+      -- The transaction that must have CONFIRMED before this one may be built.
+      alter table outbound_transactions
+        add column if not exists depends_on uuid references outbound_transactions (id);
+
+      -- The two new purposes. A CHECK is replaced rather than widened in place because the old
+      -- text is checksummed; dropping and recreating is the only expand/contract shape a CHECK has.
+      alter table outbound_transactions drop constraint if exists outbound_transactions_purpose_ck;
+      alter table outbound_transactions add constraint outbound_transactions_purpose_ck check (
+        purpose in ('withdrawal','sweep','treasury_move','deploy','gas_topup','token_sweep')
+      );
+
+      -- ────────────────────────────────────────────────────────────────────────────────────────
+      -- A TOKEN CONTRACT EXISTS IF AND ONLY IF THE PURPOSE IS A TOKEN SWEEP.
+      --
+      -- Both directions, in one constraint, and both are real. A token_sweep with no contract is
+      -- a row the builder would have to invent a destination for. A contract on any OTHER purpose
+      -- is a row that reads as a token movement to every query that filters on the column being
+      -- non-null, while being built and signed as a plain native transfer — which is the shape of
+      -- error that gets found by an auditor rather than by a test.
+      --
+      -- Lower-cased and shaped, for custody_token_contracts_contract_ck's reason: the allowlist
+      -- custody checks this against stores one spelling, so a row carrying another spelling here
+      -- is a sweep that will be refused at signing time, after the chain's single outbound slot
+      -- has been claimed.
+      -- ────────────────────────────────────────────────────────────────────────────────────────
+      alter table outbound_transactions add constraint outbound_token_contract_ck check (
+        (purpose = 'token_sweep') = (token_contract is not null)
+        and (token_contract is null or token_contract ~ '^0x[0-9a-f]{40}$')
+      );
+
+      -- ────────────────────────────────────────────────────────────────────────────────────────
+      -- A TOKEN SWEEP MOVES NO NATIVE VALUE, AND ITS FEE IS PAID BY SOMEBODY ELSE.
+      --
+      -- amount on a token sweep is denominated in the TOKEN and fee in native wei, so the two
+      -- columns hold different units on this one purpose. value on the transaction itself is
+      -- zero — custody refuses a token sweep carrying native value outright, because on most
+      -- ERC-20s it reverts and on the rest it is burnt at the contract.
+      --
+      -- The positive-amount half is the one worth having: a zero-amount token sweep is a signature
+      -- over a no-op that costs a real fee, and a signature is permanent.
+      -- ────────────────────────────────────────────────────────────────────────────────────────
+      alter table outbound_transactions add constraint outbound_token_amount_ck check (
+        purpose <> 'token_sweep' or (amount > 0 and fee >= 0)
+      );
+
+      -- ────────────────────────────────────────────────────────────────────────────────────────
+      -- A DEPENDENT ROW MAY NOT BE BUILT UNTIL ITS DEPENDENCY HAS CONFIRMED.
+      --
+      -- The last line under nextPlanned's filter, and it is the same relationship
+      -- outbound_in_flight_uniq has to the chain lease: the query is what normally enforces this
+      -- and the constraint is what makes it true anyway. Everything that can defeat a query — a
+      -- future call site that selects a row by id, an operator re-queueing a stuck sweep by hand,
+      -- a refactor that adds a second planner — leaves the database as the last thing standing.
+      --
+      -- A TRIGGER RATHER THAN A CHECK because the fact being asserted lives on ANOTHER ROW, and a
+      -- CHECK constraint cannot see one. It fires only on the transition INTO 'building', which is
+      -- the moment the nonce is about to be read and therefore the last moment a refusal is free.
+      --
+      -- IT REFUSES A MISSING DEPENDENCY TOO. depends_on has a foreign key, so the row cannot be
+      -- absent, but the found variable is checked rather than assumed: a dependency that is
+      -- failed, stuck or still planned all take the same branch as one that is not there, and
+      -- the error names which so an operator reads a state rather than a null.
+      -- ────────────────────────────────────────────────────────────────────────────────────────
+      create or replace function outbound_dependency_confirmed() returns trigger as $$
+      declare
+        dependency_state text;
+      begin
+        if new.depends_on is null or new.state <> 'building' then
+          return new;
+        end if;
+        if old.state = 'building' then
+          -- Not a transition into 'building'; some other column is being updated on a row that is
+          -- already there. Re-checking would refuse a legitimate write after the dependency has
+          -- been superseded, and the transition itself was already gated.
+          return new;
+        end if;
+        select state into dependency_state
+          from outbound_transactions where id = new.depends_on;
+        if dependency_state is distinct from 'confirmed' then
+          raise exception
+            'outbound transaction % depends on %, which is % rather than confirmed — the gas it '
+            'pays for has not landed, so these bytes could not be broadcast',
+            new.id, new.depends_on, coalesce(dependency_state, 'missing')
+            using errcode = 'integrity_constraint_violation';
+        end if;
+        return new;
+      end;
+      $$ language plpgsql;
+
+      drop trigger if exists outbound_dependency_confirmed_trg on outbound_transactions;
+      create trigger outbound_dependency_confirmed_trg
+        before update on outbound_transactions
+        for each row execute function outbound_dependency_confirmed();
+
+      -- The planner's access path: rows blocked on a dependency, and rows that unblock them.
+      -- Partial, because in the steady state nothing is waiting.
+      create index if not exists outbound_dependent_idx
+        on outbound_transactions (depends_on)
+        where depends_on is not null and state = 'planned';
+    `,
+  },
 ]
 
 /**

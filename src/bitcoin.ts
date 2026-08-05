@@ -622,6 +622,10 @@ export function bitcoinChain(options: BitcoinChainOptions = {}): OutboundChain {
     chain: 'btc',
     family: 'bitcoin',
     unimplementedPhase: null,
+    // Bitcoin has no token model, so there is nothing here and never will be. Null rather than an
+    // object whose methods throw: the token planner reads it as "no token sweeps on this chain" and
+    // skips silently, which is the permanent, correct, unremarkable state of this chain.
+    tokens: null,
 
     canonicalise(address) {
       // The identity, validated. See `validateAddress` for why lower-casing would be a bug.

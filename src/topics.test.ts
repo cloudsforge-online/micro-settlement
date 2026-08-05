@@ -192,6 +192,8 @@ const ROW_FIXTURE = {
   reservationEntryId: null,
   correlationId: 'req-1',
   idempotencyKey: 'k-1',
+  tokenContract: null,
+  dependsOn: null,
   createdAt: new Date('2026-08-03T09:00:00.000Z'),
   updatedAt: new Date('2026-08-03T09:00:00.000Z'),
 }

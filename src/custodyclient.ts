@@ -138,10 +138,34 @@ export interface TreasuryCandidate {
   readonly reused: boolean
 }
 
+/** A row of `custody_token_contracts`, as custody publishes it to a peer. */
+export interface CustodyTokenContract {
+  /** CUSTODY'S chain name — `ethereum`, not this service's `eth` slug. @see custodyChainOf */
+  readonly chain: string
+  readonly network: string
+  /** Lower-cased, and custody's own CHECK constraint guarantees it. */
+  readonly contract: string
+  readonly symbol: string
+  readonly decimals: number
+}
+
 export interface CustodyClient {
   sign(request: SignRequest): Promise<SignedResult>
   /** The address custody will accept as a sweep destination here. Null when nobody has pinned one. */
   treasuryPin(chain: string, network: Network): Promise<string | null>
+  /**
+   * The ERC-20 contracts an operator has allowed a deposit key to call.
+   *
+   * **READ FROM CUSTODY RATHER THAN CONFIGURED HERE, AND THAT IS THE POINT.** `assertTokenSweep`
+   * refuses a contract that is not in this list, so a second copy of it — an env var, a table of
+   * this service's own — makes the day the two disagree a sweep that is built, committed, and
+   * refused after this chain's single outbound slot is claimed. One authority; the other side reads
+   * it.
+   *
+   * An empty list is the ordinary, correct, permanent state of a chain nobody has registered a
+   * token on, and is never an error.
+   */
+  tokenContracts(): Promise<readonly CustodyTokenContract[]>
   /** Mint a rotation candidate. **Does not pin it.** Requires an operator's token. */
   mintTreasury(chain: string, network: Network, operatorToken: string): Promise<TreasuryCandidate>
   /** Pin an address custody already holds the key to. Requires an operator's token. */
@@ -210,6 +234,19 @@ export function httpCustodyClient(options: CustodyClientOptions): CustodyClient 
         // unavailability would make an unconfigured chain look like an outage and would be retried
         // for ever at error level.
         if (err instanceof HttpError && err.status === 404) return null
+        throw translateSign(err)
+      }
+    },
+
+    async tokenContracts() {
+      try {
+        const body = await client.get<{ tokens: readonly CustodyTokenContract[] }>('/v1/token-contracts')
+        // A missing or malformed list is an EMPTY one rather than a throw, and empty means "sweep no
+        // tokens". Failing closed is the only safe direction: the alternative reading of a broken
+        // response is "sweep every token I last heard about", which is a stale allowlist deciding
+        // what a customer's deposit key may execute.
+        return Array.isArray(body?.tokens) ? body.tokens : []
+      } catch (err) {
         throw translateSign(err)
       }
     },

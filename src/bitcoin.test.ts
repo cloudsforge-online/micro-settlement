@@ -11,6 +11,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import * as bitcoin from 'bitcoinjs-lib'
+import { chainSpec } from '@cloudsforge/contracts-chain'
 import {
   CUSTODY_MAX_PAYMENT_SAT_PER_VB,
   CUSTODY_MAX_SWEEP_SAT_PER_VB,
@@ -552,13 +553,31 @@ describe('status', () => {
     assert.deepEqual(await chainFor('btc').status(node.call, TXID), { kind: 'unknown' })
   })
 
-  it('crosses from pending to confirmed at the declared depth of three', async () => {
-    for (const [confirmations, kind] of [
+  /**
+   * **THE DEPTH IS READ FROM `contracts-chain`, NEVER RESTATED HERE.**
+   *
+   * This test used to hardcode three, and it went red the moment BTC's declared depth was raised
+   * from 3 to 6 — a change made deliberately in `contracts` because three confirmations is roughly
+   * thirty minutes and below what any custodian uses for Bitcoin. The adapter was correct
+   * throughout; only the test's copy of the constant was wrong, and it sat red on a deployable
+   * branch.
+   *
+   * A test that restates a constant does not test that the constant is honoured — it tests that two
+   * copies agree, and it fails on the correct change rather than on the incorrect one. So the
+   * boundary is computed from the same value the adapter reads, and what is asserted is the
+   * PROPERTY: below the declared depth is pending, at it and above it is confirmed. That statement
+   * stays true and stays meaningful whatever the number becomes.
+   */
+  it('crosses from pending to confirmed at whatever depth contracts-chain declares', async () => {
+    const depth = chainSpec('BTC').confirmations
+    assert.ok(depth >= 2, 'a depth below two would make this test vacuous')
+    const cases: ReadonlyArray<readonly [number, 'pending' | 'confirmed']> = [
       [1, 'pending'],
-      [2, 'pending'],
-      [3, 'confirmed'],
-      [9, 'confirmed'],
-    ] as const) {
+      [depth - 1, 'pending'],
+      [depth, 'confirmed'],
+      [depth + 6, 'confirmed'],
+    ]
+    for (const [confirmations, kind] of cases) {
       const node = fakeBtcNode({ confirmationsByTxid: { [TXID]: confirmations }, height: 900 })
       const status = await chainFor('btc').status(node.call, TXID)
       assert.equal(status.kind, kind, `${confirmations} confirmations should be ${kind}`)

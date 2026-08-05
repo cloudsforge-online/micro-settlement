@@ -204,6 +204,46 @@ export interface Env {
    * holding barely more than the fee spends most of the customer's deposit on moving it.
    */
   readonly sweepMinFeeMultiple: number
+  /**
+   * Whether this deployment sweeps ERC-20 balances out of deposit addresses.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════
+   * **OFF BY DEFAULT, AND IT MUST STAY OFF UNTIL TOKEN DEPOSITS ARE CREDITED.** This is not a
+   * performance switch and it is not caution for its own sake; it is the one precondition that
+   * cannot be checked from inside this service.
+   *
+   * `micro-wallet` currently REFUSES to credit a token deposit — `deposits.ts`, the
+   * `token_deposit_unsupported` branch — because the amount is denominated in a token whose
+   * decimals it has no registry for, and crediting a six-decimal stablecoin as an eighteen-decimal
+   * coin is a balance wrong by 10^12. That refusal is correct.
+   *
+   * The consequence for THIS service is the part that matters. Sweeping is not neutral: it moves a
+   * coin out of an address only custody can sign for and into the treasury, which is inside the
+   * blast radius of `custody:sign:treasury`. Doing that to a balance the platform has NOT recorded
+   * a liability for means the user's money is in the treasury, the ledger does not know it is owed,
+   * and there is no withdrawal path in this service that could pay it back — a token withdrawal
+   * needs a treasury-side token shape that does not exist. **Leaving the tokens where they are is
+   * strictly safer than sweeping them**, because the deposit address is the one place they cannot
+   * be spent from by anything but a pinned sweep.
+   *
+   * So the order of operations is fixed: wallet learns to credit `TOKEN:` deposits, the ledger
+   * learns to hold them, a token withdrawal path exists — and only then is this turned on. An
+   * operator turning it on early does not lose money, but they do move customer funds into a place
+   * the platform cannot account for, and that is the state this flag exists to make deliberate.
+   * ══════════════════════════════════════════════════════════════════════════════════════════
+   */
+  readonly tokenSweepEnabled: boolean
+  /**
+   * The smallest token balance worth two transactions, in the token's own smallest units.
+   *
+   * A token sweep costs a gas top-up AND a sweep, both paid by the platform in native coin, so the
+   * economics are worse than a native sweep's by a whole transaction. Zero disables the floor and
+   * is the default: a number nobody has chosen must not silently strand a real deposit, and the
+   * right value differs by three orders of magnitude between a six-decimal stablecoin and an
+   * eighteen-decimal one. It is one number rather than a per-token map because a deployment that
+   * needs two of them needs `micro-policy`'s per-asset table, not a second env var.
+   */
+  readonly minTokenSweep: bigint
 
   readonly minGasPriceWei: bigint
   readonly maxGasPriceWei: bigint
@@ -278,6 +318,8 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     sweepEnabled: boolean(source, 'SETTLEMENT_SWEEP_ENABLED', false),
     treasuryTargets: jsonMap(source, 'SETTLEMENT_TREASURY_TARGETS', '{}'),
     sweepMinFeeMultiple: integer(source, 'SETTLEMENT_SWEEP_MIN_FEE_MULTIPLE', 3, 1, 1_000),
+    tokenSweepEnabled: boolean(source, 'SETTLEMENT_TOKEN_SWEEP_ENABLED', false),
+    minTokenSweep: wei(source, 'SETTLEMENT_MIN_TOKEN_SWEEP', 0n),
 
     minGasPriceWei,
     maxGasPriceWei,

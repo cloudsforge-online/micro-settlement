@@ -182,6 +182,15 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       labels: ['chain'],
     })
     .register({
+      name: 'settlement_token_sweeps_planned_total',
+      help:
+        'ERC-20 sweep PAIRS opened, by chain. One increment is two outbound rows — a gas top-up ' +
+        'and the token sweep that depends on it — so this is deliberately not folded into ' +
+        'settlement_sweeps_planned_total, which counts one row each.',
+      kind: 'counter',
+      labels: ['chain'],
+    })
+    .register({
       name: 'settlement_sweeps_blocked_total',
       help: 'Sweep passes refused for want of a pinned treasury, an agreeing pin, or a node.',
       kind: 'counter',

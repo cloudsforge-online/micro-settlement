@@ -274,8 +274,17 @@ export interface FeeBounds {
  * that is wallet's arithmetic, not this service's — so a user can always withdraw their whole
  * balance. forge-pay gets this right and the split preserves it.
  */
-export interface BuildInput {
+interface BuildInputBase {
   readonly from: string
+  /**
+   * **WHO IS PAID**, on every shape including the token one.
+   *
+   * For a `token_sweep` this is NOT the transaction's `to` — that is the contract, which travels in
+   * `token.contract`. This is the address the calldata pays, which is the treasury pin. Keeping the
+   * field's meaning constant across shapes is what stops `to_address` in the schema, the `to` on
+   * `settlement.sweep.completed`, and the operator surface's "where did it go" column from each
+   * meaning something different for one purpose.
+   */
   readonly to: string
   readonly value: bigint
   readonly fee: bigint
@@ -299,8 +308,38 @@ export interface BuildInput {
   readonly shape: OutboundShape
 }
 
+/**
+ * What a caller wants moved.
+ *
+ * **A UNION RATHER THAN A BASE WITH AN OPTIONAL `token`**, for the reason `EvmPolicy` is one in
+ * custody: `shape: 'token_sweep'` with no contract must fail at BUILD time rather than fall
+ * through to a runtime default. There is no contract this service could default to — the allowlist
+ * custody checks against refuses by default and starts empty — so the only two things an optional
+ * field could produce here are a crash and a guess, and a guess is a customer's deposit key calling
+ * code nobody registered.
+ */
+export type BuildInput =
+  | (BuildInputBase & { readonly shape: 'payment' | 'sweep' })
+  | (BuildInputBase & { readonly shape: 'token_sweep'; readonly token: TokenRef })
+
 /** @see BuildInput.shape */
-export type OutboundShape = 'payment' | 'sweep'
+export type OutboundShape = 'payment' | 'sweep' | 'token_sweep'
+
+/**
+ * The ERC-20 contract a token sweep calls.
+ *
+ * **THE CONTRACT AND NOTHING ELSE — no decimals and no symbol, deliberately.** Every amount in this
+ * service is already in smallest units and nothing here ever divides one, so a decimals value
+ * passed to a builder would be a field that is carried, never read, and therefore free to be wrong.
+ * The identity of the token travels on the row as its ledger asset code —
+ * `TOKEN:<chain>:<network>:<contract>`, which names the deployment uniquely — and the decimals live
+ * on custody's registry row, which is the operator-maintained authority that the wrong value would
+ * have to be corrected in anyway. One place holds it; nothing copies it.
+ */
+export interface TokenRef {
+  /** Lower-cased, and both this schema and custody's allowlist enforce that. The transaction `to`. */
+  readonly contract: string
+}
 
 /**
  * What a sweep of ONE address would move, and what moving it would cost.
@@ -417,11 +456,40 @@ export type DeathVerdict =
  * were (a null txid read as "no transaction to ask about", and "no receipt" read as "never
  * mined"). Putting it on the interface means a new chain cannot be added without answering it.
  */
+/**
+ * Reading an ERC-20, for the planner that decides whether a token sweep is worth two transactions.
+ *
+ * **A CAPABILITY OBJECT RATHER THAN OPTIONAL METHODS ON `OutboundChain`.** A family with no tokens
+ * answers `tokens: null`, which a planner reads as "there are no token sweeps here" and skips
+ * silently — the ordinary, correct, permanent state of Bitcoin and XRP. The alternative, optional
+ * methods, gives every adapter a shape where "not implemented" and "nothing to do" are the same
+ * `undefined`, which is the `estimateFee()` returning `0n` mistake `unimplementedChain` exists to
+ * refuse.
+ *
+ * Both methods are READS. Nothing here signs, and nothing here needs a credential the withdrawal
+ * path does not already hold.
+ */
+export interface TokenOperations {
+  /** What this address holds of one ERC-20, in the token's own smallest units. */
+  balanceOf(call: ChainCall, address: string, contract: string): Promise<bigint>
+  /**
+   * What one ERC-20 `transfer` costs right now, in native smallest units, bounded.
+   *
+   * Separate from `estimateFee` because an ERC-20 transfer is not 21,000 gas — it is the intrinsic
+   * cost plus the contract's storage work — and quoting a token sweep at a native transfer's gas
+   * would under-fund the top-up by roughly four fifths, producing a signed transaction that runs
+   * out of gas and burns the fee without moving the tokens.
+   */
+  transferFee(call: ChainCall, bounds: FeeBounds): Promise<bigint>
+}
+
 export interface OutboundChain {
   readonly chain: ChainId
   readonly family: ChainFamily
   /** Null when this chain works. The phase that brings it otherwise. */
   readonly unimplementedPhase: string | null
+  /** Null on every family with no token model. @see TokenOperations */
+  readonly tokens: TokenOperations | null
 
   /** The display form of an address, or throw. EIP-55 for EVM; the identity elsewhere. */
   canonicalise(address: string): string
@@ -469,6 +537,12 @@ export function unimplementedChain(
     chain,
     family: familyOf(chain),
     unimplementedPhase: phase,
+    // NULL rather than an object whose methods throw, and the distinction is the same one this
+    // whole function exists to make. `tokens: null` is read by the planner as "no token sweeps on
+    // this chain", which is exactly right for a chain that cannot move a native coin either — a
+    // throwing object would instead make every planning pass on an unimplemented chain raise, and
+    // `unimplementedPhase` above is already the honest answer to why nothing here works.
+    tokens: null,
     canonicalise: () => refuse('address canonicalisation'),
     addressKey: () => refuse('address canonicalisation'),
     isValidDestination: () => refuse('destination validation'),

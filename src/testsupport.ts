@@ -38,12 +38,18 @@ import type { ChainId, FeeBounds, JsonRpc } from './chains.ts'
 import { canonicaliseEvm, evmTxHash, TRANSFER_GAS } from './evm.ts'
 import { registerServiceMetrics } from './server.ts'
 import { MIGRATIONS, TABLES } from './migrations.ts'
-import type { CustodyClient, SignRequest, SignedResult, TreasuryCandidate } from './custodyclient.ts'
+import type {
+  CustodyClient,
+  CustodyTokenContract,
+  SignRequest,
+  SignedResult,
+  TreasuryCandidate,
+} from './custodyclient.ts'
 import type { IndexedTransaction, IndexerClient } from './indexerclient.ts'
 import type { LedgerClient, PostEntryRequest, PostedEntry } from './ledgerclient.ts'
 import type { Db } from './outbox.ts'
 import type { OutboundDeps } from './outbound.ts'
-import type { SweepDeps } from './sweeps.ts'
+import { tokensFor, type TokenSweepDeps } from './sweeps.ts'
 import type { WorkerDeps } from './worker.ts'
 import type { AdjudicateDeps } from './adjudicate.ts'
 import type { WithdrawalDeps } from './withdrawals.ts'
@@ -109,6 +115,16 @@ export interface FakeNodeOptions {
   readonly contracts?: readonly string[]
   readonly startingNonce?: number
   readonly head?: bigint
+  /**
+   * ERC-20 balances, as `contract → owner → amount`.
+   *
+   * Modelled at the `eth_call` seam rather than by stubbing the adapter, for the reason the file
+   * header gives: the code under test stays the REAL `evmChain`, so its calldata encoding, its
+   * selector and its result decoding are all exercised and only the wire is imaginary. A contract
+   * present here also HAS CODE, because a token address with no code is a different failure and the
+   * adapter refuses it — see `tokenBalances` handling in the `eth_getCode` branch.
+   */
+  readonly tokenBalances?: Readonly<Record<string, Readonly<Record<string, bigint>>>>
 }
 
 export interface FakeNode {
@@ -118,6 +134,8 @@ export interface FakeNode {
   /** Every set of bytes that reached `eth_sendRawTransaction`. */
   readonly broadcast: readonly string[]
   setBalance(address: string, value: bigint): void
+  /** Give an owner a token balance, and give the contract code at the same time. */
+  setTokenBalance(contract: string, owner: string, value: bigint): void
   setGasPrice(value: bigint): void
   setNonce(address: string, value: number): void
   /** Put a broadcast transaction in a block, so a receipt appears. */
@@ -132,12 +150,75 @@ export interface FakeNode {
 
 const hexQuantity = (value: bigint): string => `0x${value.toString(16)}`
 
+/**
+ * The `to` and `value` of a signed legacy transaction, read straight out of the bytes.
+ *
+ * **TEST-ONLY, AND IT LIVES HERE RATHER THAN IN `evm.ts` FOR A REASON.** Production needs the nonce
+ * out of a signed transaction — `legacyNonce`, for the death proof — and nothing else, so exporting
+ * a general decoder from the adapter would be adding a parser to the service that has to be right
+ * about money in order to make a test convenient. The fake node is a MODEL OF THE CHAIN, and a
+ * chain does read these fields, so this belongs to the model.
+ *
+ * A legacy transaction is `rlp([nonce, gasPrice, gasLimit, to, value, data, v, r, s])`. Anything
+ * that is not one — a typed envelope, a truncated body — returns null, and the caller treats null
+ * as "not a transfer" rather than as a transfer of zero.
+ */
+function legacyFields(rawTx: string): { readonly to: Buffer; readonly value: bigint } | null {
+  const body = rawTx.startsWith('0x') ? rawTx.slice(2) : rawTx
+  if (body.length === 0 || body.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(body)) return null
+  const bytes = Buffer.from(body, 'hex')
+
+  // Returns [payloadStart, payloadEnd, isList] for the item at `at`, or null.
+  const header = (at: number): readonly [number, number, boolean] | null => {
+    if (at >= bytes.length) return null
+    const tag = bytes[at]!
+    const span = (start: number, length: number, list: boolean): readonly [number, number, boolean] | null =>
+      start + length <= bytes.length ? [start, start + length, list] : null
+    if (tag <= 0x7f) return [at, at + 1, false]
+    if (tag <= 0xb7) return span(at + 1, tag - 0x80, false)
+    if (tag <= 0xbf) {
+      const size = tag - 0xb7
+      if (at + 1 + size > bytes.length) return null
+      return span(at + 1 + size, Number(BigInt(`0x${bytes.subarray(at + 1, at + 1 + size).toString('hex')}`)), false)
+    }
+    if (tag <= 0xf7) return span(at + 1, tag - 0xc0, true)
+    const size = tag - 0xf7
+    if (at + 1 + size > bytes.length) return null
+    return span(at + 1 + size, Number(BigInt(`0x${bytes.subarray(at + 1, at + 1 + size).toString('hex')}`)), true)
+  }
+
+  const outer = header(0)
+  if (!outer || !outer[2]) return null
+  let cursor = outer[0]
+  const items: Buffer[] = []
+  while (cursor < outer[1] && items.length < 9) {
+    const item = header(cursor)
+    if (!item) return null
+    items.push(bytes.subarray(item[0], item[1]))
+    cursor = item[1]
+  }
+  // [nonce, gasPrice, gasLimit, to, value, ...]
+  const to = items[3]
+  const value = items[4]
+  if (!to || !value) return null
+  return { to, value: value.length === 0 ? 0n : BigInt(`0x${value.toString('hex')}`) }
+}
+
 export function fakeNode(options: FakeNodeOptions = {}): FakeNode {
   const calls: Array<{ method: string; params: readonly unknown[] }> = []
   const broadcast: string[] = []
   const balances = new Map<string, bigint>()
   const nonces = new Map<string, number>()
   const contracts = new Set((options.contracts ?? []).map((a) => a.toLowerCase()))
+  const tokenBalances = new Map<string, Map<string, bigint>>()
+  for (const [contract, owners] of Object.entries(options.tokenBalances ?? {})) {
+    const key = contract.toLowerCase()
+    // A registered token contract HAS CODE. Stated here rather than left to each test to remember,
+    // because the adapter refuses a token whose address holds none — a check that exists precisely
+    // so a wrong address is not read as a zero balance.
+    contracts.add(key)
+    tokenBalances.set(key, new Map(Object.entries(owners).map(([o, v]) => [o.toLowerCase(), v])))
+  }
   const receipts = new Map<string, { block: bigint; reverted: boolean }>()
   const failures = new Map<string, string>()
   let gasPrice = options.gasPriceWei ?? 20_000_000_000n
@@ -163,11 +244,47 @@ export function fakeNode(options: FakeNodeOptions = {}): FakeNode {
     return derived
   }
 
+  /**
+   * **A MINED TRANSFER MOVES THE BALANCE, BECAUSE ON A REAL CHAIN IT DOES.**
+   *
+   * This used to be missing and it made a whole class of test vacuous. The two-phase token sweep is
+   * exactly that class: phase A pays gas to a deposit address and phase B can only be built if the
+   * address now holds it, so a fake whose balances never change makes phase B fail its balance
+   * check for ever — and, far worse, a fake that let phase B build ANYWAY would report the sequence
+   * working while proving nothing about the only thing it exists to sequence.
+   *
+   * So `mine` applies the transfer. `to` and `value` are read out of the signed bytes rather than
+   * remembered from the request, for `evmTxHash`'s reason: the fake must model what the chain does
+   * with THESE bytes, not what the caller meant by them.
+   *
+   * **IT CREDITS THE RECIPIENT AND DOES NOT DEBIT THE SENDER**, and that limitation is stated
+   * rather than hidden. Debiting would need the sender recovered from the signature, which this
+   * fake cannot do — no key exists in this repository. The consequence is that this fake models
+   * DELIVERY and not SOLVENCY: it will happily let a treasury pay out more than it holds. Nothing
+   * asserted against it may therefore be a claim about the treasury running dry; that property is
+   * `InsufficientTreasuryError`'s, and it is tested by setting a balance directly.
+   */
+  const applyTransfer = (rawTx: string): void => {
+    const fields = legacyFields(rawTx)
+    if (!fields) return
+    // `to` is empty on a creation and a token sweep's `value` is zero — both are no-ops here.
+    if (fields.to.length !== 20 || fields.value <= 0n) return
+    const recipient = `0x${fields.to.toString('hex')}`
+    balances.set(recipient, (balances.get(recipient) ?? 0n) + fields.value)
+  }
+
   const node: FakeNode = {
     calls,
     broadcast,
     setBalance(address, value) {
       balances.set(address.toLowerCase(), value)
+    },
+    setTokenBalance(contract, owner, value) {
+      const key = contract.toLowerCase()
+      contracts.add(key)
+      const owners = tokenBalances.get(key) ?? new Map<string, bigint>()
+      owners.set(owner.toLowerCase(), value)
+      tokenBalances.set(key, owners)
     },
     setGasPrice(value) {
       gasPrice = value
@@ -176,8 +293,14 @@ export function fakeNode(options: FakeNodeOptions = {}): FakeNode {
       nonces.set(address.toLowerCase(), value)
     },
     mine(rawTxOrHash, mineOptions = {}) {
-      const hash = rawTxOrHash.length > 70 ? hashOf(rawTxOrHash) : rawTxOrHash
+      const isRaw = rawTxOrHash.length > 70
+      const hash = isRaw ? hashOf(rawTxOrHash) : rawTxOrHash
+      const already = receipts.has(hash.toLowerCase())
       receipts.set(hash.toLowerCase(), { block: head, reverted: mineOptions.reverted === true })
+      // ONCE. Mining is idempotent on a real chain — a transaction is in one block — and the test
+      // helpers re-mine the whole broadcast list on every tick, so applying the transfer twice
+      // would credit the same gas top-up as many times as the loop runs.
+      if (isRaw && !already && mineOptions.reverted !== true) applyTransfer(rawTxOrHash)
     },
     advance(blocks) {
       head += BigInt(blocks)
@@ -214,6 +337,22 @@ export function fakeNode(options: FakeNodeOptions = {}): FakeNode {
         case 'eth_getCode': {
           const address = String(params[0]).toLowerCase()
           return contracts.has(address) ? '0x60006000' : '0x'
+        }
+        case 'eth_call': {
+          const request = params[0] as { to?: unknown; data?: unknown }
+          const to = String(request.to ?? '').toLowerCase()
+          const data = String(request.data ?? '')
+          // `balanceOf(address)` — the selector and the one 32-byte argument, decoded by hand for
+          // the same reason the production encoder builds it by hand: the fake must model what the
+          // chain actually does with these exact bytes, not what an ABI library would like them to
+          // mean. A malformed call gets the empty result a real node returns.
+          if (!data.startsWith('0x70a08231') || data.length !== 2 + 8 + 64) return '0x'
+          const owner = `0x${data.slice(10 + 24)}`.toLowerCase()
+          const held = tokenBalances.get(to)?.get(owner) ?? 0n
+          // Contracts that exist answer a padded uint256; anything else answers 0x, which is what a
+          // node returns for a call to an address with no code.
+          if (!contracts.has(to)) return '0x'
+          return `0x${held.toString(16).padStart(64, '0')}`
         }
         case 'eth_sendRawTransaction': {
           const rawTx = String(params[0])
@@ -256,6 +395,8 @@ export interface FakeCustody extends CustodyClient {
   readonly signatures: readonly string[]
   pin(chain: string, network: Network, address: string): void
   unpin(chain: string, network: Network): void
+  /** Register a token, exactly as an operator would in custody's own table. */
+  registerToken(token: CustodyTokenContract): void
   /** Refuse the next N sign calls with this code. */
   refuseSigning(code: string, message: string): void
   failSigning(err: Error): void
@@ -274,6 +415,7 @@ export function fakeCustody(options: { readonly mint?: string } = {}): FakeCusto
   const requests: SignRequest[] = []
   const signatures: string[] = []
   const pins = new Map<string, string>()
+  const tokens: CustodyTokenContract[] = []
   let refusal: { code: string; message: string } | null = null
   let failure: Error | null = null
   let minted = 0
@@ -286,6 +428,12 @@ export function fakeCustody(options: { readonly mint?: string } = {}): FakeCusto
     },
     unpin(chain, network) {
       pins.delete(`${chain}:${network}`)
+    },
+    registerToken(token) {
+      tokens.push(token)
+    },
+    async tokenContracts() {
+      return tokens
     },
     refuseSigning(code, message) {
       refusal = { code, message }
@@ -554,7 +702,7 @@ export interface Harness {
   readonly outbound: OutboundDeps
   readonly worker: WorkerDeps
   readonly adjudication: AdjudicateDeps
-  readonly sweeps: SweepDeps
+  readonly sweeps: TokenSweepDeps
   readonly withdrawals: WithdrawalDeps
   readonly treasuries: { readonly sql: Db; readonly custody: FakeCustody; readonly network: Network }
   readonly treasuryWatch: TreasuryWatchDeps
@@ -567,6 +715,8 @@ export interface HarnessOptions {
   readonly stuckMinutes?: number
   readonly bounds?: FeeBounds
   readonly sweepEnabled?: boolean
+  readonly tokenSweepEnabled?: boolean
+  readonly minTokenSweep?: bigint
   readonly treasuryTargets?: Readonly<Record<string, string>>
   readonly now?: () => number
 }
@@ -612,6 +762,12 @@ export function harness(sql: postgres.Sql, options: HarnessOptions = {}): Harnes
       minFeeMultiple: 3,
       probeLimit: 10,
       enabled: options.sweepEnabled ?? true,
+      // Defaulted ON in tests and OFF in production, and the asymmetry is deliberate: the tests
+      // exist to exercise this path, and `env.ts` explains at length why a deployment must not have
+      // it until wallet credits token deposits.
+      tokenSweepEnabled: options.tokenSweepEnabled ?? true,
+      minimumTokenSweep: options.minTokenSweep ?? 0n,
+      tokens: async (chain, network) => tokensFor(await custody.tokenContracts(), chain, network),
     },
     withdrawals: { ...treasuries, producer: 'settlement' },
     treasuries,
