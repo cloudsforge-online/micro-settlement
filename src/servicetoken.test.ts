@@ -37,8 +37,8 @@ import { httpCustodyClient } from './custodyclient.ts'
 import { buildUpstreams, type UpstreamEnv } from './upstreams.ts'
 
 const ISSUER = 'https://identity.test'
-const IDENTITY = 'http://identity:4000'
-const CUSTODY = 'http://custody:4000'
+const IDENTITY = 'http://127.0.0.1:4001'
+const CUSTODY = 'http://127.0.0.1:4005'
 const CREDENTIAL = 'cfsc_TToR-eOeVTDnqhX1-nu6-u7DoCr4MCfa86g4g6kd404'
 
 /** The scopes identity grants `service:settlement`. `deploy` IDENTITY_SERVICE_TOKEN_GRANTS. */
@@ -84,7 +84,7 @@ async function world(): Promise<World> {
   const jwk: JWK = { ...(await exportJWK(publicKey)), kid: 'k1', alg: 'RS256', use: 'sig' }
   void jwk
   const keySet = (async () => publicKey) as never
-  const verifier = new Verifier({ jwksUrl: 'http://unused', issuer: ISSUER, keySet })
+  const verifier = new Verifier({ jwksUrl: 'http://127.0.0.1:1/never-dialled', issuer: ISSUER, keySet })
 
   // RS256 is deterministic, so two tokens signed from the same payload at the same simulated instant
   // are the same string. identity mints a uuidv7 jti per token; the counter restores that.
@@ -160,8 +160,8 @@ function upstreamsFor(w: World, options: { credential: string | null; onMinted?:
     identityUrl: IDENTITY,
     identityCredential: options.credential,
     custodyUrl: CUSTODY,
-    indexerUrl: 'http://indexer:4000',
-    ledgerUrl: 'http://ledger:4000',
+    indexerUrl: 'http://127.0.0.1:4006',
+    ledgerUrl: 'http://127.0.0.1:4004',
     upstreamDeadlineMs: 8_000,
   }
   return buildUpstreams(env, {
