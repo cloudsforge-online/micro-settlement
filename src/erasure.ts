@@ -108,8 +108,29 @@ import type { Tx } from './outbox.ts'
 /** The topic. Registered in `@cloudsforge/contracts-events` as keyed by `user_id`. */
 export const IDENTITY_USER_DELETED = 'identity.user.deleted'
 
-/** A uuid, and nothing else. The one shape identity keys this topic by. */
-export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+/**
+ * A uuid, and nothing else. The one shape identity keys this topic by.
+ *
+ * ── THE VERSION NIBBLE IS NOT CONSTRAINED, AND THAT IS THE WHOLE POINT ────────
+ *
+ * This pattern read `[1-5]` for the version and `[89ab]` for the variant — the
+ * RFC 4122 shape for versions 1 to 5. **Every user id in this estate is a
+ * UUIDv7.** 04-domain-model section 0 requires it ("All ids are UUIDv7,
+ * time-ordered, so they index well and sort"), and `identity/src/ids.ts:33`
+ * mints them.
+ *
+ * So this regex rejected every real erasure event. The handler answered 400, the
+ * relay treated that as a delivery failure and retried it for ever, and the
+ * person's data stayed exactly where it was — while the account service reported
+ * the deletion as done.
+ *
+ * **The unit tests passed throughout**, because their fixtures were v4 uuids
+ * from `gen_random_uuid()` and `crypto.randomUUID()`. Both sides of the test
+ * agreed with each other and neither agreed with the producer. It was caught by
+ * `deploy/scripts/erasure-drill.sh` driving a real deletion through the real
+ * bus — the seam, not the mock — and it is the reason that drill exists.
+ */
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export interface ErasureCounts {
   readonly outbound: number
