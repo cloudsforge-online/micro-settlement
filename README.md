@@ -251,9 +251,12 @@ delivery and wallet retries for ever — withdrawals reserved and never built, s
 `OUTBOX_ACCEPT_SECRETS` is the overlap window. Set it to `new,old`, redeploy wallet, then drop
 `old`. Both arms of `verifyInbound` try every candidate, the contract's and the pre-contract one,
 because the pre-contract arm is the one wallet's relay is still on — widening only the first would
-be the same partition in disguise. Each entry gets the same checks as the signing secret: no
-placeholders, at least 24 characters, and a repeated entry is refused because it makes "which key
-verified this" ambiguous. `settlement_event_signatures_total{scheme}` still separates `contract`
+be the same partition in disguise. Each entry gets the same checks as the signing secret, and
+those checks changed: `@cloudsforge/secrets` now asserts the SHAPE of a generated key — the base64
+or hex alphabet, 32 decoded BYTES, and an entropy floor — rather than a deny-list of exact strings
+and a 24-CHARACTER floor, which is the pair micro-org #142's 40-character placeholder walked
+through on 44 containers. A repeated entry is still refused, because it makes "which key verified
+this" ambiguous. `settlement_event_signatures_total{scheme}` still separates `contract`
 from `legacy`. Leaving the variable unset is exactly today's behaviour.
 
 ---
