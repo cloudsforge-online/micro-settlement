@@ -582,6 +582,59 @@ test('an inbound delivery verifies under either scheme, and forgery under neithe
   assert.equal(LEGACY_SIGNATURE_HEADER, 'x-cloudsforge-signature')
 })
 
+/**
+ * THE ROTATION PROPERTY, and it has to hold on BOTH arms.
+ *
+ * `OUTBOX_SIGNING_SECRET` is one HMAC key shared by every service in the estate and it is being
+ * replaced. A rolling rotation is only possible if a receiver accepts more than one candidate for
+ * the length of the cutover: the producer moves first or this service moves first, and whichever
+ * order it is, one of them is briefly signing with a key the other has not adopted.
+ *
+ * The legacy arm is the one that actually matters here. `verifyInbound`'s own header says wallet's
+ * relay still signs the pre-contract way and that this service's ONLY inbound topic arrives on it.
+ * An arm that tried the first candidate only would therefore partition exactly the path the
+ * comment says is still live — and it would do it silently, as a 401 the relay retries for ever.
+ */
+test('a rotation window accepts a NON-FIRST secret under both the contract and legacy schemes', () => {
+  const body = JSON.stringify(buildEnvelope(ROW))
+  // Obviously fake, and past the 24-character floor `env.ts` enforces on every entry.
+  const ROTATED_IN = 'fake-new-outbox-secret-0000000000'
+  // Newest first, exactly as `OUTBOX_ACCEPT_SECRETS` is written. SECRET is the one being retired.
+  const accepted = [ROTATED_IN, SECRET] as const
+
+  const legacyOld = `sha256=${createHmac('sha256', SECRET).update(body).digest('hex')}`
+  const legacyNew = `sha256=${createHmac('sha256', ROTATED_IN).update(body).digest('hex')}`
+
+  // The un-redeployed producer, still on the secret being rotated OUT — second in the list.
+  assert.equal(verifyInbound(body, accepted, { contract: signEvent(body, SECRET), legacy: '' }), 'contract')
+  assert.equal(
+    verifyInbound(body, accepted, { contract: '', legacy: legacyOld }),
+    'legacy',
+    'the legacy arm tried only the first candidate, and that is wallet’s live path',
+  )
+  // The redeployed producer, on the new secret, in the same window.
+  assert.equal(verifyInbound(body, accepted, { contract: signEvent(body, ROTATED_IN), legacy: '' }), 'contract')
+  assert.equal(verifyInbound(body, accepted, { contract: '', legacy: legacyNew }), 'legacy')
+
+  // The scheme report survives the widening: the contract's is still preferred when both are
+  // present, so the counter an operator watches falls as wallet migrates.
+  assert.equal(verifyInbound(body, accepted, { contract: signEvent(body, ROTATED_IN), legacy: legacyOld }), 'contract')
+
+  // Widening the list must not widen anything else. A secret on neither end is refused on BOTH
+  // arms, and a scalar still behaves exactly as it did.
+  const forged = 'fake-secret-nobody-issued-0000000'
+  assert.equal(verifyInbound(body, accepted, { contract: signEvent(body, forged), legacy: '' }), null)
+  assert.equal(
+    verifyInbound(body, accepted, {
+      contract: '',
+      legacy: `sha256=${createHmac('sha256', forged).update(body).digest('hex')}`,
+    }),
+    null,
+  )
+  assert.equal(verifyInbound(`${body} `, accepted, { contract: '', legacy: legacyOld }), null)
+  assert.equal(verifyInbound(body, [SECRET], { contract: '', legacy: legacyNew }), null)
+})
+
 /* ------------------------------------------------------------------ reachability */
 
 /**

@@ -114,8 +114,17 @@ export interface ServerDeps {
   readonly withdrawals: WithdrawalDeps
   readonly treasuries: TreasuryDeps
   readonly sweeps: SweepDeps
-  /** Verifies the HMAC wallet's relay put on the exact bytes it sent. */
-  readonly eventSigningSecret: string
+  /**
+   * Verifies the HMAC wallet's relay put on the exact bytes it sent — every secret it may have
+   * used, newest first.
+   *
+   * A LIST as well as a scalar, and the list is the point: `OUTBOX_SIGNING_SECRET` is one key
+   * shared across the estate, and it can only be replaced by a rolling change if a receiver
+   * accepts both the outgoing and the incoming key for the length of the cutover. `verifyInbound`
+   * tries all of them on BOTH schemes. A scalar still behaves exactly as it always has;
+   * `env.outboxAcceptSecrets` is what production passes.
+   */
+  readonly eventSigningSecret: string | readonly string[]
   readonly beforeScrape?: () => Promise<void>
 }
 

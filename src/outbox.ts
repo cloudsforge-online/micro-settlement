@@ -255,14 +255,33 @@ export type InboundScheme = 'contract' | 'legacy'
  * the scheme is REPORTED on every accepted delivery, so an operator can see the legacy count reach
  * zero before anyone deletes anything, rather than deleting on a belief.
  * ════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * **`secrets` IS A LIST, AND BOTH ARMS TRY ALL OF IT.** `OUTBOX_SIGNING_SECRET` is one HMAC key
+ * shared by every service in the estate and it has to be replaced. A rolling rotation only works if
+ * a receiver accepts the outgoing and the incoming key at once for the length of the cutover;
+ * otherwise the moment wallet's relay moves, every delivery here 401s and the relay retries it for
+ * ever, with a green `/livez`. Widening only the CONTRACT arm would be the same partition wearing a
+ * disguise — the paragraphs above say wallet's relay is still on the legacy scheme, so the legacy
+ * arm is the live path, and a single-secret arm would break exactly it.
+ *
+ * The contract arm hands the array straight to `verifyDelivery`, which tries each candidate with a
+ * timing-safe comparison inside the freshness window. The legacy arm has to loop here because
+ * `verifyLegacyDelivery` is local, and it does NOT short-circuit on the first candidate: every
+ * comparison in it is timing-safe and length-checked, so trying them all costs a few microseconds
+ * and leaks nothing beyond a public digest length.
  */
 export function verifyInbound(
   body: string,
-  secret: string,
+  secret: string | readonly string[],
   headers: { readonly contract: string; readonly legacy: string },
 ): InboundScheme | null {
   if (headers.contract.length > 0 && verifyDelivery(body, headers.contract, secret).ok) return 'contract'
-  if (headers.legacy.length > 0 && verifyLegacyDelivery(body, secret, headers.legacy)) return 'legacy'
+  if (headers.legacy.length > 0) {
+    const candidates = typeof secret === 'string' ? [secret] : secret
+    for (const candidate of candidates) {
+      if (verifyLegacyDelivery(body, candidate, headers.legacy)) return 'legacy'
+    }
+  }
   return null
 }
 

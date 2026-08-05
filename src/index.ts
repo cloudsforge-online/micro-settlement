@@ -186,7 +186,9 @@ const server = createServer({
   withdrawals: { ...treasuries, producer: SERVICE },
   treasuries,
   sweeps,
-  eventSigningSecret: env.outboxSigningSecret,
+  // The ACCEPT list, not the signing key: verification widens for the rotation window, signing
+  // does not. Absent `OUTBOX_ACCEPT_SECRETS` this is `[env.outboxSigningSecret]`, i.e. unchanged.
+  eventSigningSecret: env.outboxAcceptSecrets,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository, and CI greps for one — rule 8.
   beforeScrape: async () => {

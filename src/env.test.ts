@@ -29,7 +29,14 @@ const BASE: Record<string, string> = {
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
 
-const { EnvError, SERVICE, env: liveEnv, loadEnv } = await import('./env.ts')
+/**
+ * Two obviously-fake secrets, long enough to pass the 24-character rule. They stand for "the new
+ * one" and "the one being rotated out" in the acceptance-list cases below.
+ */
+const NEW_SECRET = 'fake-new-outbox-secret-0000000000'
+const OLD_SECRET = 'fake-old-outbox-secret-1111111111'
+
+const { EnvError, SERVICE, env: liveEnv, loadEnv, parseSecretList } = await import('./env.ts')
 
 describe('loadEnv', () => {
   it('loads a complete environment, and importing the module did not exit', () => {
@@ -109,5 +116,50 @@ describe('loadEnv', () => {
   it('bounds the stuck deadline', () => {
     assert.throws(() => loadEnv({ ...BASE, SETTLEMENT_STUCK_MINUTES: '1' }), /between 5 and 10080/)
     assert.equal(loadEnv({ ...BASE, SETTLEMENT_STUCK_MINUTES: '90' }).stuckMinutes, 90)
+  })
+
+  /**
+   * OUTBOX_ACCEPT_SECRETS — the overlap window that makes rotating the shared HMAC key survivable.
+   *
+   * `OUTBOX_SIGNING_SECRET` is one key shared across the estate. Replacing it is only possible as a
+   * rolling change if every RECEIVER can hold more than one candidate at once; otherwise the moment
+   * wallet's relay moves, every `wallet.withdrawal.requested` 401s and this service's only inbound
+   * path is gone while `/livez` stays green.
+   */
+  it('accepts only the signing secret when OUTBOX_ACCEPT_SECRETS is absent', () => {
+    // The default is what makes deploying this change a no-op, which is what makes the rotation
+    // stageable one service at a time.
+    assert.deepEqual(loadEnv(BASE).outboxAcceptSecrets, [BASE['OUTBOX_SIGNING_SECRET']])
+  })
+
+  it('reads OUTBOX_ACCEPT_SECRETS newest first, and still signs with the single secret', () => {
+    const env = loadEnv({
+      ...BASE,
+      OUTBOX_SIGNING_SECRET: NEW_SECRET,
+      OUTBOX_ACCEPT_SECRETS: `${NEW_SECRET}, ${OLD_SECRET}`,
+    })
+    assert.deepEqual(env.outboxAcceptSecrets, [NEW_SECRET, OLD_SECRET])
+    // Verification widens; signing does not. A service that signed with the whole list would have
+    // no defined answer to "which key did this go out under".
+    assert.equal(env.outboxSigningSecret, NEW_SECRET)
+  })
+
+  it('validates every entry in OUTBOX_ACCEPT_SECRETS exactly as it validates the signing secret', () => {
+    assert.throws(
+      () => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${NEW_SECRET},changeme` }),
+      /known placeholder/,
+    )
+    assert.throws(() => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${NEW_SECRET},hunter2` }), /at least 24/)
+    // A duplicate makes "which key verified this" ambiguous, and that answer is how an operator
+    // knows a rotation has finished.
+    assert.throws(
+      () => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${NEW_SECRET},${NEW_SECRET}` }),
+      /same secret twice/,
+    )
+    // A list that is empty or all blanks accepts nothing at all, which is a silent partition.
+    assert.throws(() => parseSecretList(' , , ', 'X'), EnvError)
+    assert.throws(() => parseSecretList('', 'X'), EnvError)
+    // A single entry is a list of one, not a special case.
+    assert.deepEqual(parseSecretList(` ${OLD_SECRET} `, 'X'), [OLD_SECRET])
   })
 })

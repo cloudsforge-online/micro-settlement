@@ -235,6 +235,27 @@ pnpm start
 read; it is never sent to. `scripts/upstreams.ts` stands up local stubs for identity, custody, the
 indexer, the ledger and a fake chain so the real service can be booted and driven by hand.
 
+### Rotating the outbox secret
+
+| Variable | | |
+| --- | --- | --- |
+| `OUTBOX_SIGNING_SECRET` | required | The key this service **signs** its own outbox deliveries with. One key, always. |
+| `OUTBOX_ACCEPT_SECRETS` | optional | Comma-separated, **newest first**. The keys `POST /v1/events` will **accept**, under *both* inbound schemes. Defaults to `[OUTBOX_SIGNING_SECRET]`. |
+
+`OUTBOX_SIGNING_SECRET` is one HMAC key shared across the estate, so replacing it is a rolling
+change or it is an outage. `wallet.withdrawal.requested` is this service's **only** inbound topic:
+the instant wallet's relay adopts the new key, a receiver that accepts only the old one 401s every
+delivery and wallet retries for ever — withdrawals reserved and never built, silently, with a green
+`/livez`.
+
+`OUTBOX_ACCEPT_SECRETS` is the overlap window. Set it to `new,old`, redeploy wallet, then drop
+`old`. Both arms of `verifyInbound` try every candidate, the contract's and the pre-contract one,
+because the pre-contract arm is the one wallet's relay is still on — widening only the first would
+be the same partition in disguise. Each entry gets the same checks as the signing secret: no
+placeholders, at least 24 characters, and a repeated entry is refused because it makes "which key
+verified this" ambiguous. `settlement_event_signatures_total{scheme}` still separates `contract`
+from `legacy`. Leaving the variable unset is exactly today's behaviour.
+
 ---
 
 ## Provenance
