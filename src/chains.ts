@@ -38,13 +38,13 @@
  *   * It said `signBitcoin`'s output policy was "specified, not built", so `SWEEPABLE_FAMILIES`
  *     refused a bitcoin `deposit` address and therefore "neither a withdrawal nor a sweep is
  *     possible". **The withdrawal half was never true.** The gate it named is conditioned on
- *     `purpose === 'deposit'` (custody/src/gates.ts:150), so it never touched a `treasury`-purpose
+ *     `purpose === 'deposit'` (custody/src/gates.ts), so it never touched a `treasury`-purpose
  *     withdrawal at all. `bitcoin.ts` corrected that half. The sweep half was true and is not any
- *     more: `BitcoinPolicy` (custody/src/signing.ts:596) is built, and `SWEEPABLE_FAMILIES`
- *     (custody/src/gates.ts:118) now names `bitcoin` and `solana`.
+ *     more: `BitcoinPolicy` (custody/src/signing.ts) is built, and `SWEEPABLE_FAMILIES`
+ *     (custody/src/gates.ts) now names `bitcoin` and `solana`.
  *   * It said `signSolana` "allows only the SPL mint-creation instruction set and explicitly
  *     refuses `SystemProgram::Transfer`". That WAS true and is now false: `SolanaPolicy`
- *     (custody/src/signing.ts:379) has three disjoint shapes, and `transfer` and `sweep` each admit
+ *     (custody/src/signing.ts) has three disjoint shapes, and `transfer` and `sweep` each admit
  *     exactly one System Transfer of native lamports.
  *   * It said admitting SOL would "hand a signing credential `createAccount` over every customer's
  *     SOL deposit key". False in the opposite direction now: `createAccount` is reachable only
@@ -312,7 +312,7 @@ interface BuildInputBase {
    * **Not a label, and not derivable from the addresses on the row.** custody picks the policy from
    * the PURPOSE of the address it is signing for, and the two policies want two DIFFERENT
    * transactions. On Bitcoin the difference is a whole output: `assertSweepOutputs`
-   * (custody/src/signing.ts:722) refuses a PSBT any of whose outputs does not pay the pin, change
+   * (custody/src/signing.ts) refuses a PSBT any of whose outputs does not pay the pin, change
    * included — and a change output back to the deposit address is exactly what the withdrawal
    * builder produces. An adapter that could not tell the two apart would hand custody bytes it
    * refuses AFTER the row is committed and this chain's single outbound slot is claimed.

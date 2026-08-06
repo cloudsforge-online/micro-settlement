@@ -102,7 +102,7 @@ describe('loadEnv', () => {
   /**
    * **The ten-minute cliff, at the only place it can still be reintroduced.**
    *
-   * `index.ts:83` read `SETTLEMENT_SERVICE_TOKEN` — a 600-second JWT — once at boot and presented
+   * `index.ts` read `SETTLEMENT_SERVICE_TOKEN` — a 600-second JWT — once at boot and presented
    * it to custody, the indexer and the ledger for the life of the process. On the mainnet estate
    * that meant one exchange ever, on 2026-08-04, and every treasury-pin read since answering 401.
    * What `loadEnv` now decides is which of the two variables holds a CREDENTIAL, and it decides it

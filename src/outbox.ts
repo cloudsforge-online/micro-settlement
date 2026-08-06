@@ -68,7 +68,7 @@ export const SETTLEMENT_OUTBOUND_FAILED = 'settlement.outbound.failed'
  *
  * `@cloudsforge/contracts-events` owns `settlement.withdrawal.stuck`, keyed `chain:network`, with
  * the description "An outbound transaction passed its deadline unconfirmed. Pages on one." Both
- * consumers classify that name — `activity/src/classify.ts:383` and `notify/src/catalogue.ts:433`,
+ * consumers classify that name — `activity/src/classify.ts` and `notify/src/catalogue.ts`,
  * the latter at `priority: 'high'` with the reason "Silence here is a user who believes their money
  * has vanished".
  *
@@ -239,7 +239,7 @@ export type InboundScheme = 'contract' | 'legacy'
  * way, because every consumer of it imports the contract. The CONSUMER half cannot be, and the
  * reason is a fact about another repository rather than a preference: this service consumes exactly
  * one topic, `wallet.withdrawal.requested`, and `micro-wallet`'s relay still signs the old way —
- * `wallet/src/outbox.ts:165,168`, a local `x-cloudsforge-signature` and a local `sha256=<hmac>`.
+ * `wallet/src/outbox.ts,168`, a local `x-cloudsforge-signature` and a local `sha256=<hmac>`.
  *
  * Switching only the verifier would 401 every withdrawal request the instant this deploys. That is
  * not a smaller outage than the one being fixed; it is the same service's only inbound path.

@@ -5,11 +5,11 @@
  *
  * This is `micro-wallet`'s `upstreams.ts` defect, still live here months after wallet fixed it:
  *
- *     const token = () => env.serviceToken        // index.ts:83, before this change
+ *     const token = () => env.serviceToken        // index.ts, before this change
  *
  * A function called per request, so that a short-TTL token could rotate without a restart —
  * returning a string read ONCE AT BOOT from a token that expires in 600 seconds
- * (`identity/src/tokens.ts:28`). Ten minutes into every deployment, every call to custody, the
+ * (`identity/src/tokens.ts`). Ten minutes into every deployment, every call to custody, the
  * indexer and the ledger began answering 401, for ever, until somebody restarted the container
  * with a hand-minted token that would itself die ten minutes later.
  *

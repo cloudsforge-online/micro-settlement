@@ -573,11 +573,11 @@ export function confirmedEvents(row: OutboundTransaction): readonly DomainEvent[
  * so `settlement.outbound.failed` is the ONLY event a failure produces — and every reader in the
  * estate that turns an event into something a person sees resolves the person from the payload:
  *
- *   - `activity/src/classify.ts:510` classifies this topic with `userId: userFromPayload`, which
+ *   - `activity/src/classify.ts` classifies this topic with `userId: userFromPayload`, which
  *     reads `payload.userId` and requires a uuid. **Deliberately not `userFromKey`**, because the
  *     key is the WITHDRAWAL id and is also a uuid — a key fallback would hand back a withdrawal id
  *     as a user id: well-formed, queryable and wrong.
- *   - `notify/src/catalogue.ts:120` reads `payload.user_id`/`payload.userId`, then the key only if
+ *   - `notify/src/catalogue.ts` reads `payload.user_id`/`payload.userId`, then the key only if
  *     the registry keys the topic by `user_id` (it keys by `withdrawal_id`), then an `actor` of
  *     `user:<id>`. This service's relay stamps `actor` as `service:settlement` when an emit names
  *     none (`outbox.ts` `buildEnvelope`), and none of these three emits does — every one originates
@@ -594,9 +594,9 @@ export function confirmedEvents(row: OutboundTransaction): readonly DomainEvent[
  * is held" are different messages to a reader, and every consumer splits them the same way — on
  * `refundable === true`, with anything else meaning HELD:
  *
- *   - `wallet/src/server.ts:875` writes `refundable: payload['refundable'] === true` and
- *     `wallet/src/withdrawals.ts:592` sends `!refundable` to `stuck` — funds held, operator paged.
- *   - `activity/src/classify.ts:191` mirrors that `=== true` on purpose, so a feed entry can never
+ *   - `wallet/src/server.ts` writes `refundable: payload['refundable'] === true` and
+ *     `wallet/src/withdrawals.ts` sends `!refundable` to `stuck` — funds held, operator paged.
+ *   - `activity/src/classify.ts` mirrors that `=== true` on purpose, so a feed entry can never
  *     say "on its way back" while wallet is holding the money on the same screen.
  *
  * An ABSENT field is `undefined` to both, which reads as held — the safe direction, and the reason
@@ -613,7 +613,7 @@ export function confirmedEvents(row: OutboundTransaction): readonly DomainEvent[
  *
  * ## Why the repair is a FIELD and not a new `settlement.withdrawal.failed`
  *
- * `notify/src/catalogue.ts:851` records this gap as "the one entry in this table that records a
+ * `notify/src/catalogue.ts` records this gap as "the one entry in this table that records a
  * notification the estate still owes somebody", says the envelope "names nobody notify could
  * address", and ends "the user-facing twin does not exist … there is no settlement.withdrawal.failed
  * … owned by micro-settlement". The obvious reading is that this service should invent that topic,
@@ -664,7 +664,7 @@ export function failedEvents(
  * `settlement.withdrawal.stuck` is the REGISTERED name — `@cloudsforge/contracts-events` owns it,
  * keyed `chain:network` — and **this service was not emitting it.** It emitted
  * `settlement.outbound.stuck`, keyed by the outbound row id, which no registry names and nothing
- * subscribes to. `activity/src/classify.ts:383` and `notify/src/catalogue.ts:433` both classify the
+ * subscribes to. `activity/src/classify.ts` and `notify/src/catalogue.ts` both classify the
  * registered name, the latter at `priority: 'high'` because "Silence here is a user who believes
  * their money has vanished" — so both were dead code, and a stuck withdrawal notified nobody. The
  * one event in this file whose entire purpose is to reach a person reached none. It is the same

@@ -11,7 +11,7 @@
  *      flight — which is strictly worse than this refusal, which happens before anything is
  *      written."
  *
- * `SolanaPolicy` (custody/src/signing.ts:379) now has three disjoint shapes and two of them are a
+ * `SolanaPolicy` (custody/src/signing.ts) now has three disjoint shapes and two of them are a
  * System Transfer:
  *
  *     deployer → 'mint'      the SPL mint-creation set, unchanged

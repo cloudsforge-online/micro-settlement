@@ -4,19 +4,19 @@
  * `@cloudsforge/auth` proves the provider in isolation. This file proves the ADOPTION, which is a
  * different claim and the one that was wrong here:
  *
- *     const token = () => env.serviceToken        // src/index.ts:83, before this change
+ *     const token = () => env.serviceToken        // src/index.ts, before this change
  *
  * A function called per request, so that a short-TTL token could rotate without a restart —
  * returning a string read once at boot from a token that dies in 600 seconds
- * (`identity/src/tokens.ts:28`). Every call to custody, the indexer and the ledger began failing
+ * (`identity/src/tokens.ts`). Every call to custody, the indexer and the ledger began failing
  * ten minutes into every deployment.
  *
  * **The call modelled below is `custody.treasuryPin`, and that is not an arbitrary choice.** It is
  * the exact call the mainnet estate was failing every five minutes when `micro-org#174` was filed:
  *
  *     CustodySignRefusedError: a valid bearer token is required
- *       at translateSign (/app/src/custodyclient.ts:268)
- *       at Object.treasuryPin (/app/src/custodyclient.ts:213)
+ *       at translateSign (/app/src/custodyclient.ts)
+ *       at Object.treasuryPin (/app/src/custodyclient.ts)
  *
  * A settlement that cannot read the pin cannot pay a withdrawal even once an operator has pinned
  * one, so this seam is on the money path rather than beside it.
@@ -51,7 +51,7 @@ const SCOPES = [
   'ledger:post',
 ]
 
-/** identity/src/tokens.ts:28. Unchanged by this fix, and it must stay unchanged. */
+/** identity/src/tokens.ts. Unchanged by this fix, and it must stay unchanged. */
 const SERVICE_TTL_SECONDS = 600
 
 /** The address custody pins. A public value; nothing here is key material. */

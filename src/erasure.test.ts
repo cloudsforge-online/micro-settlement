@@ -132,7 +132,7 @@ test('an erased outbound transaction names nobody and keeps its evidence', { ski
 })
 
 test('erasure is distinguishable from a row that never had a user id', { skip }, async () => {
-  // `withdrawals.ts:544` documents a null user_id as "a row that predates the column being
+  // `withdrawals.ts` documents a null user_id as "a row that predates the column being
   // written". Without `erased_at` the two states would be the same row, and an audit could not tell
   // an erasure that happened from one that never did.
   const legacy = await seedOutbound(null, 'confirmed', 'legacy')

@@ -31,7 +31,7 @@
  * |                        |                     | the three that read it (activity, analytics,    |
  * |                        |                     | notify) all use it for attribution and for      |
  * |                        |                     | telling somebody. For a deleted account there   |
- * |                        |                     | is nobody to tell, and `withdrawals.ts:544`     |
+ * |                        |                     | is nobody to tell, and `withdrawals.ts`     |
  * |                        |                     | already calls a null userId "unreachable", the  |
  * |                        |                     | value those consumers already tolerate.         |
  * |                        |                     | `to_address` is KEPT: it is inside `raw_tx` and |
@@ -47,7 +47,7 @@
  * |                        |                     | itself survives, for a reason that is not about |
  * |                        |                     | records at all: **custody compares the binding  |
  * |                        |                     | character for character before it will sign**   |
- * |                        |                     | (custody/src/gates.ts:182). A sweep restates    |
+ * |                        |                     | (custody/src/gates.ts). A sweep restates    |
  * |                        |                     | `custody_user_id` and `custody_order_id` or it  |
  * |                        |                     | is refused, and the refusal does not say which  |
  * |                        |                     | field disagreed. Null either one and every coin |
@@ -71,9 +71,9 @@
  * |                        |                     | is retained indefinitely.                       |
  * |------------------------|---------------------|------------------------------------------------|
  * | treasuries             | NO ACTION —         | **The issue said this table holds an owner      |
- * |                        | not personal data   | reference (migrations.ts:126). It does not.**   |
+ * |                        | not personal data   | reference (migrations.ts). It does not.**   |
  * |                        |                     | Its `custody_user_id` is the literal            |
- * |                        |                     | `'cloudsforge:treasury'` (src/treasury.ts:58) — |
+ * |                        |                     | `'cloudsforge:treasury'` (src/treasury.ts) — |
  * |                        |                     | the platform's own custody account for the      |
  * |                        |                     | platform's own address. One address per         |
  * |                        |                     | (chain, network), belonging to nobody. Recorded |
@@ -116,7 +116,7 @@ export const IDENTITY_USER_DELETED = 'identity.user.deleted'
  * This pattern read `[1-5]` for the version and `[89ab]` for the variant — the
  * RFC 4122 shape for versions 1 to 5. **Every user id in this estate is a
  * UUIDv7.** 04-domain-model section 0 requires it ("All ids are UUIDv7,
- * time-ordered, so they index well and sort"), and `identity/src/ids.ts:33`
+ * time-ordered, so they index well and sort"), and `identity/src/ids.ts`
  * mints them.
  *
  * So this regex rejected every real erasure event. The handler answered 400, the
@@ -142,7 +142,7 @@ export interface ErasureCounts {
 /**
  * The two spellings of one person, and why both are matched.
  *
- * The event payload carries a BARE UUID (`identity/src/deletion.ts:113-125`), and that is also how
+ * The event payload carries a BARE UUID (`identity/src/deletion.ts`), and that is also how
  * this service stores it: `outbound_transactions.user_id` comes straight off wallet's withdrawal
  * event, and `sweep_sources.custody_user_id` is the value custody was minted with. So the bare form
  * is the live one here — unlike billing, policy and the other ledger-facing services, which store

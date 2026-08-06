@@ -4,7 +4,7 @@
  * Pure, and deliberately separate from the job that writes it: what is worth pinning is the
  * ACCOUNT KEY and its TYPE. The ledger keys an account on `(subject, asset_code, purpose)` and
  * refuses an entry whose stated type disagrees with the row that already exists
- * (ledger/src/accounts.ts:125, `AccountConflictError`) — and that refusal is not per-entry, it is
+ * (ledger/src/accounts.ts, `AccountConflictError`) — and that refusal is not per-entry, it is
  * every entry from whichever service posted second, for as long as the disagreement stands.
  *
  * It is invisible to every suite in the estate because each service tests against its own fake
@@ -26,7 +26,7 @@ describe('the fee entry names accounts nobody else claims differently', () => {
     assert.equal(account.assetCode, 'EMBER')
     // The chart's `expense` slot for the `platform` subject — micro-ledger names it in its own
     // source: "`platform` is revenue under `fees`, equity under `treasury` and expense under
-    // `payout_due`" (ledger/src/accounts.ts:16-17).
+    // `payout_due`" (ledger/src/accounts.ts).
     assert.equal(account.purpose, 'payout_due')
     assert.equal(account.type, 'expense')
   })
@@ -72,7 +72,7 @@ describe('the fee entry names accounts nobody else claims differently', () => {
    * **THE SAME TWO KEYS FOR EVERY ASSET, INCLUDING THE ONES THAT DID NOT EXIST YET.**
    *
    * `ensureAccount` throws `AccountConflictError` when a caller's stated type disagrees with the
-   * row that already exists (ledger/src/accounts.ts:125), and whichever service posts SECOND has
+   * row that already exists (ledger/src/accounts.ts), and whichever service posts SECOND has
    * EVERY entry refused, not one — for as long as the disagreement stands. No suite in the estate
    * can see it, because each service tests against its own fake ledger.
    *

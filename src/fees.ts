@@ -18,18 +18,18 @@
  *
  *   1. The debit was `(platform, <asset>, fees)` as type `expense`. `micro-billing`,
  *      `micro-market`, `micro-mint`, `micro-trade` and `micro-wallet` all name that SAME key as
- *      type `revenue` (market/src/ledgerclient.ts:123, wallet/src/money.ts:145), and
+ *      type `revenue` (market/src/ledgerclient.ts, wallet/src/money.ts), and
  *      `micro-foresight` names `(platform, EMBER, fees)` `revenue` too
- *      (foresight/src/ledgerclient.ts:116). `ensureAccount` THROWS `AccountConflictError` when a
+ *      (foresight/src/ledgerclient.ts). `ensureAccount` THROWS `AccountConflictError` when a
  *      caller's stated type disagrees with the row that already exists
- *      (ledger/src/accounts.ts:125) — so whichever service posted second would have had EVERY
+ *      (ledger/src/accounts.ts) — so whichever service posted second would have had EVERY
  *      entry refused, for as long as the disagreement stood. No suite caught it because each
  *      service tests against its own fake ledger.
  *
  *      `revenue` is the correct reading and this service's `expense` was the wrong one:
  *      `micro-ledger` states the chart for the `platform` subject in its own source — "`platform`
  *      is revenue under `fees`, equity under `treasury` and expense under `payout_due`"
- *      (ledger/src/accounts.ts:16-17) — and `normalBalance` makes `revenue` credit-normal, the
+ *      (ledger/src/accounts.ts) — and `normalBalance` makes `revenue` credit-normal, the
  *      direction six services already credit fee income in.
  *
  *      But merely RETYPING this posting to `revenue` would have swapped one production breakage
@@ -45,7 +45,7 @@
  *
  *   2. The credit was `(custody, <asset>, treasury)`. Nothing in the estate has ever DEBITED that
  *      account — `micro-wallet` books every deposit and every settled withdrawal against
- *      `(custody, <asset>, available)` (wallet/src/deposits.ts:627, wallet/src/withdrawals.ts:564)
+ *      `(custody, <asset>, available)` (wallet/src/deposits.ts, wallet/src/withdrawals.ts)
  *      — so its balance is 0, and crediting an `asset` (debit-normal) account with a zero balance
  *      takes it negative and `ledger_assert_no_overdraft` refuses the entry. The fee was burned
  *      out of the coin custody actually holds, so it is that pool which goes down. Same type,
@@ -69,7 +69,7 @@ import type { OutboundTransaction } from './outbound.ts'
 
 /**
  * The platform's own expense line — the chart's `expense` slot for the `platform` subject, named
- * by `micro-ledger` itself (ledger/src/accounts.ts:16-17). Exported so the suite can assert the
+ * by `micro-ledger` itself (ledger/src/accounts.ts). Exported so the suite can assert the
  * key rather than re-spell it: a second spelling is a second account, and the whole defect this
  * replaces was two services spelling one key two ways.
  *
@@ -82,7 +82,7 @@ export function feeExpenseAccount(assetCode: LedgerAssetCode): AccountRef {
 
 /**
  * What custody holds, as `micro-wallet` maintains it — `(custody, <asset>, available)`
- * (wallet/src/deposits.ts:627). The pool a burned network fee actually came out of.
+ * (wallet/src/deposits.ts). The pool a burned network fee actually came out of.
  */
 export function custodyAccount(assetCode: LedgerAssetCode): AccountRef {
   return { subject: 'custody', assetCode, purpose: 'available', type: 'asset' }

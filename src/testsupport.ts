@@ -612,10 +612,10 @@ export function fakeLedger(): FakeLedger {
  * weaker assertion than "the person whose money did not arrive is reachable", and this service spent
  * its whole life emitting a failure that satisfied no reader at all.
  *
- *   - `notify/src/catalogue.ts:120` (`userIdOf`) — `payload.user_id` or `payload.userId`; failing
+ *   - `notify/src/catalogue.ts` (`userIdOf`) — `payload.user_id` or `payload.userId`; failing
  *     that the envelope KEY, but only where the registry keys that topic by `user_id`; failing that
  *     an `actor` of `user:<id>`.
- *   - `activity/src/classify.ts:112` (`userFromPayload`) — `payload.userId`, and it must be a uuid.
+ *   - `activity/src/classify.ts` (`userFromPayload`) — `payload.userId`, and it must be a uuid.
  *     Deliberately NOT the key: on `settlement.outbound.failed` the key is the withdrawal id and is
  *     also a uuid, so a key fallback returns a well-formed, queryable, wrong "user".
  *

@@ -354,8 +354,8 @@ test('THE RULE: a failed withdrawal reaches the person whose money did not arriv
  * `activity` classifies this topic as TWO facts — `withdrawal.failed_refunded` and
  * `withdrawal.failed_held` — because "the money is coming back" and "your money is held while we
  * find out where it went" are different messages to a person. Both consumers split on
- * `refundable === true` with everything else meaning HELD (`wallet/src/server.ts:875`,
- * `activity/src/classify.ts:191`), so an absent or undefined field silently reads as held. It is the
+ * `refundable === true` with everything else meaning HELD (`wallet/src/server.ts`,
+ * `activity/src/classify.ts`), so an absent or undefined field silently reads as held. It is the
  * safe direction, and it is still not one this service is allowed to fall into by accident.
  */
 test('the reader can tell refunded from held, and an absent flag reads as held', () => {
@@ -555,7 +555,7 @@ test('the delivery this relay signs is one a contract-following consumer verifie
 /**
  * The INBOUND seam, which is deliberately asymmetric with the outbound one.
  *
- * `micro-wallet`'s relay still signs the pre-contract way (`wallet/src/outbox.ts:165,168`), and
+ * `micro-wallet`'s relay still signs the pre-contract way (`wallet/src/outbox.ts,168`), and
  * `wallet.withdrawal.requested` is the only topic this service consumes. Verifying only the
  * contract's scheme would 401 every withdrawal request the instant this deploys — the same
  * service's only inbound path.
@@ -640,7 +640,7 @@ test('a rotation window accepts a NON-FIRST secret under both the contract and l
 /**
  * A guard that proves a topic name is correct proves nothing about whether the emit is reached.
  *
- * `identity/src/sessions.ts:390` exports `emitSessionRevoked` and NOTHING CALLS IT — `revokeSession`
+ * `identity/src/sessions.ts` exports `emitSessionRevoked` and NOTHING CALLS IT — `revokeSession`
  * and `revokeAllSessions` update rows without emitting — so `identity.session.revoked` is produced
  * by dead code while identity's own guard passes, because it scans literals rather than
  * reachability. This is the cheapest check that catches that exact shape.

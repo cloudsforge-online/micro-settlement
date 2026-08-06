@@ -168,7 +168,7 @@ describe('the HTTP surface', { skip }, () => {
   /**
    * A delivery as one of the two producers on the wire today would actually make it.
    *
-   * `'legacy'` is what `micro-wallet`'s relay sends RIGHT NOW — `wallet/src/outbox.ts:165,168`, a
+   * `'legacy'` is what `micro-wallet`'s relay sends RIGHT NOW — `wallet/src/outbox.ts,168`, a
    * local `x-cloudsforge-signature` carrying `sha256=<hmac over the body>`. It is the default here
    * for exactly that reason: the default has to be the thing that is really arriving, or this suite
    * would prove that the migration works and nothing about whether withdrawals still get in.

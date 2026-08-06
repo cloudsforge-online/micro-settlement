@@ -22,7 +22,7 @@
  *     as "signature: missing", then as `malformed_header` once the name was aligned.
  *   - **A topic renamed on the wire.** The registry owns `settlement.withdrawal.stuck` keyed
  *     `chain:network`; this service emitted `settlement.outbound.stuck` keyed by the row id.
- *     `activity/src/classify.ts:383` and `notify/src/catalogue.ts:433` both classify the registered
+ *     `activity/src/classify.ts` and `notify/src/catalogue.ts` both classify the registered
  *     name, so both were dead code and a stuck withdrawal notified nobody.
  *
  * These are one defect wearing three hats: **the producer is free and the consumer is pinned.** So

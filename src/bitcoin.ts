@@ -487,7 +487,7 @@ export function finalisedVsize(psbt: bitcoin.Psbt): number {
  *
  * The comparison is `>=` and the divisor is the finalised size, because that is character for
  * character what `signBitcoin` does: `psbt.getFeeRate()` is `Math.floor(fee / virtualSize)` and it
- * refuses at `feeRate >= ceiling` (custody/src/signing.ts:700). Reproducing the comparison rather
+ * refuses at `feeRate >= ceiling` (custody/src/signing.ts). Reproducing the comparison rather
  * than approximating it is the point — an approximation is a second policy, and the one thing that
  * must not happen here is this service believing a PSBT acceptable that custody will not sign.
  */
@@ -498,7 +498,7 @@ export function assertUnderCustodysCeiling(
   /**
    * Only so the refusal names the right chain. **The CEILINGS are deliberately not per-chain**,
    * because custody's are not: `signBitcoin` reads one pair of constants whatever the row's chain
-   * (`custody/src/signing.ts:858-859,925`). They are a rate in the chain's own smallest unit per
+   * (`custody/src/signing.ts,925`). They are a rate in the chain's own smallest unit per
    * vbyte, so 5,000 is a looser bound in value terms for LTC than for BTC — which is the safe
    * direction for a CEILING, and inventing a tighter Litecoin number here would mean this service
    * refusing PSBTs custody would happily sign, in a place no operator would think to look.
@@ -568,10 +568,10 @@ const FEE_TARGET_BLOCKS = 3
  *
  * There is one number here that must not be got wrong and it is a RELATIONSHIP, not a value.
  * custody's `signBitcoin` sets `psbt.setMaximumFeeRate(ceiling)` and then refuses outright at
- * `feeRate >= ceiling` (custody/src/signing.ts:700), with two ceilings of its own:
+ * `feeRate >= ceiling` (custody/src/signing.ts), with two ceilings of its own:
  *
- *     MAX_SWEEP_FEE_RATE   = 1_000   (custody/src/signing.ts:623)
- *     MAX_PAYMENT_FEE_RATE = 5_000   (custody/src/signing.ts:624)
+ *     MAX_SWEEP_FEE_RATE   = 1_000   (custody/src/signing.ts)
+ *     MAX_PAYMENT_FEE_RATE = 5_000   (custody/src/signing.ts)
  *
  * Until this block existed, this service carried ONE ceiling, `MAX_SAT_PER_VB = 5_000`, applied to
  * both shapes. Two things were wrong with that and they are different failures:
@@ -603,9 +603,9 @@ const FEE_TARGET_BLOCKS = 3
  * ════════════════════════════════════════════════════════════════════════════════════════════════
  */
 
-/** custody/src/signing.ts:623. Restated so the test can compare, never used as this service's own. */
+/** custody/src/signing.ts. Restated so the test can compare, never used as this service's own. */
 export const CUSTODY_MAX_SWEEP_SAT_PER_VB = 1_000n
-/** custody/src/signing.ts:624. Same. */
+/** custody/src/signing.ts. Same. */
 export const CUSTODY_MAX_PAYMENT_SAT_PER_VB = 5_000n
 
 /**

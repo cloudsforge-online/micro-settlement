@@ -37,7 +37,7 @@ import { solanaChain } from './solana.ts'
  *     to watch for: quoting the right file at the right line and drawing the wrong conclusion.
  *   * **The SOL entry was true when it was written and went stale.** It said `signSolana` "refuses
  *     SystemProgram::Transfer for EVERY purpose". It did. It does not now: `SolanaPolicy`
- *     (custody/src/signing.ts:379) has three disjoint shapes and `transfer` and `sweep` are each
+ *     (custody/src/signing.ts) has three disjoint shapes and `transfer` and `sweep` are each
  *     exactly one System Transfer. Nothing announced that; it was found by reading custody again.
  *   * The SOL entry also said admitting SOL "would hand a signing credential createAccount over
  *     every customer's SOL deposit key". That is now false in the OPPOSITE direction as well:

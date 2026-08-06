@@ -60,14 +60,14 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  * `micro-market` declared `policy:evaluate` and `micro-wallet` `custody:address` — neither ever
  * a registry key — for the life of both services. `derive-grants.mjs` reads this into
  * `IDENTITY_SERVICE_TOKEN_GRANTS`, and identity validates that list at import and REFUSES TO
- * START on an unknown name (`identity/src/env.ts:141`): a dead identity container, so no tokens
+ * START on an unknown name (`identity/src/env.ts`): a dead identity container, so no tokens
  * for anybody.
  *
  * `LiveScope` rather than `Scope` because `Scope` is `keyof typeof SCOPES` — every registered
  * key, DEPRECATED ones included — and identity will not mint a deprecated scope either.
  * `LiveScope = Exclude<Scope, DeprecatedScope>`, with `DeprecatedScope` computed FROM `SCOPES` by
  * a conditional type over the `deprecated` field rather than hand-listed
- * (`contracts/packages/auth/src/index.ts:507`), so it cannot drift from the registry. `Scope`
+ * (`contracts/packages/auth/src/index.ts`), so it cannot drift from the registry. `Scope`
  * keeps its wide meaning and this does not narrow it: a token arriving from anywhere may carry a
  * scope that has since died, so reading is wide and demanding is narrow. This is demanding.
  */
