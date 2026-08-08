@@ -198,6 +198,43 @@ function wei(source: Source, name: string, fallback: bigint): bigint {
   return BigInt(raw)
 }
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * `SETTLEMENT_RPC_URLS` IS A SECRET NOW, AND THE COMMENT AT THE FOOT OF THIS FILE USED TO BE
+ * WRONG ABOUT IT.
+ *
+ * That comment says the fatal line emitted at import is "the one `loadEnv` produced, which by
+ * construction never contains a value of a secret". `jsonMap` was the exception, and it became one
+ * the moment Bitcoin-family endpoints arrived: Core authenticates JSON-RPC with HTTP Basic and
+ * nothing else, so the endpoint an operator configures is `http://rpcuser:rpcpassword@host:8332`
+ * and the map that holds it holds a password. `registry.ts` now reads that userinfo and sends it
+ * (see `basicAuthorization` there); before this change it was parsed and dropped, and every
+ * Litecoin call took a 401.
+ *
+ * The failure that made this worth fixing is a one-character one. `SETTLEMENT_RPC_URLS` with a
+ * trailing comma does not parse, and the branch below echoed the first sixty characters of the raw
+ * value to explain why — which for that variable is the scheme, the username and most of the
+ * password, printed by the hand-built fatal line at the foot of this file, into the collector,
+ * on every restart of a container that will never start. The password would then be in a log
+ * store, which is a rotation rather than a redeploy.
+ *
+ * REDACT FIRST, THEN SLICE. The other order is worse than not redacting: a sixty-character cut
+ * lands mid-userinfo about as often as not, and the pattern below would no longer match the
+ * fragment left over — so the truncation would be doing the leaking.
+ *
+ * The pattern is deliberately not `new URL`: the raw string is a JSON blob that did not parse, so
+ * there may be no URL in it to construct, and there may be several. `@cloudsforge/http`'s
+ * `redactUrl` is the right tool one layer down, on a single well-formed URL, and is what
+ * `HttpError` and `TimeoutError` already use.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const USERINFO = /(\/\/)[^/?#\s"'@]*@/g
+
+/** Replaces `//user:pass@` with `//***:***@` anywhere in a string, however malformed the rest is. */
+function redactUserinfo(text: string): string {
+  return text.replace(USERINFO, '$1***:***@')
+}
+
 /**
  * A JSON object of `chain → value`, refused rather than defaulted when it will not parse.
  *
@@ -210,7 +247,7 @@ function jsonMap(source: Source, name: string, fallback: string): Readonly<Recor
   try {
     parsed = JSON.parse(raw)
   } catch {
-    throw new EnvError(`${name} must be a JSON object (got ${raw.slice(0, 60)})`)
+    throw new EnvError(`${name} must be a JSON object (got ${redactUserinfo(raw).slice(0, 60)})`)
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new EnvError(`${name} must be a JSON object of string keys to string values`)
@@ -336,6 +373,12 @@ export interface Env {
   /**
    * `chain → JSON-RPC endpoint`. Empty by default, which makes a chain with no endpoint refuse
    * rather than fall back to a public node nobody chose.
+   *
+   * **THIS MAP CAN HOLD A PASSWORD.** Bitcoin, Litecoin and Dogecoin Core speak HTTP Basic and
+   * have no anonymous mode, so their entries are `http://rpcuser:rpcpassword@host:8332` and
+   * `registry.ts` turns that userinfo into an `Authorization` header. Nothing may print a value
+   * from this map: `index.ts` reports `Boolean(env.rpcUrls[chain])` at boot and not the URL, and
+   * the parse failure above is redacted before it is sliced.
    */
   readonly rpcUrls: Readonly<Record<string, string>>
   readonly rpcDeadlineMs: number
@@ -529,8 +572,15 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
  *
  * So emit one structured fatal line by hand. It is built from a literal rather than routed through
  * the telemetry package: nothing that can itself fail may sit between a configuration error and
- * the report of it. The message is the one `loadEnv` produced, which by construction never
- * contains a value of a secret.
+ * the report of it. The message is the one `loadEnv` produced, and this line is the reason every
+ * message in this file is written the way it is: it goes to the collector verbatim, so a value
+ * echoed for diagnosis is a value stored for as long as the log store keeps it.
+ *
+ * "By construction never contains a value of a secret" is what this comment used to claim, and it
+ * was false for exactly one branch — `jsonMap` echoed the head of the raw value, and
+ * `SETTLEMENT_RPC_URLS` holds `http://rpcuser:rpcpassword@host:8332`. See `redactUserinfo` above.
+ * The claim is worth keeping as an invariant precisely because it is the kind that goes quietly
+ * stale when a variable changes what it carries.
  */
 function fatalConfig(err: unknown): never {
   const message = err instanceof Error ? err.message : String(err)

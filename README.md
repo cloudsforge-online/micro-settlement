@@ -195,6 +195,26 @@ The dust threshold is the one where copying Bitcoin's number is not merely inacc
 refused by every node as `dust` — a broadcast failure after a signature. The fee ceilings are
 deliberately NOT per-chain, because custody's are not; see `assertUnderCustodysCeiling`.
 
+**A UTXO node is reached with HTTP Basic, and the credential travels in `SETTLEMENT_RPC_URLS`.**
+Bitcoin, Litecoin and Dogecoin Core have no anonymous JSON-RPC mode and no cookie path a container
+on the other side of a network boundary can use — `.cookie` is a file inside the node's datadir. So
+the entry is `{"ltc":"http://rpcuser:rpcpassword@host:9332"}` and `rpcFactory` turns that userinfo
+into `Authorization: Basic …`. Two consequences an operator has to know:
+
+* **The password is percent-encoded, because it is inside a URL.** `@`, `/`, `:`, `?`, `#` and `%`
+  are syntax; `p@ss:word` is written `p%40ss%3Aword` and a literal `%` is written `%25`. The
+  service decodes before it authenticates, so getting this wrong is not a parse error you can see —
+  it is a 401 on a password that is correct. An escape that is not valid percent-encoding is
+  refused by name at the first call on that chain, with the value never printed.
+* **This variable is therefore a secret.** Nothing prints a value from it: the boot line reports
+  `endpoint: true/false` per chain and not the URL, and a map that will not parse is redacted to
+  `//***:***@host` before the diagnostic is truncated. `env.ts` `redactUserinfo` is that rule, and
+  `env.test.ts` pins it.
+
+This is why `URL.origin` alone was not enough. `origin` is scheme, host and port — it discards the
+userinfo — so a client built on it sent no credential and every Litecoin call was answered 401,
+against a node that was up, synced and reachable the whole time.
+
 **Taproot destinations are refused on both chains.** `bitcoinjs-lib` routes witness version 1
 through `p2tr`, which throws without `initEccLib`, and nothing in this estate calls it — not this
 service, which has no secp256k1 package, and not custody, which has one it never initialises. So a

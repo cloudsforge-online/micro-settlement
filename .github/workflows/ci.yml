@@ -186,11 +186,33 @@ jobs:
       # guarantees it is that every chain call in every test goes through `fakeNode`, an in-memory
       # node — so the check is that no test constructs the real transport. `rpcFactory` is the only
       # thing in this repository that can open a socket to a chain.
+      #
+      # ONE FILE IS ADMITTED, AND IT IS ADMITTED WITH A CONDITION RATHER THAN WITH TRUST.
+      # `src/registry.test.ts` is the suite for that transport — it exists because `rpcFactory`
+      # built its client with `baseUrl: parsed.origin`, `URL.origin` discards the userinfo, and
+      # every Bitcoin/Litecoin/Dogecoin Core call therefore went out with no `Authorization` header
+      # and came back 401. A suite that could not name the function could not have caught that, and
+      # a suite that asserts on a stubbed `HttpClient` proves only that it agrees with itself: the
+      # defect WAS a disagreement between this repository and the transport underneath it.
+      #
+      # The condition is `RpcOptions.fetch`. A factory built on an injected fetch has no socket to
+      # open, so every line of that file naming `rpcFactory` must be a comment, the import, or a
+      # construction that injects one ON THE SAME LINE. Splitting the call across lines fails this
+      # on purpose — a per-occurrence check a line break defeats is not a check — and the file says
+      # so where the factory is built.
       # ────────────────────────────────────────────────────────────────────────────────────────
       - name: 'AD — no test can reach a real network'
         run: |
-          if grep -rn 'rpcFactory' src/*.test.ts; then
+          if grep -rn 'rpcFactory' src/*.test.ts | grep -vE '^src/registry\.test\.ts:'; then
             echo '::error::a test builds the real RPC transport; chain calls go through fakeNode'
+            exit 1
+          fi
+          # Comments are stripped first: six guards in this estate have fired on their own prose.
+          if grep -n 'rpcFactory' src/registry.test.ts \
+             | grep -vE '^[0-9]+:[[:space:]]*(//|\*|/\*)' \
+             | grep -vF "from './registry.ts'" \
+             | grep -v 'fetch'; then
+            echo '::error::registry.test.ts builds a transport without injecting a fetch on that line'
             exit 1
           fi
           if grep -rnE 'https?://' src/*.test.ts | grep -vE '127\.0\.0\.1|localhost|//wallet/|//identity'; then
