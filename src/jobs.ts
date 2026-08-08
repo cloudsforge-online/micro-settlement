@@ -339,6 +339,13 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       if (outcome.kind === 'registered') {
         deps.metrics.increment('settlement_treasury_registrations_total', { chain })
       }
+      // A row that was watched on an earlier pass and booked on this one. Counted separately
+      // because it means the previous pass got half way — the address was in the aggregate and had
+      // no ledger position, which is the window the incident happened in — and an operator wants
+      // to know that happened at all, not just that it has stopped.
+      if (outcome.kind === 'booked') {
+        deps.metrics.increment('settlement_treasury_openings_deferred_total', { chain })
+      }
     } catch (err) {
       deps.metrics.increment('settlement_treasury_registrations_failed_total', { chain })
       deps.logger.error(

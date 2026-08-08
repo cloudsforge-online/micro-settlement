@@ -642,6 +642,99 @@ export const MIGRATIONS: readonly Migration[] = [
         for each row execute function settlement_sweep_source_erasure_is_final();
     `,
   },
+  {
+    version: 10,
+    name: 'treasury-opening-balance',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- REGISTERING AN ADDRESS AND BOOKING IT ARE ONE OPERATION, AND MIGRATION 7 ONLY DID THE
+      -- FIRST HALF.
+      --
+      -- Migration 7 closed a real defect — swept coin was invisible to the solvency check — and
+      -- closed it correctly. What it did not consider is stated in its own function's header, as a
+      -- FEATURE: "registering an address that has been accumulating swept coin for months makes
+      -- its ENTIRE balance visible on the very next observation — there is no history to replay."
+      --
+      -- The entire balance includes float the ledger has never booked. The reconciliation compares
+      -- the ledger's custody total against the indexer's aggregate, so an address whose balance
+      -- joins one side and not the other is drift, and EMBER has no tolerance entry, which means
+      -- ZERO and not infinity (ledger/src/env.ts). One wei freezes every withdrawal in the asset.
+      --
+      -- On 2026-08-05 the ember/mainnet treasury was pinned at 12:39:37 and registered at 12:40:11
+      -- holding 25.000021 EMBER of platform float. Reconciliation went to
+      -- drift -25000020999999996000 and froze. Every EMBER withdrawal in the estate was refused
+      -- for three days while the platform held MORE coin than it owed. An invented insolvency.
+      -- micro-org#247 is the incident; #248 is this.
+      --
+      -- ── WHAT IS BOOKED, AND WHY IT IS NOT THE DRIFT ─────────────────────────────────────────
+      --
+      -- The address's OWN measured balance, debited to (custody, ASSET, available) and credited to
+      -- (platform, ASSET, treasury) equity — platform float is real coin the platform controls
+      -- with no customer behind it, so it belongs on the asset side with an equity counterpart,
+      -- exactly as 'engagementAccount' reasons for the platform's earmarked money.
+      --
+      -- Booking THE DRIFT instead would be one line shorter and catastrophic: the drift is an
+      -- aggregate that a genuine shortfall also moves, so a service that books it makes the estate
+      -- paper over the exact loss the check exists to find. Booking a specific address's measured
+      -- balance is a MEASUREMENT — if the books were already wrong before registration they stay
+      -- wrong afterwards, and the freeze still fires for the real reason.
+      --
+      -- ── WHY THE AMOUNT AND THE ENTRY ID ARE BOTH STORED ─────────────────────────────────────
+      --
+      -- 'opening_entry_id' is what makes registration complete: the recurring job retries until it
+      -- is present, so a crash between watching and booking heals rather than leaving a watched,
+      -- unbooked address — which is the incident with extra steps. 'opening_amount' is what an
+      -- operator standing in front of a freeze needs in order to answer "was this address booked,
+      -- and for how much" without reading the ledger, and 'opening_observed_block' is the height
+      -- the indexer measured it at, so the two numbers can be compared against one another rather
+      -- than taken on trust.
+      alter table treasuries add column if not exists opening_amount          numeric(78,0);
+      alter table treasuries add column if not exists opening_entry_id        text;
+      alter table treasuries add column if not exists opening_observed_block  bigint;
+      alter table treasuries add column if not exists opening_booked_at       timestamptz;
+
+      -- ── THE BACK-FILL, WHICH IS THE DANGEROUS PART OF THIS MIGRATION ────────────────────────
+      --
+      -- ember/mainnet is ALREADY registered and its float has ALREADY been booked, by hand, as a
+      -- 'reconciliation_correction' on 2026-08-08 that took custody from 99979000000004000 to
+      -- 25100000000000000000 and lifted the freeze. Without this statement the new code would find
+      -- 'opening_booked_at is null' on that row and book the treasury a SECOND time — 25.1 EMBER
+      -- of custody that no coin backs, drift in the opposite direction, and the same asset frozen
+      -- again by the fix for the freeze.
+      --
+      -- The predicate is 'indexer_watched_key is not null': a row this service has successfully
+      -- registered is one whose balance the aggregate has already been counting, so whatever
+      -- reconciliation state exists for it is the state an operator has already settled. Rows that
+      -- were never registered are left null and take the new path, which is what should happen.
+      --
+      -- 'opening_amount' and 'opening_entry_id' stay NULL for these rows on purpose. They are not
+      -- known here, and inventing them would put a number in a column an operator reads as
+      -- measured. The null says "booked before this column existed, look in the ledger", which is
+      -- true, and 'opening_booked_at' carries the timestamp that makes it findable.
+      update treasuries
+         set opening_booked_at = coalesce(indexer_watched_at, now())
+       where indexer_watched_key is not null
+         and opening_booked_at is null;
+
+      -- The job's access path for outstanding work, partial for the reason migration 7's is: in a
+      -- healthy estate this index is empty and the query touches nothing.
+      create index if not exists treasuries_unbooked_idx
+        on treasuries (chain, network)
+        where opening_booked_at is null;
+
+      -- An amount without a booking is a half-written row, and a booking is never negative. Stated
+      -- at the database because the alternative is trusting that every future path writes all four
+      -- columns together, and the cost of one that does not is a treasury the estate believes is
+      -- booked and is not.
+      alter table treasuries
+        add constraint treasury_opening_is_whole
+        check (
+          (opening_amount is null or opening_amount >= 0)
+          and (opening_amount is null or opening_booked_at is not null)
+          and (opening_entry_id is null or opening_booked_at is not null)
+        );
+    `,
+  },
 ]
 
 /**

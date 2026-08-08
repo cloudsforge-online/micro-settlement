@@ -514,6 +514,16 @@ export interface FakeIndexer extends IndexerClient {
   readonly watched: readonly { readonly chain: string; readonly network: string; readonly address: string; readonly label: string }[]
   /** Refuse the next `watch`, as a missing `indexer:write` grant or an outage would. */
   setWatchFails(value: boolean): void
+  /**
+   * What the indexer will say one address holds. Absent means it REFUSES, not that it holds zero.
+   *
+   * That distinction is the file under test one repository over: a zero booked as an opening
+   * balance is a permanent understatement of custody, so an indexer that cannot answer must
+   * produce an unavailability and not a number.
+   */
+  setBalance(address: string, balance: bigint): void
+  /** Every address whose balance was read, in order. Asserts the measure-before-watch ordering. */
+  readonly measured: readonly string[]
 }
 
 /**
@@ -525,13 +535,35 @@ export function fakeIndexer(): FakeIndexer {
   const known = new Map<string, IndexedTransaction>()
   const asked: string[] = []
   const watched: { chain: string; network: string; address: string; label: string }[] = []
+  const measured: string[] = []
+  const balances = new Map<string, bigint>()
   let unavailable = false
   let watchFails = false
   return {
     asked,
     watched,
+    measured,
     setWatchFails(value) {
       watchFails = value
+    },
+    setBalance(address, balance) {
+      balances.set(address.toLowerCase(), balance)
+    },
+    async custodyBalance(_chain, _network, address) {
+      measured.push(address)
+      const balance = balances.get(address.toLowerCase())
+      if (balance === undefined) {
+        // Absent is a REFUSAL, never a zero — the same line the real indexer holds. A test that
+        // forgets to arm a balance gets an outage, which is the honest thing for it to get.
+        const { IndexerUnavailableError } = await import('./indexerclient.ts')
+        throw new IndexerUnavailableError(`the fake indexer has no balance armed for ${address}`)
+      }
+      return {
+        balance,
+        observedAtBlock: 41,
+        observedAtBlockHash: `0x${'ab'.repeat(32)}`,
+        requiredConfirmations: 60,
+      }
     },
     async watch(chain, network, address, label) {
       if (watchFails) {
@@ -785,7 +817,7 @@ export function harness(sql: postgres.Sql, options: HarnessOptions = {}): Harnes
     },
     withdrawals: { ...treasuries, producer: 'settlement' },
     treasuries,
-    treasuryWatch: { ...treasuries, indexer, logger },
+    treasuryWatch: { ...treasuries, indexer, ledger, producer: 'settlement', logger },
   }
 }
 
