@@ -580,6 +580,16 @@ export async function registerTreasuryWithIndexer(
     // The DISPLAY form, exactly as custody published it. The indexer canonicalises for itself, and
     // sending the lowercase comparison key would put a spelling into `watched_addresses` that no
     // operator comparing it against custody's pin would recognise.
+    //
+    // NO `freshlyDerived` CLAIM, AND THERE NEVER CAN BE ONE HERE. On a UTXO chain the indexer
+    // derives custody balances from its own walked record and needs a registrar's statement that
+    // the address had no activity below some height before it will call the derivation a balance
+    // (micro-org#252). A treasury address is PINNED by an operator, not minted by this service:
+    // it may be years old and may have been receiving coin the whole time, so this service knows
+    // nothing about its past and must not invent a floor for it. Where the indexer's record does
+    // not reach back far enough, the honest outcome is its `history_unknown` refusal and an
+    // operator supplying `historyFromHeight` deliberately — which is also why STEP 1 above can
+    // refuse on a cold-started UTXO chain, since it measures this address before it is watched.
     await deps.indexer.watch(chain, network, treasury.address, label)
 
     // Written only AFTER the call returned. `watch` throws on every failure precisely so this line
