@@ -88,6 +88,27 @@ export function custodyAccount(assetCode: LedgerAssetCode): AccountRef {
   return { subject: 'custody', assetCode, purpose: 'available', type: 'asset' }
 }
 
+/**
+ * The platform's own float — coin it controls with no customer behind it.
+ *
+ * `(platform, <asset>, treasury)` and `equity`, which is the chart's own slot: `ledger/src/accounts.ts`
+ * states it as "`platform` is revenue under `fees`, equity under `treasury` and expense under
+ * `payout_due`", and `engagementAccount` (contracts-money) reasons for the same shape one subject
+ * over — "the platform's own money earmarked, not revenue and not a user liability".
+ *
+ * **Not a liability, and the distinction is the whole of the incident.** The tempting reading of
+ * the solvency invariant is "customer liabilities should equal the chain's balance", and following
+ * it means either booking the treasury float as something owed to a customer (it is not) or
+ * leaving it unbooked (which froze EMBER for three days). It is an asset with an equity
+ * counterpart, on both sides of the same journal entry.
+ *
+ * Exported so the suite asserts the key rather than re-spelling it. A second spelling is a second
+ * account, which is the quietest way to split one balance in half.
+ */
+export function treasuryEquityAccount(assetCode: LedgerAssetCode): AccountRef {
+  return { subject: 'platform', assetCode, purpose: 'treasury', type: 'equity' }
+}
+
 export interface FeeDeps {
   readonly sql: Db
   readonly ledger: LedgerClient

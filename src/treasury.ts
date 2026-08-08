@@ -31,10 +31,12 @@
 
 import { parseAmount, type Network } from '@cloudsforge/contracts-chain'
 import type { Logger } from '@cloudsforge/telemetry'
-import { chainKey, custodyChainOf, custodyFamilyOf, type ChainId } from './chains.ts'
+import { assetOf, chainKey, custodyChainOf, custodyFamilyOf, type ChainId } from './chains.ts'
 import { chainFor } from './registry.ts'
 import type { CustodyClient } from './custodyclient.ts'
+import { custodyAccount, treasuryEquityAccount } from './fees.ts'
 import { treasuryLabel, type IndexerClient } from './indexerclient.ts'
+import type { LedgerClient } from './ledgerclient.ts'
 import type { Db, Tx } from './outbox.ts'
 
 /**
@@ -78,6 +80,20 @@ export interface Treasury {
    * `null` if it never has. See migration 7 on why this is a key and not a timestamp.
    */
   readonly indexerWatchedKey: string | null
+  /**
+   * When this address's on-chain float was given a position in the ledger, or `null` if it never
+   * has been.
+   *
+   * **Registration is not complete until this is set.** Watching an address without booking it
+   * raises the indexer's custody aggregate with nothing on the ledger side to match, which is
+   * drift, and EMBER reconciles at zero tolerance — one wei freezes every withdrawal in the asset.
+   * That is not a hazard, it is the incident of 2026-08-05 (micro-org#247).
+   */
+  readonly openingBookedAt: Date | null
+  /** What was booked, in smallest units. Null on rows back-filled by migration 10 — see it. */
+  readonly openingAmount: bigint | null
+  /** The ledger entry that booked it. Null likewise, and for the same rows. */
+  readonly openingEntryId: string | null
 }
 
 interface TreasuryRow {
@@ -92,7 +108,22 @@ interface TreasuryRow {
   readonly custody_order_id: string
   readonly pinned_at: Date | null
   readonly indexer_watched_key: string | null
+  readonly opening_booked_at: Date | null
+  /** `numeric(78,0)`, selected as text. See `toTreasury` for why it is never a JS number. */
+  readonly opening_amount: string | null
+  readonly opening_entry_id: string | null
 }
+
+/**
+ * The columns every read of this table selects, in one place.
+ *
+ * `opening_amount::text` is not a stylistic choice. `numeric` arrives from the driver as a JS
+ * number unless it is cast, and an 18-decimal balance does not survive one — the digits a float
+ * drops are exactly the digits a reconciliation drift is made of.
+ */
+const TREASURY_COLUMNS = `id, chain, network, address, address_key, custody_chain, custody_family,
+       custody_user_id, custody_order_id, pinned_at, indexer_watched_key,
+       opening_booked_at, opening_amount::text as opening_amount, opening_entry_id`
 
 function toTreasury(row: TreasuryRow): Treasury {
   return {
@@ -107,6 +138,9 @@ function toTreasury(row: TreasuryRow): Treasury {
     custodyOrderId: row.custody_order_id,
     pinnedAt: row.pinned_at,
     indexerWatchedKey: row.indexer_watched_key,
+    openingBookedAt: row.opening_booked_at,
+    openingAmount: row.opening_amount === null ? null : BigInt(row.opening_amount),
+    openingEntryId: row.opening_entry_id,
   }
 }
 
@@ -149,6 +183,50 @@ export class TreasuryDisagreementError extends Error {
   }
 }
 
+/**
+ * The treasury is watched by the indexer but its float has no position in the ledger yet.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **WHY THIS REFUSES A SWEEP AND NOT A WITHDRAWAL.**
+ *
+ * A sweep moves customer coin from a deposit address into the treasury. Both addresses are in the
+ * indexer's custody set, so the aggregate does not move and the sweep is invariant-neutral — as
+ * long as the treasury's own float is already accounted for. In the window between `indexer.watch`
+ * and the opening entry it is not, and a sweep landing in that window inflates the treasury's
+ * measured balance with coin that IS already booked against the deposit address it came from. The
+ * opening entry would then book it a second time, and the estate would believe it holds more coin
+ * than exists — which reconciles to drift in the direction that looks like a customer surplus and
+ * is really a double count.
+ *
+ * A WITHDRAWAL is not refused, and must not be. Payouts are the estate's whole purpose, the
+ * treasury is the only address they can be paid from, and paying one out of an unbooked treasury
+ * is arithmetically harmless: it lowers both the chain balance and the ledger's custody total by
+ * the same amount, and the opening entry that lands afterwards measures whatever is left. Refusing
+ * withdrawals here would turn a bookkeeping gap into the exact payments outage this whole change
+ * exists to prevent.
+ *
+ * The window is seconds in practice and closes on the next pass of a leased job, so this is a
+ * refusal an operator should essentially never see. If they do, it means the indexer is reachable
+ * for `watch` and not for the balance read, or the ledger is refusing the entry — both of which
+ * are named in the recurring job's log.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export class TreasuryNotBookedError extends Error {
+  readonly chain: ChainId
+  readonly network: Network
+  constructor(chain: ChainId, network: Network, address: string) {
+    super(
+      `the ${chain} ${network} treasury (${address}) is registered with the indexer but its ` +
+        'opening balance has not been booked to the ledger yet, so a sweep landing now would be ' +
+        'counted twice when it is. The treasury-watch job books it on its next pass and nothing ' +
+        'needs to be done by hand; if this persists, that job is failing and says why.',
+    )
+    this.name = 'TreasuryNotBookedError'
+    this.chain = chain
+    this.network = network
+  }
+}
+
 export interface TreasuryDeps {
   readonly sql: Db
   readonly custody: CustodyClient
@@ -162,8 +240,7 @@ export async function findTreasury(
   network: Network,
 ): Promise<Treasury | null> {
   const rows = await sql<TreasuryRow[]>`
-    select id, chain, network, address, address_key, custody_chain, custody_family,
-           custody_user_id, custody_order_id, pinned_at, indexer_watched_key
+    select ${sql.unsafe(TREASURY_COLUMNS)}
       from treasuries where chain = ${chain} and network = ${network}
   `
   const row = rows[0]
@@ -172,8 +249,7 @@ export async function findTreasury(
 
 export async function listTreasuries(sql: Db): Promise<readonly Treasury[]> {
   const rows = await sql<TreasuryRow[]>`
-    select id, chain, network, address, address_key, custody_chain, custody_family,
-           custody_user_id, custody_order_id, pinned_at, indexer_watched_key
+    select ${sql.unsafe(TREASURY_COLUMNS)}
       from treasuries order by chain, network
   `
   return rows.map(toTreasury)
@@ -287,6 +363,13 @@ export async function assertSweepable(
   if (adapter.addressKey(pin) !== treasury.addressKey) {
     throw new TreasuryDisagreementError(chain, network, treasury.address, pin)
   }
+  // Watched but not yet booked — see `TreasuryNotBookedError` for why a sweep in that window is
+  // the one operation that would be counted twice. Conditioned on `indexerWatchedKey`, not on the
+  // booking alone: a treasury nobody has registered yet is not in the aggregate at all, so a sweep
+  // into it is invariant-neutral in the old way and there is nothing to double count.
+  if (treasury.indexerWatchedKey !== null && treasury.openingBookedAt === null) {
+    throw new TreasuryNotBookedError(chain, network, treasury.address)
+  }
   return { treasury, pin }
 }
 
@@ -296,11 +379,33 @@ export async function assertSweepable(
 
 export interface TreasuryWatchDeps extends TreasuryDeps {
   readonly indexer: IndexerClient
+  readonly ledger: LedgerClient
+  /** The `actor` on the entry this posts — `service:<producer>`, as `bookFee` spells it. */
+  readonly producer: string
   readonly logger: Logger
 }
 
 export type TreasuryWatchOutcome =
-  | { readonly kind: 'registered'; readonly address: string; readonly label: string }
+  | {
+      readonly kind: 'registered'
+      readonly address: string
+      readonly label: string
+      /**
+       * What the opening entry booked, in smallest units. `0n` when the address held nothing, and
+       * NULL when no opening was owed at all — a rotation onto a row that is already booked. The
+       * two are different facts and collapsing them into `0n` would hide the second.
+       */
+      readonly openingAmount: bigint | null
+      /** Null when the balance was zero, or when no opening was owed. */
+      readonly openingEntryId: string | null
+    }
+  /** Watched already, but the opening entry was outstanding and has now been posted. */
+  | {
+      readonly kind: 'booked'
+      readonly address: string
+      readonly openingAmount: bigint
+      readonly openingEntryId: string | null
+    }
   | { readonly kind: 'already_registered'; readonly address: string }
   | { readonly kind: 'no_treasury' }
 
@@ -356,6 +461,76 @@ export type TreasuryWatchOutcome =
  * next pass. **The old one is never un-watched**, and that is deliberate too — it is still an
  * address the platform holds, it may still hold dust, and removing it from the set would recreate
  * this very defect for whatever is left on it.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ## Correction, 2026-08-08: registering was only half the operation, and the missing half froze
+ * ## the asset for three days
+ *
+ * Everything above is still true and none of it was the wrong thing to do. What it did not
+ * consider is the sentence it advertises as a feature two paragraphs up: *"registering an address
+ * that has been accumulating swept coin for months makes its **entire** balance visible on the
+ * very next observation — there is no history to replay."*
+ *
+ * The entire balance includes float the ledger has never booked. `ember/mainnet` was pinned at
+ * 2026-08-05 12:39:37 and registered at 12:40:11 holding 25.000021 EMBER of platform float —
+ * 24.1 in the treasury itself and 0.900021 stranded in an unswept deposit address, because the
+ * withdrawal that day was paid out of the treasury. The aggregate rose by all of it. The ledger's
+ * custody total did not move, because nothing had ever booked platform float as anything. EMBER
+ * has no tolerance entry, which `ledger/src/env.ts` is explicit means ZERO and not infinity, so
+ * reconciliation recorded `drift -25000020999999996000` and froze the asset. **Every EMBER
+ * withdrawal in the estate was refused for three days while the platform held MORE coin than it
+ * owed.** An invented insolvency. micro-org#247 is the incident and the manual repair; #248 is
+ * this.
+ *
+ * `deploy/scripts/ember-seed.js` had predicted it, in as many words: *"Watching it would add its
+ * balance to one side of that comparison and nothing to the other, and every reconciliation from
+ * then on would record a non-zero drift and FREEZE EMBER — an invented insolvency."* The seeder
+ * honoured its own warning by leaving the faucet float unregistered. That workaround is available
+ * to a seed script and NOT to this service, which must register the treasury: sweeps move customer
+ * coin into it, and an unwatched treasury on a swept estate hides the very loss reconciliation
+ * exists to catch. Both halves of that argument are in migration 7.
+ *
+ * So the repair is not to watch less. It is to make watching and booking ONE operation:
+ *
+ *   1. Ask the INDEXER what the address holds, before watching it. Not this service's own adapter
+ *      — see `IndexerClient.custodyBalance` for why a read at `latest` books the wrong number.
+ *   2. Watch it.
+ *   3. Post one entry: debit `(custody, ASSET, available)`, credit `(platform, ASSET, treasury)`.
+ *   4. Record the entry on the row. **Registration is not complete until step 4**, and this job
+ *      runs again until it is — which is what makes a crash between 2 and 3 heal rather than
+ *      reproduce the incident.
+ *
+ * **The amount is the address's own measured balance and never "the drift".** This is the design's
+ * whole safety property and it is worth being blunt about: the drift is an aggregate that a
+ * GENUINE shortfall also moves, so a service that books the drift makes the estate paper over the
+ * exact loss the check exists to find. A measurement of one named address is a measurement — if
+ * the books were already wrong before registration they are still wrong afterwards, and the freeze
+ * still fires, for the real reason.
+ *
+ * **A zero balance is booked as nothing, not as a zero-amount entry.** The ledger refuses a
+ * posting of zero and it is right to: an entry that moves nothing is a row that says something
+ * happened when it did not. The row is still marked booked, because it was: the correct opening
+ * position for an address holding nothing is no position.
+ *
+ * ## An opening is owed ONCE PER TREASURY ROW, and a rotation is not owed a second one
+ *
+ * The tempting reading of "book what you start watching" is that it applies per ADDRESS, and it is
+ * wrong here in the one case that involves the most money. A rotation's documented middle step is
+ * *move the balance* (`provisionTreasury`, `allowRotation`), so the coin at the new address came
+ * out of the old one — an address the aggregate already counted and the ledger already booked.
+ * Booking the new address's balance too would credit the same coin twice: the aggregate is
+ * unchanged by the move (both addresses are watched, the old one is never un-watched) while the
+ * ledger's custody total doubles. That is a NEGATIVE drift of the entire float, and it freezes the
+ * asset exactly as the original defect did, only from the other side and with a wrong number
+ * standing in the books.
+ *
+ * So the condition on measuring and booking is `opening_booked_at is null`, on the ROW, and a
+ * rotation onto a booked row watches the new address and posts nothing. The residual case — an
+ * operator who rotates onto an address funded from OUTSIDE the estate rather than from the old
+ * treasury — is deliberately not handled here: it is not the documented procedure, the shortfall it
+ * produces is the safe direction, and reconciliation will refuse to be clean until an operator
+ * posts a `reconciliation_correction` naming what they actually did. Guessing on their behalf is
+ * how a bookkeeping service invents money.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 export async function registerTreasuryWithIndexer(
@@ -374,33 +549,155 @@ export async function registerTreasuryWithIndexer(
     throw err
   }
 
-  if (treasury.indexerWatchedKey === treasury.addressKey) {
+  const watched = treasury.indexerWatchedKey === treasury.addressKey
+  const owesOpening = treasury.openingBookedAt === null
+  if (watched && !owesOpening) {
     return { kind: 'already_registered', address: treasury.address }
   }
 
-  const label = treasuryLabel(chain, network)
-  // The DISPLAY form, exactly as custody published it. The indexer canonicalises for itself, and
-  // sending the lowercase comparison key would put a spelling into `watched_addresses` that no
-  // operator comparing it against custody's pin would recognise.
-  await deps.indexer.watch(chain, network, treasury.address, label)
+  // ── STEP 1: MEASURE FIRST, AND MEASURE BEFORE WATCHING ────────────────────────────────────────
+  //
+  // The order matters in one direction only, and it is this one. Watching first and measuring
+  // second leaves a window in which the aggregate counts this address and the ledger does not, and
+  // that window is the incident. Measuring first and failing to watch leaves nothing behind: no
+  // row is written, the aggregate is unchanged, and the job tries again.
+  //
+  // The reading is the INDEXER's, at the indexer's confirmation depth, against a block hash it
+  // proved before and after. See `custodyBalance` — a reading of our own at `latest` would count
+  // coin the aggregate will not count for another 60 blocks, and book the ledger high by exactly
+  // that.
+  //
+  // Skipped entirely when the row is already booked, which is the rotation case. Not measuring is
+  // the point: see the header. It also means a rotation does not fail on an indexer outage, since
+  // there is nothing it needs the indexer to tell it.
+  const observed = owesOpening
+    ? await deps.indexer.custodyBalance(chain, network, treasury.address)
+    : null
 
-  // Written only AFTER the call returned. `watch` throws on every failure precisely so this line is
-  // unreachable unless the indexer really did accept it — a row that recorded the attempt would
-  // report an invisible treasury as registered, which is the defect wearing the fix's clothes.
+  const label = treasuryLabel(chain, network)
+  if (!watched) {
+    // ── STEP 2 ────────────────────────────────────────────────────────────────────────────────
+    // The DISPLAY form, exactly as custody published it. The indexer canonicalises for itself, and
+    // sending the lowercase comparison key would put a spelling into `watched_addresses` that no
+    // operator comparing it against custody's pin would recognise.
+    await deps.indexer.watch(chain, network, treasury.address, label)
+
+    // Written only AFTER the call returned. `watch` throws on every failure precisely so this line
+    // is unreachable unless the indexer really did accept it — a row that recorded the attempt
+    // would report an invisible treasury as registered, which is the defect wearing the fix's
+    // clothes.
+    await deps.sql`
+      update treasuries
+         set indexer_watched_key = ${treasury.addressKey},
+             indexer_watched_at = now(),
+             updated_at = now()
+       where id = ${treasury.id}
+    `
+    deps.logger.info('treasury registered with the indexer custody set', {
+      chain,
+      network,
+      address: treasury.address,
+      label,
+    })
+  }
+
+  // A rotation onto a row that is already booked. The new address is now watched, which is the
+  // whole of what it needed; the coin at it was booked when the OLD address was registered.
+  if (observed === null) {
+    return {
+      kind: 'registered',
+      address: treasury.address,
+      label,
+      openingAmount: null,
+      openingEntryId: null,
+    }
+  }
+
+  // ── STEP 3: BOOK IT ───────────────────────────────────────────────────────────────────────────
+  const assetCode = assetOf(chain)
+  let entryId: string | null = null
+  if (observed.balance > 0n) {
+    const entry = await deps.ledger.postEntry({
+      // NOT `deposit_credited` — nobody deposited this and no customer is owed it. NOT
+      // `treasury_spend` — nothing was spent. `reconciliation_correction` is the kind the estate
+      // already used for exactly this by hand on 2026-08-08, and it is deliberately outside
+      // `WITHDRAWAL_KINDS`, so this entry posts even while the asset is FROZEN. That matters more
+      // than the naming: if a freeze could block the entry that lifts it, the first deployment of
+      // this code into a frozen estate would be unable to repair the estate it was written for.
+      kind: 'reconciliation_correction',
+      actor: `service:${deps.producer}`,
+      correlationId: treasury.id,
+      // Derived from the ADDRESS KEY, not the row id, so a retry after a lost response replays
+      // rather than double-posting — `bookFee`'s rule, on the address rather than the transaction.
+      //
+      // It is the address key and not the row id for a second reason that no longer applies, and
+      // the difference is worth keeping visible: the first draft let a ROTATION post its own
+      // opening entry, and keyed on the row that entry would have replayed the old one instead. It
+      // does not post one at all now — see the header on why booking a rotation double-books the
+      // float — so both spellings would behave identically today. The address key stays because it
+      // is the narrower claim: this entry is the opening of THIS address, and nothing else.
+      idempotencyKey: `settlement:treasury-opening:${chain}:${network}:${treasury.addressKey}`,
+      description:
+        `opening balance of the ${chain} ${network} treasury ${treasury.address}, measured by ` +
+        `the indexer at block ${observed.observedAtBlock} (${observed.requiredConfirmations} ` +
+        'confirmations deep) as it was registered with the custody set',
+      postings: [
+        // Debit custody: this is real coin the platform controls, and the custody total is the
+        // ledger side of the solvency comparison the indexer's aggregate is the chain side of.
+        {
+          direction: 'debit',
+          amount: observed.balance,
+          assetCode,
+          sequence: 1,
+          account: custodyAccount(assetCode),
+        },
+        // Credit platform equity: nobody is owed it. Booking this as a liability would say a
+        // customer could withdraw the float, which is the mirror-image error and the one that
+        // produces a real shortfall rather than an imaginary one.
+        {
+          direction: 'credit',
+          amount: observed.balance,
+          assetCode,
+          sequence: 2,
+          account: treasuryEquityAccount(assetCode),
+        },
+      ],
+    })
+    entryId = entry.id
+  }
+
+  // ── STEP 4: REGISTRATION IS COMPLETE ─────────────────────────────────────────────────────────
+  //
+  // `where opening_booked_at is null` so a replayed post cannot overwrite a different entry's id
+  // onto a row that is already booked — the same conditional `bookFee` uses, and for the same
+  // reason.
   await deps.sql`
     update treasuries
-       set indexer_watched_key = ${treasury.addressKey},
-           indexer_watched_at = now(),
+       set opening_amount = ${observed.balance.toString()},
+           opening_entry_id = ${entryId},
+           opening_observed_block = ${observed.observedAtBlock},
+           opening_booked_at = now(),
            updated_at = now()
-     where id = ${treasury.id}
+     where id = ${treasury.id} and opening_booked_at is null
   `
-  deps.logger.info('treasury registered with the indexer custody set', {
+  deps.logger.info('treasury opening balance booked', {
     chain,
     network,
     address: treasury.address,
-    label,
+    amount: observed.balance.toString(),
+    observedAtBlock: observed.observedAtBlock,
+    entryId,
   })
-  return { kind: 'registered', address: treasury.address, label }
+
+  return watched
+    ? { kind: 'booked', address: treasury.address, openingAmount: observed.balance, openingEntryId: entryId }
+    : {
+        kind: 'registered',
+        address: treasury.address,
+        label,
+        openingAmount: observed.balance,
+        openingEntryId: entryId,
+      }
 }
 
 /**

@@ -113,6 +113,43 @@ export interface IndexerClient {
    * able to tell "registered" from "tried", because it writes the former down.
    */
   watch(chain: ChainId, network: Network, address: string, label: string): Promise<void>
+  /**
+   * What the indexer will count for one address, measured the way it will count it.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THIS SERVICE DOES NOT MEASURE CHAIN BALANCES FOR THE LEDGER, AND THAT IS THE POINT.**
+   *
+   * It has an adapter that could: `chainFor(chain).spendableBalance(...)` is one call away and
+   * reads `eth_getBalance` at `latest`. Using it here would be wrong in a way that is invisible
+   * until it freezes an asset. The indexer's aggregate reads at `head − confirmations + 1` — 60
+   * blocks deep on EMBER — so a balance read at `latest` includes coin the aggregate will not
+   * count for another fifteen minutes. Book that number and the ledger is high by exactly the
+   * recent arrivals, and a zero-tolerance asset refuses every withdrawal until someone works out
+   * why. `spendableBalance` is also not even the same QUESTION on two families: Solana subtracts
+   * the rent-exempt minimum and Bitcoin sums confirmed UTXOs, and neither is what the aggregate
+   * sums.
+   *
+   * So the amount booked is not this service's opinion about the chain. It is the reconciler's own
+   * measurement, at the reconciler's own depth, against a block hash the reconciler proved before
+   * and after reading — asked for by name, one address at a time.
+   *
+   * **Throws rather than returning null.** There is no absence here: an account always has a
+   * balance, so an indexer that will not state one has told us nothing, and nothing is not zero. A
+   * zero booked as an opening balance is a permanent understatement of custody that no later run
+   * can detect, which is the incident this whole path exists to prevent, inverted.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  custodyBalance(chain: ChainId, network: Network, address: string): Promise<ObservedBalance>
+}
+
+/** One address as the indexer's custody arithmetic sees it. */
+export interface ObservedBalance {
+  /** Smallest units. Parsed from the decimal string the indexer sends, never from a JSON number. */
+  readonly balance: bigint
+  /** The height it was read at. Recorded beside the booking so the two can be compared later. */
+  readonly observedAtBlock: number
+  readonly observedAtBlockHash: string
+  readonly requiredConfirmations: number
 }
 
 export interface IndexerClientOptions {
@@ -162,6 +199,52 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
         // treasury is still invisible to the custody aggregate, and the caller must not record it
         // as registered. It retries on the next pass of a leased job.
         throw new IndexerUnavailableError(err instanceof Error ? err.message : String(err))
+      }
+    },
+
+    async custodyBalance(chain, network, address) {
+      let answer: {
+        balance?: unknown
+        observedAtBlock?: unknown
+        observedAtBlockHash?: unknown
+        requiredConfirmations?: unknown
+      }
+      try {
+        answer = await client.get(
+          `/v1/custody/${chain}/${network}/addresses/${encodeURIComponent(address)}`,
+        )
+      } catch (err) {
+        // No 404 case, deliberately, and it is the same argument the indexer's own route makes: a
+        // 404 read as "this address holds nothing" is a zero wearing a status code, and a zero
+        // booked here is a permanent understatement. Every failure is an unavailability, the
+        // caller does not book, does not mark the registration complete, and the leased job
+        // retries.
+        throw new IndexerUnavailableError(err instanceof Error ? err.message : String(err))
+      }
+
+      // Parsed, not trusted. `balance` is a decimal STRING because an 18-decimal amount does not
+      // survive a JSON number — and the digits a float drops are precisely the digits a drift is
+      // made of. `BigInt('')` is `0n`, which is why the shape is checked before it is converted:
+      // an empty string arriving here would otherwise become a zero opening balance.
+      const raw = answer.balance
+      if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
+        throw new IndexerUnavailableError(
+          `the indexer answered a balance for ${address} that is not a decimal string: ${JSON.stringify(raw)}`,
+        )
+      }
+      const height = answer.observedAtBlock
+      const hash = answer.observedAtBlockHash
+      if (typeof height !== 'number' || typeof hash !== 'string') {
+        throw new IndexerUnavailableError(
+          `the indexer answered a balance for ${address} with no height it was read at`,
+        )
+      }
+      return {
+        balance: BigInt(raw),
+        observedAtBlock: height,
+        observedAtBlockHash: hash,
+        requiredConfirmations:
+          typeof answer.requiredConfirmations === 'number' ? answer.requiredConfirmations : 0,
       }
     },
   }

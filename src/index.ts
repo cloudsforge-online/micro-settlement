@@ -273,7 +273,16 @@ registerHandlers(runner, {
   // What makes swept coin visible to the platform's solvency check. Built from `treasuries` rather
   // than from `sweeps`, because the treasury must be registered whether or not `SWEEP_ENABLED` is
   // set: it is the address every withdrawal is paid from either way.
-  treasuryWatch: { ...treasuries, indexer, logger: logger.child({ component: 'treasury-watch' }) },
+  // `ledger` and `producer` because registering an address and booking it are one operation — an
+  // address the indexer counts and the ledger does not is drift, and EMBER reconciles at zero
+  // tolerance. See the correction in `registerTreasuryWithIndexer`.
+  treasuryWatch: {
+    ...treasuries,
+    indexer,
+    ledger,
+    producer: SERVICE,
+    logger: logger.child({ component: 'treasury-watch' }),
+  },
 })
 await seedRecurring(queue, env.network)
 runner.start()
