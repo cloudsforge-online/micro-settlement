@@ -53,6 +53,12 @@ logger.info('starting', {
   network: env.network,
   // Said at boot rather than discovered from a refused withdrawal an hour later. A chain with an
   // adapter but no endpoint is the failure most likely to be a deploy mistake.
+  //
+  // `Boolean(...)` IS THE WHOLE LINE'S SAFETY AND IT IS NOT AN ABBREVIATION. A UTXO endpoint is
+  // `http://rpcuser:rpcpassword@host:8332` — Core has no anonymous JSON-RPC — so the value here is
+  // a credential, and this line is emitted on every start of every replica. Report that an
+  // endpoint exists; never report which one. `redactUserinfo` in env.ts is the same rule at the
+  // only other place a raw entry from this map could have reached a log.
   chains: implementedChains().map((chain) => ({ chain, endpoint: Boolean(env.rpcUrls[chain]) })),
 })
 

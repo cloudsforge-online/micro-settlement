@@ -241,6 +241,46 @@ describe('loadEnv', () => {
     assert.equal(env.rpcUrls['ember'], 'http://127.0.0.1:8545')
   })
 
+  /**
+   * **The RPC map is a secret file, and the branch that explains a parse failure used to print it.**
+   *
+   * Bitcoin, Litecoin and Dogecoin Core authenticate JSON-RPC with HTTP Basic and have no
+   * anonymous mode, so a UTXO endpoint carries `rpcuser:rpcpassword@` in its userinfo and this
+   * variable holds a password. `registry.ts` now reads that userinfo and sends it as an
+   * `Authorization` header; until it did, every Litecoin call took a 401.
+   *
+   * The leak is a one-character deploy mistake away: a trailing comma does not parse, `jsonMap`
+   * echoed the head of the raw value to say so, and `fatalConfig` writes that message to stderr as
+   * the process dies. A container that cannot start restarts, so the password would be in the
+   * collector as many times as the orchestrator retried — and a password in a log store is a
+   * credential rotation on every node in the estate, not a redeploy.
+   *
+   * The value below is deliberately longer than the sixty-character slice, so this also pins the
+   * ORDER: redact, then truncate. Slicing first cuts mid-userinfo about half the time and leaves a
+   * fragment the pattern no longer matches, which would make the truncation itself the leak.
+   */
+  it('never echoes the userinfo of an RPC endpoint when the map will not parse', () => {
+    const raw = '{"ltc":"http://rpcuser:PLAINTEXT-NODE-PASSWORD@127.0.0.1:9332","btc":,}'
+    assert.throws(
+      () => loadEnv({ ...BASE, SETTLEMENT_RPC_URLS: raw }),
+      (err: unknown) => {
+        assert.ok(err instanceof EnvError)
+        // It still names the variable and still shows the shape of what would not parse, because
+        // an unexplained refusal to start is the failure this branch exists to prevent.
+        assert.match(err.message, /SETTLEMENT_RPC_URLS must be a JSON object/)
+        assert.match(err.message, /\/\/\*\*\*:\*\*\*@127\.0\.0\.1:9332/)
+        assert.equal(err.message.includes('PLAINTEXT-NODE-PASSWORD'), false)
+        assert.equal(err.message.includes('rpcuser'), false)
+        return true
+      },
+    )
+    // A map with no userinfo in it is untouched: the redaction must not eat a legible diagnosis.
+    assert.throws(
+      () => loadEnv({ ...BASE, SETTLEMENT_RPC_URLS: '{"ember":"http://127.0.0.1:8545",}' }),
+      /got \{"ember":"http:\/\/127\.0\.0\.1:8545",\}/,
+    )
+  })
+
   it('refuses a network that is neither mainnet nor testnet', () => {
     assert.throws(() => loadEnv({ ...BASE, SETTLEMENT_NETWORK: 'devnet' }), /mainnet or testnet/)
   })
