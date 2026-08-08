@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/settlement",
-  "version": "2.4.0",
+  "version": "2.5.2",
   "private": true,
   "description": "The outbound chain service. Treasuries, sweeps, outbound transaction building, signing requests, broadcast, confirmation tracking and stuck adjudication. One in-flight outbound transaction per chain per network, by construction.",
   "license": "MIT",
