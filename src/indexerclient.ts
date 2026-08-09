@@ -111,8 +111,24 @@ export interface IndexerClient {
    * **Throws rather than returning a status.** A registration that silently failed is a treasury
    * the aggregate cannot see, which is the defect this method exists to close; the caller must be
    * able to tell "registered" from "tried", because it writes the former down.
+   *
+   * `freshlyDerived` is a STATEMENT ABOUT THE ADDRESS'S PAST and the caller must be entitled to
+   * make it: "nothing can have paid this, because it did not exist until a moment ago". On a UTXO
+   * chain the indexer will not call a derived balance a balance without one (micro-org#252), and
+   * without a balance the treasury can be neither registered nor booked. `treasury.ts` holds the
+   * rule for when this service is entitled — only for an address it minted through custody itself
+   * — and it is `false` here by default so that reaching for it has to be deliberate.
+   *
+   * A boolean and not a height: the indexer resolves it against its own canonical tip, which is
+   * the only height comparable with the record its derivation reads.
    */
-  watch(chain: ChainId, network: Network, address: string, label: string): Promise<void>
+  watch(
+    chain: ChainId,
+    network: Network,
+    address: string,
+    label: string,
+    freshlyDerived?: boolean,
+  ): Promise<void>
   /**
    * What the indexer will count for one address, measured the way it will count it.
    *
@@ -183,14 +199,23 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
       }
     },
 
-    async watch(chain, network, address, label) {
+    async watch(chain, network, address, label, freshlyDerived = false) {
       try {
         await client.request(`/v1/watch/${chain}/${network}/${encodeURIComponent(address)}`, {
           method: 'POST',
-          body: { label },
+          // The key is OMITTED rather than sent as `false`. The indexer reads
+          // `body['freshlyDerived'] === true`, so the two spellings behave identically today — but
+          // the field is a claim, and a request that carries `freshlyDerived: false` reads in a
+          // capture as this service having considered the question and answered no about an
+          // address it simply knows nothing about. Absent is the accurate spelling of "no claim".
+          body: freshlyDerived ? { label, freshlyDerived: true } : { label },
           // An upsert on the far side, so a retry is a no-op rather than a second row. Supplied
           // because `HttpClient` will not retry a POST without one, and this POST is idempotent by
           // construction — the whole request is derived from the pin.
+          //
+          // The claim is deliberately NOT in the key. A retry of a claimed registration must reach
+          // the same stored row as the original, and the far side keeps the LOWEST claim either
+          // call made (`watchAddress`, `least`), so a repeat can only ever leave it where it was.
           idempotencyKey: `settlement:watch:${chain}:${network}:${address.toLowerCase()}`,
         })
       } catch (err) {

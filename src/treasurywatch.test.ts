@@ -122,7 +122,16 @@ describe('registering the treasury with the indexer', () => {
 
     assert.equal(outcome.kind, 'registered')
     assert.deepEqual([...deps.indexer.watched], [
-      { chain: 'ember', network: 'testnet', address: TREASURY, label: 'treasury:ember:testnet' },
+      {
+        chain: 'ember',
+        network: 'testnet',
+        address: TREASURY,
+        label: 'treasury:ember:testnet',
+        // An ADOPTED pin, so no claim about its past travels with it. Asserted in the whole-object
+        // comparison rather than separately so that a future edit which starts claiming here has to
+        // change this line and read the sentence above it.
+        freshlyDerived: false,
+      },
     ])
     // The DISPLAY form custody published, not the lowercase comparison key. An operator reading
     // `watched_addresses` beside a freeze compares it against custody's pin by eye.
@@ -455,6 +464,131 @@ describe('the treasury opening balance', () => {
     assert.equal(deps.ledger.keys.length, 2, 'the second pass did not attempt a post at all')
     assert.equal(deps.ledger.entries.length, 1, 'the same opening was booked twice')
     assert.equal((await findTreasury(deps.sql, 'ember', 'testnet'))?.openingEntryId, 'entry-1')
+  })
+})
+
+/**
+ * The chain the indexer walked from a cold-start height, which is every UTXO chain this estate has.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * On such a chain the indexer refuses a custody balance for an address nobody has stated a history
+ * floor for, because coin received below the first block it walked would be invisible and missing
+ * from the total (micro-org#252). An unwatched address has stated nothing. So measure-then-watch —
+ * correct everywhere else in this file, and the order the incident of 2026-08-05 demands — asks
+ * about an address that is unclaimed by construction and is refused on every pass, for ever.
+ *
+ * Measured, not theorised: `ltc/mainnet` was provisioned on 2026-08-09 at 00:29:39 against an
+ * indexer whose LTC record starts at block 3154639, and every pass until an operator watched the
+ * address by hand logged a 503. `indexer_watched_key` and `opening_booked_at` stayed null the whole
+ * time, which is the treasury invisible to the solvency check — the state this file exists to end.
+ *
+ * The distinction that resolves it is not about the chain, it is about WHO DERIVED THE ADDRESS.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+describe('a treasury on a chain the indexer walked from a cold start', () => {
+  it('DEADLOCKS on an ADOPTED pin, and that refusal is the honest answer rather than a defect', { skip }, async () => {
+    // This case is asserted so that the fix below cannot be widened into it by a later edit. This
+    // service knows NOTHING about an address an operator pinned: it may be years old and may have
+    // been receiving coin the whole time. Claiming a floor for it would tell the indexer to derive
+    // a balance over history nobody walked, and the number that comes back would be an
+    // understatement of custody wearing a measurement's clothes.
+    const custody = fakeCustody()
+    custody.pin('ember', 'testnet', TREASURY)
+    const deps = armed(harness(sql, { custody }))
+    deps.indexer.setColdStarted(true)
+
+    await assert.rejects(() => registerTreasuryWithIndexer(deps.treasuryWatch, 'ember', 'testnet'))
+    await assert.rejects(() => registerTreasuryWithIndexer(deps.treasuryWatch, 'ember', 'testnet'))
+
+    assert.equal(deps.indexer.watched.length, 0, 'an adopted pin was registered with a claim')
+    const row = await findTreasury(deps.sql, 'ember', 'testnet')
+    assert.equal(row?.derivedHereKey, null, 'adoption recorded a derivation that never happened')
+    assert.equal(row?.indexerWatchedKey, null)
+    assert.equal(row?.openingBookedAt, null)
+    // The operator's move from here is `historyFromHeight` on the indexer's watch route. There is
+    // deliberately no way to reach it from this service, because the statement is theirs to make.
+  })
+
+  it('THE FIX: a treasury this service MINTED registers and books, because it may claim the past', { skip }, async () => {
+    // `provisionTreasury` mints the key through custody in the same call that pins it, so here —
+    // and only here — this service is the party that derived the address, and "nothing can have
+    // paid an address that did not exist" is a statement it is entitled to make.
+    const custody = fakeCustody({ mint: TREASURY })
+    const deps = armed(harness(sql, { custody }), 0n)
+    deps.indexer.setColdStarted(true)
+
+    await provisionTreasury(deps.treasuries, {
+      chain: 'ember',
+      network: 'testnet',
+      operatorToken: OPERATOR,
+      allowRotation: false,
+    })
+    const provisioned = await findTreasury(deps.sql, 'ember', 'testnet')
+    assert.equal(provisioned?.derivedHereKey, provisioned?.addressKey)
+
+    const outcome = await registerTreasuryWithIndexer(deps.treasuryWatch, 'ember', 'testnet')
+
+    assert.equal(outcome.kind, 'registered')
+    assert.equal(deps.indexer.watched.length, 1)
+    assert.equal(deps.indexer.watched[0]?.freshlyDerived, true, 'the claim that lifts the refusal was not sent')
+    // The whole point of the reversal. The fake refuses a balance for an address that carries no
+    // claim, so a measurement recorded at all is proof the watch went first.
+    assert.deepEqual([...deps.indexer.measured], [TREASURY])
+    const row = await findTreasury(deps.sql, 'ember', 'testnet')
+    assert.equal(row?.indexerWatchedKey, row?.addressKey)
+    assert.notEqual(row?.openingBookedAt, null, 'the treasury is watched and still owes an opening')
+    // Zero, and booked as no entry rather than as an entry of zero: a freshly derived address holds
+    // nothing, and the ledger is right to refuse a posting that moves nothing.
+    assert.equal(row?.openingAmount, 0n)
+    assert.equal(deps.ledger.entries.length, 0)
+  })
+
+  it('sends a ROTATION’s claim about the NEW address only, never the address it replaced', { skip }, async () => {
+    // The reason the column holds a KEY and not a flag. A rotation overwrites `address_key` in
+    // place, so a boolean set when the FIRST address was minted would still read true for whatever
+    // the row holds afterwards — a claim about the past of an address the claim was never about.
+    // Written as a key, the recorded fact has to agree with the current `address_key` before it
+    // means anything, and an address this service did not derive can never borrow the agreement.
+    const custody = fakeCustody({ mint: TREASURY })
+    const deps = armed(harness(sql, { custody }), 0n)
+    deps.indexer.setColdStarted(true)
+
+    await provisionTreasury(deps.treasuries, {
+      chain: 'ember',
+      network: 'testnet',
+      operatorToken: OPERATOR,
+      allowRotation: false,
+    })
+    await registerTreasuryWithIndexer(deps.treasuryWatch, 'ember', 'testnet')
+    const first = await findTreasury(deps.sql, 'ember', 'testnet')
+
+    // The rotation, spelled the way an operator actually reaches it. `provisionTreasury` short
+    // circuits while the pin still agrees with the row, so the pin has to move first — here by
+    // being removed, which is what retiring a compromised key looks like from custody's side.
+    // Then, and only with `allowRotation`, a NEW key is minted and pinned. This is the service's
+    // only path onto a different treasury address: `requireTreasury` refuses to adopt a pin that
+    // disagrees with a row it already holds, so a rotation always mints and the new key is always
+    // one this service derived.
+    custody.unpin('ember', 'testnet')
+    custody.setMint(ROTATED)
+    await provisionTreasury(deps.treasuries, {
+      chain: 'ember',
+      network: 'testnet',
+      operatorToken: OPERATOR,
+      allowRotation: true,
+    })
+    const rotated = await registerTreasuryWithIndexer(deps.treasuryWatch, 'ember', 'testnet')
+
+    assert.equal(rotated.kind, 'registered')
+    assert.equal(deps.indexer.watched.length, 2)
+    assert.equal(deps.indexer.watched[1]?.address, ROTATED)
+    assert.equal(deps.indexer.watched[1]?.freshlyDerived, true)
+    const row = await findTreasury(deps.sql, 'ember', 'testnet')
+    // Moved with the address rather than kept alongside it. The old key is GONE, which is what
+    // makes the column safe: were a later path to rotate onto an address nobody derived here, this
+    // would be null and the watch would carry no claim, instead of inheriting one.
+    assert.equal(row?.derivedHereKey, row?.addressKey)
+    assert.notEqual(row?.derivedHereKey, first?.addressKey)
   })
 })
 

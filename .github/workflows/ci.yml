@@ -30,7 +30,10 @@ on:
     # `feat/**` builds too, for the same reason `release/**` does: a change that has to be proved
     # on testnet before it merges needs a published image to deploy, and the estate deploys images
     # rather than source. Mainnet is unaffected — it pins a version tag.
-    branches: [main, 'release/**', 'feat/**']
+    # `fix/**` builds for exactly the same reason, and the omission was an accident of naming
+    # rather than a policy: a fix is the change most likely to need proving on a live estate
+    # before it merges, because it is the one written in response to something that already broke.
+    branches: [main, 'release/**', 'feat/**', 'fix/**']
   pull_request:
 
 permissions:
@@ -243,11 +246,16 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────────────────────────
   publish:
     needs: [estate, controls]
-    # A green push to main and nothing else. An image tag a release manifest pins has to name
-    # something that passed, on the branch it will be deployed from.
+    # A green push, and only from a branch something is deployed from. An image tag a release
+    # manifest pins has to name something that passed, on the branch it will be deployed from —
+    # and a work branch that has to be proved on a live estate before it merges needs the same
+    # thing for the same reason, which is why `feat/**` and `fix/**` publish too. Their tags carry
+    # the branch name, so nothing a release manifest pins can be reached by them.
     if: >-
       github.event_name == 'push' && (github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/heads/release/'))
+      startsWith(github.ref, 'refs/heads/release/') ||
+      startsWith(github.ref, 'refs/heads/feat/') ||
+      startsWith(github.ref, 'refs/heads/fix/'))
     uses: cloudsforge-online/micro-org/.github/workflows/publish-image.yml@main
     with:
       kind: service

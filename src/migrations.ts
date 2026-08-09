@@ -735,6 +735,62 @@ export const MIGRATIONS: readonly Migration[] = [
         );
     `,
   },
+  {
+    version: 11,
+    name: 'treasury-derived-here',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- WHICH TREASURY ADDRESSES THIS SERVICE DERIVED ITSELF, WHICH IS THE ONLY CASE WHERE IT MAY
+      -- STATE ANYTHING ABOUT THEIR PAST.
+      --
+      -- 'registerTreasuryWithIndexer' measures the address's balance BEFORE watching it, and that
+      -- order is right: watching first leaves a window in which the indexer's custody aggregate
+      -- counts the address and the ledger does not, which is drift, which freezes the asset — the
+      -- incident migration 10 exists for. But on a UTXO chain the indexer derives a custody
+      -- balance from its OWN walked record and refuses an address nobody has claimed a history
+      -- floor for, because coin received below the first block it walked would be invisible and
+      -- missing from the total (micro-org#252, 'indexer/src/custody.ts' on 'history_unknown').
+      -- An unwatched address has made no claim. So on a chain walked from a cold-start height the
+      -- measurement refuses, the watch never happens, and the job retries for ever.
+      --
+      -- Measured on mainnet on 2026-08-09. ltc/mainnet was provisioned at 00:29:39; the indexer's
+      -- LTC record starts at block 3154639; every pass of 'treasury.watch' from then until
+      -- 00:44 logged 'IndexerUnavailableError: GET /v1/custody/ltc/mainnet/addresses/ltc1qswwly0…
+      -- → 503'. The treasury could not be registered or booked at all without an operator watching
+      -- it by hand, and an unregistered treasury is exactly the invisible-to-solvency state
+      -- migration 7 was written to end.
+      --
+      -- ── WHY A NEW COLUMN AND NOT A LOOSER CLAIM ─────────────────────────────────────────────
+      --
+      -- The indexer accepts 'freshlyDerived: true' from a registrar that has JUST DERIVED THE KEY,
+      -- because nothing can have paid an address that did not exist. 'treasury.ts' said in as many
+      -- words that this service can never make that claim — "a treasury address is PINNED by an
+      -- operator, not minted by this service: it may be years old" — and for an ADOPTED pin that
+      -- is still exactly true and this migration does not change it.
+      --
+      -- It is not true of 'provisionTreasury', which mints the address through custody in the same
+      -- call that pins it. There this service IS the party that derived the key, and it is the
+      -- only party that can say so. The column records WHICH address that was, as an address_key
+      -- and not a boolean, for migration 7's reason: a later rotation onto an address an operator
+      -- pinned from elsewhere must not inherit a claim that was made about a different key. The
+      -- comparison is 'derived_here_key = address_key' and a rotation simply fails it.
+      --
+      -- Null everywhere on arrival, including on rows this service really did mint before this
+      -- column existed. That is deliberate: the fact was not recorded at the time and cannot be
+      -- reconstructed from anything in this database, so back-filling it would be a guess wearing
+      -- a measurement's clothes. The consequence of the null is the old behaviour — an operator
+      -- states 'historyFromHeight' by hand — which is where those rows already are.
+      alter table treasuries add column if not exists derived_here_key text;
+
+      -- A claim about a key this row no longer holds is not evidence, but it is also not a fault:
+      -- a rotation legitimately leaves the old key behind here. So this is not a foreign key onto
+      -- 'address_key' and there is no constraint tying them together; the read compares them and
+      -- treats a mismatch as no claim, which is what 'indexer_watched_key' already does.
+      -- One string literal and not a concatenation: 'comment on' takes a string CONSTANT, and
+      -- Postgres refuses '…' || '…' here with a syntax error at the first pipe.
+      comment on column treasuries.derived_here_key is 'The address_key this service derived through custody itself, in the provision call that pinned it. Equal to address_key means this service may tell the indexer freshlyDerived; anything else, including null, means it may not.';
+    `,
+  },
 ]
 
 /**

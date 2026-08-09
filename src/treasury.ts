@@ -81,6 +81,16 @@ export interface Treasury {
    */
   readonly indexerWatchedKey: string | null
   /**
+   * The `addressKey` this service derived through custody ITSELF, in the `provisionTreasury` call
+   * that pinned it — or `null` for a pin it adopted, which is most of them.
+   *
+   * It is the whole of this service's entitlement to tell the indexer `freshlyDerived`, and it is
+   * a key rather than a flag so that a rotation onto an operator-supplied address cannot inherit a
+   * claim that was made about a different one. See migration 11, and `registerTreasuryWithIndexer`
+   * for what the claim buys.
+   */
+  readonly derivedHereKey: string | null
+  /**
    * When this address's on-chain float was given a position in the ledger, or `null` if it never
    * has been.
    *
@@ -108,6 +118,7 @@ interface TreasuryRow {
   readonly custody_order_id: string
   readonly pinned_at: Date | null
   readonly indexer_watched_key: string | null
+  readonly derived_here_key: string | null
   readonly opening_booked_at: Date | null
   /** `numeric(78,0)`, selected as text. See `toTreasury` for why it is never a JS number. */
   readonly opening_amount: string | null
@@ -122,7 +133,7 @@ interface TreasuryRow {
  * drops are exactly the digits a reconciliation drift is made of.
  */
 const TREASURY_COLUMNS = `id, chain, network, address, address_key, custody_chain, custody_family,
-       custody_user_id, custody_order_id, pinned_at, indexer_watched_key,
+       custody_user_id, custody_order_id, pinned_at, indexer_watched_key, derived_here_key,
        opening_booked_at, opening_amount::text as opening_amount, opening_entry_id`
 
 function toTreasury(row: TreasuryRow): Treasury {
@@ -138,6 +149,7 @@ function toTreasury(row: TreasuryRow): Treasury {
     custodyOrderId: row.custody_order_id,
     pinnedAt: row.pinned_at,
     indexerWatchedKey: row.indexer_watched_key,
+    derivedHereKey: row.derived_here_key,
     openingBookedAt: row.opening_booked_at,
     openingAmount: row.opening_amount === null ? null : BigInt(row.opening_amount),
     openingEntryId: row.opening_entry_id,
@@ -267,6 +279,13 @@ async function upsertTreasury(
   chain: ChainId,
   network: Network,
   address: string,
+  /**
+   * True only when the CALLER derived this key through custody in the same breath — which is
+   * `provisionTreasury` and nothing else. Every other path here is adopting a pin whose past this
+   * service knows nothing about, and the default says so. See migration 11 for what the recorded
+   * fact is later allowed to claim.
+   */
+  derivedHere = false,
 ): Promise<void> {
   const adapter = chainFor(chain)
   const binding = treasuryBinding(chain, network)
@@ -274,18 +293,27 @@ async function upsertTreasury(
   // character, so what is stored must be what it published — but what is COMPARED is the lowercase
   // key, because the same account has three valid spellings.
   const display = adapter.canonicalise(address)
+  const addressKey = adapter.addressKey(address)
+  const derivedKey = derivedHere ? addressKey : null
   await sql`
     insert into treasuries (
       chain, network, address, address_key,
-      custody_chain, custody_family, custody_user_id, custody_order_id, pinned_at
+      custody_chain, custody_family, custody_user_id, custody_order_id, pinned_at,
+      derived_here_key
     ) values (
-      ${chain}, ${network}, ${display}, ${adapter.addressKey(address)},
+      ${chain}, ${network}, ${display}, ${addressKey},
       ${custodyChainOf(chain)}, ${custodyFamilyOf(chain)},
-      ${binding.userId}, ${binding.orderId}, now()
+      ${binding.userId}, ${binding.orderId}, now(),
+      ${derivedKey}
     )
     on conflict (chain, network) do update
       set address = excluded.address,
           address_key = excluded.address_key,
+          -- Overwritten rather than coalesced, and on a ROTATION that means the previous key's
+          -- claim is DROPPED, which is the point: the old claim was about an address this row no
+          -- longer holds. An adoption writing null here is therefore the correct loss of a claim
+          -- and not the loss of a fact — nobody derived the new key here.
+          derived_here_key = excluded.derived_here_key,
           pinned_at = now(),
           updated_at = now()
       -- Only when the pin has actually MOVED. Without the predicate every call rewrites the row,
@@ -555,6 +583,50 @@ export async function registerTreasuryWithIndexer(
     return { kind: 'already_registered', address: treasury.address }
   }
 
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // WHICH OF THE TWO ORDERS THIS PASS USES, AND WHY THERE HAS TO BE A SECOND ONE.
+  //
+  // The order below is MEASURE, THEN WATCH, and everything after this block assumes it. It is the
+  // right order for a pin this service ADOPTED and it deadlocks for one it MINTED, on a UTXO chain
+  // the indexer walked from a cold-start height rather than from genesis:
+  //
+  //   * the indexer derives a UTXO custody balance from its own walked record, and refuses an
+  //     address for which nobody has stated a height below which it had no activity, because coin
+  //     received below the first block walked would be invisible and missing from the total
+  //     (micro-org#252, `indexer/src/custody.ts` on `history_unknown`);
+  //   * an UNWATCHED address has made no such statement, there being no row to hold one;
+  //   * so measuring before watching asks about an address that is, by construction, unclaimed —
+  //     and gets a refusal, on every pass, for ever.
+  //
+  // Measured on mainnet: `ltc/mainnet` was provisioned on 2026-08-09 at 00:29:39 against an
+  // indexer whose LTC record starts at block 3154639, and every pass from then until an operator
+  // intervened at 00:44 logged `IndexerUnavailableError … → 503`. Neither `indexer_watched_key`
+  // nor `opening_booked_at` was ever written. An unregistered treasury is invisible to the custody
+  // aggregate, which is the state migration 7 exists to end.
+  //
+  // The escape is not to measure differently. It is that for an address THIS SERVICE DERIVED there
+  // is a true statement available — nothing can have paid an address that did not exist — and the
+  // indexer accepts exactly that statement, from exactly that party, as `freshlyDerived: true`.
+  // Making it requires the address to be watched first, because the claim is stored ON the watch.
+  //
+  // Reversing the order is safe HERE and nowhere else. The reason measure-first exists is the
+  // window in which the aggregate counts an address the ledger has not booked — the 2026-08-05
+  // incident — and that window is a hazard only if the address can hold coin. This one cannot: it
+  // was derived moments ago, has never been pinned before this provisioning, and has never been
+  // published to anybody. So the window is real in the code and empty in fact, and the alternative
+  // to standing in it is not registering the treasury at all.
+  //
+  // The residual, stated plainly rather than hidden: coin that reached the address between custody
+  // deriving it and this pass watching it, IF the indexer walked that block without recording this
+  // address, stays invisible — to the aggregate and to the opening balance alike, since both read
+  // the same walked record. Invisible on both sides is not drift and does not freeze anything; it
+  // is an under-observed treasury, which is precisely the state the row is in today and strictly
+  // less of it. Nothing here can invent coin, because the sum only ever counts outputs that were
+  // actually walked.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  const derivedHere = treasury.derivedHereKey === treasury.addressKey
+  const label = treasuryLabel(chain, network)
+
   // ── STEP 1: MEASURE FIRST, AND MEASURE BEFORE WATCHING ────────────────────────────────────────
   //
   // The order matters in one direction only, and it is this one. Watching first and measuring
@@ -570,27 +642,33 @@ export async function registerTreasuryWithIndexer(
   // Skipped entirely when the row is already booked, which is the rotation case. Not measuring is
   // the point: see the header. It also means a rotation does not fail on an indexer outage, since
   // there is nothing it needs the indexer to tell it.
-  const observed = owesOpening
+  //
+  // Also skipped, for now, on the derived-here path above — not because the measurement is
+  // unwanted there but because it cannot succeed yet. It is taken immediately after the watch
+  // instead, which is the same measurement against the same record, one round trip later.
+  const measureFirst = owesOpening && !(derivedHere && !watched)
+  let observed = measureFirst
     ? await deps.indexer.custodyBalance(chain, network, treasury.address)
     : null
 
-  const label = treasuryLabel(chain, network)
   if (!watched) {
     // ── STEP 2 ────────────────────────────────────────────────────────────────────────────────
     // The DISPLAY form, exactly as custody published it. The indexer canonicalises for itself, and
     // sending the lowercase comparison key would put a spelling into `watched_addresses` that no
     // operator comparing it against custody's pin would recognise.
     //
-    // NO `freshlyDerived` CLAIM, AND THERE NEVER CAN BE ONE HERE. On a UTXO chain the indexer
-    // derives custody balances from its own walked record and needs a registrar's statement that
-    // the address had no activity below some height before it will call the derivation a balance
-    // (micro-org#252). A treasury address is PINNED by an operator, not minted by this service:
-    // it may be years old and may have been receiving coin the whole time, so this service knows
-    // nothing about its past and must not invent a floor for it. Where the indexer's record does
-    // not reach back far enough, the honest outcome is its `history_unknown` refusal and an
-    // operator supplying `historyFromHeight` deliberately — which is also why STEP 1 above can
-    // refuse on a cold-started UTXO chain, since it measures this address before it is watched.
-    await deps.indexer.watch(chain, network, treasury.address, label)
+    // `freshlyDerived` IS THE CLAIM ONLY WHEN THIS SERVICE DERIVED THE KEY, which `derived_here_key`
+    // records and `provisionTreasury` is the only writer of. For an ADOPTED pin the original text
+    // here still holds word for word: a treasury address pinned by an operator may be years old and
+    // may have been receiving coin the whole time, this service knows nothing about its past and
+    // must not invent a floor for it, and the honest outcome on a cold-started chain is the
+    // indexer's `history_unknown` refusal with an operator supplying `historyFromHeight`
+    // deliberately.
+    //
+    // A boolean and not a height, because the indexer resolves it against ITS OWN canonical tip —
+    // the only height comparable with the record the derivation reads. A number sent from here
+    // would be a claim about a chain this service does not follow.
+    await deps.indexer.watch(chain, network, treasury.address, label, derivedHere)
 
     // Written only AFTER the call returned. `watch` throws on every failure precisely so this line
     // is unreachable unless the indexer really did accept it — a row that recorded the attempt
@@ -608,7 +686,23 @@ export async function registerTreasuryWithIndexer(
       network,
       address: treasury.address,
       label,
+      freshlyDerived: derivedHere,
     })
+
+    // ── STEP 1, DEFERRED ──────────────────────────────────────────────────────────────────────
+    // The derived-here path's measurement, taken now that the claim exists for the indexer to
+    // derive against. It is deliberately the SAME call, so the opening is booked from the
+    // indexer's reading at the indexer's depth on both paths and there is no second notion of
+    // what this address holds.
+    //
+    // A failure here leaves the row watched and unbooked, which is the half-registered state the
+    // job already retries out of: `opening_booked_at` is still null, the next pass finds
+    // `watched === true` and `owesOpening === true`, and takes the measurement again. That path
+    // is not new — it is the same one a crash between STEP 2 and STEP 3 has always produced, and
+    // `settlement_treasury_openings_deferred_total` is the counter that was added for it.
+    if (owesOpening && observed === null) {
+      observed = await deps.indexer.custodyBalance(chain, network, treasury.address)
+    }
   }
 
   // A rotation onto a row that is already booked. The new address is now watched, which is the
@@ -765,7 +859,21 @@ export async function provisionTreasury(
     candidate.address,
     input.operatorToken,
   )
-  await upsertTreasury(deps.sql, chain, network, pinResult.address)
+  // ── `derivedHere: true`, AND IT COVERS THE REUSED CANDIDATE TOO ─────────────────────────────
+  //
+  // The claim this records is "no party has ever been in a position to pay this address", and
+  // custody's mint route makes it true on both of its answers. A fresh derivation is obvious. A
+  // REUSED one — `candidate.reused`, custody returning an outstanding candidate it derived on an
+  // earlier call rather than burning a key — is an address that was never pinned, so nothing has
+  // ever swept to it, and was never published, so nothing outside custody's administrator surface
+  // has ever seen it. Withholding the claim from that case would be worse than useless: it is
+  // exactly the case a caller reaches by retrying after a crash between minting and pinning, and
+  // it would leave the retry with the deadlock the first attempt was trying to escape.
+  //
+  // Recorded here and nowhere else. `requireTreasury`'s adoption path calls `upsertTreasury` with
+  // the default, which is `false`, because an adopted pin is an address this service has never
+  // seen the derivation of.
+  await upsertTreasury(deps.sql, chain, network, pinResult.address, true)
   const treasury = await findTreasury(deps.sql, chain, network)
   if (!treasury) throw new Error(`the ${chain} ${network} treasury vanished immediately after pinning`)
   return {
