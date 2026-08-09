@@ -53,6 +53,29 @@ import { solanaChain } from './solana.ts'
 const CHAINS: Readonly<Record<ChainId, OutboundChain>> = Object.freeze({
   ember: evmChain('ember'),
   eth: evmChain('eth'),
+  /*
+   * **ETHEREUM CLASSIC NEEDED NO GAS CODE, AND THAT IS A FINDING RATHER THAN AN ASSUMPTION.**
+   *
+   * contracts-chain says ETC "did not adopt London … there is no base fee, no `maxFeePerGas`, and
+   * the effective gas price is the one that was signed", and puts it on EMBER's side of that line
+   * rather than ETH's. Checked against what this adapter actually builds instead of taken on
+   * trust: `evm.ts` has only ever produced `type: 0` with a `gasPrice`, for `ember` AND for `eth`,
+   * because Ember's node has no type-2 decoder and Ethereum still accepts legacy transactions. One
+   * shape already served both, and it is exactly the shape ETC requires — so the pre-London
+   * property that would have been a blocker on a 1559-only builder costs nothing here.
+   *
+   * What the chain argument does buy is `assertChainId`, which holds the node to the 61/63 the
+   * contract declares before anything is signed, and the 7,500-confirmation depth that `statusOf`
+   * reads through `chainSpec`. Neither is restated here.
+   *
+   * **NO ENDPOINT IS CONFIGURED FOR IT AND NONE SHOULD BE.** The estate runs no Ethereum Classic
+   * node; `SETTLEMENT_RPC_URLS` has no `etc` key in any manifest, so every call on this chain ends
+   * at `NoEndpointError`, which is classified and refunded at the deadline. The adapter being
+   * capable and the deployment being pointed at a node are two decisions, and only the first is
+   * made here. The other half — custody holds no Ethereum Classic keys at all — is written up on
+   * `CUSTODY_CHAIN` in `chains.ts`.
+   */
+  etc: evmChain('etc'),
   btc: bitcoinChain('btc'),
   /*
    * **LITECOIN IS THE SAME ADAPTER AND NOT THE SAME PARAMETERS**, and the argument it is given is
@@ -64,6 +87,43 @@ const CHAINS: Readonly<Record<ChainId, OutboundChain>> = Object.freeze({
    * same JSON-RPC, so unlike XRP the gap was never the protocol, only the parameters.
    */
   ltc: bitcoinChain('ltc'),
+  /*
+   * **DOGECOIN IS BITCOIN-FAMILY AND IS NOT `bitcoinChain('doge')`. THE ONE-WORD EDIT IS THE BUG.**
+   *
+   * `chains.test.ts` says of Litecoin that "a chain can be added here with a one-word edit, and the
+   * one-word edit is what would have shipped Bitcoin's parameters under Litecoin's name". Dogecoin
+   * is the case where the one-word edit does not even have that excuse: `family: 'bitcoin'` in
+   * contracts-chain is true of its RPC and its transaction structure, and false of the only thing
+   * this adapter needs.
+   *
+   * **Dogecoin has no segwit.** Its addresses are base58 only — P2PKH at version byte 0x1e, P2SH at
+   * 0x16 — and this builder is P2WPKH from end to end:
+   *
+   *   * `encodePsbt` adds every input as a `witnessUtxo`. bitcoinjs-lib refuses to sign a
+   *     non-witness script presented that way, so a Dogecoin PSBT built here is unsignable — which
+   *     is the good half, because it fails loudly.
+   *   * `vsizeOf` charges 41 base vbytes plus a 27-vbyte witness per input. A P2PKH input is ~148
+   *     bytes with no witness discount, so the fee this service quoted would be under half the
+   *     transaction's real size: a payment that is built, signed, broadcast and then dropped by
+   *     every node below the relay floor. That one does NOT fail loudly, and it is the reason this
+   *     entry exists rather than a row in `NETWORKS`.
+   *
+   * Custody cannot sign it either, read on 2026-08-09 rather than assumed — the mistake this file's
+   * header records four times over. `CHAIN_ASSET` has no `dogecoin`, `BITCOIN_FAMILY_NETWORKS` has
+   * no Dogecoin parameters, `bitcoinNetwork` throws for it by design and custody's own suite
+   * asserts that it throws, and custody derives P2WPKH and nothing else. So both halves are new
+   * work — a non-segwit build path here and a non-segwit derive-and-sign path there — which is
+   * 29-native-assets.md's "half an integration each", not a configuration change.
+   */
+  doge: unimplementedChain(
+    'doge',
+    'phase 8 — Dogecoin, a UTXO chain with no segwit',
+    'Dogecoin is bitcoin-family and this adapter is P2WPKH from end to end: it commits every input ' +
+      'as a witnessUtxo, which a base58 Dogecoin input cannot be signed as, and it prices vsize ' +
+      'with the witness discount, which would under-quote a Dogecoin fee by more than half and ' +
+      'produce a signed payment no node relays. Custody has no Dogecoin network parameters and ' +
+      'derives P2WPKH only, so the signing half does not exist either.',
+  ),
   sol: solanaChain(),
   xrp: unimplementedChain(
     'xrp',

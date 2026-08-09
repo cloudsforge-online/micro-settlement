@@ -287,4 +287,41 @@ describe('building an EVM transfer', () => {
     )
     assert.equal(node.calls.length, 0)
   })
+
+  /**
+   * **Ethereum Classic is pre-London, and this is the assertion that says so in transaction bytes.**
+   *
+   * ETC never adopted London: it has no base fee, and a node will reject a transaction carrying
+   * `maxFeePerGas` outright rather than ignoring the field. Reusing this builder for it was
+   * therefore a claim about what the builder emits, not a preference — so the claim is pinned here.
+   * If somebody later teaches `evm.ts` to prefer 1559 when the node advertises a base fee (the
+   * obvious optimisation for ETH, and a correct one there), this test fails on ETC before the
+   * change reaches a chain that cannot accept it. The `type` key and the ABSENCE of the 1559 keys
+   * are both asserted, because a builder that added them alongside `gasPrice` would still leave
+   * `type` at 0.
+   */
+  it('builds ETC as legacy, with no 1559 field and against the 63 the contract pins', async () => {
+    const etc = chainFor('etc')
+    const node = fakeNode({ chainId: 63, balances: { [TREASURY.toLowerCase()]: 10n ** 19n } })
+    const unsigned = await etc.build(
+      { network: 'testnet', rpc: node.rpc },
+      { from: TREASURY, to: ALICE, value: 10n ** 17n, fee: TEST_FEE, bounds: TEST_BOUNDS, shape: 'payment' },
+    )
+    const payload = fields(unsigned.payload)
+    assert.equal(payload['type'], 0)
+    assert.equal(payload['chainId'], 63)
+    assert.equal(payload['maxFeePerGas'], undefined)
+    assert.equal(payload['maxPriorityFeePerGas'], undefined)
+    assert.equal(payload['gasPrice'], '40000000000')
+    // And the same chain-id gate as every other EVM chain: a node answering Ethereum's 1 here is
+    // one whose signatures would be replayable on a chain with 12,000 times the value on it.
+    const ethereum = fakeNode({ chainId: 1, balances: { [TREASURY.toLowerCase()]: 10n ** 19n } })
+    await assert.rejects(
+      etc.build(
+        { network: 'testnet', rpc: ethereum.rpc },
+        { from: TREASURY, to: ALICE, value: 1n, fee: TEST_FEE, bounds: TEST_BOUNDS, shape: 'payment' },
+      ),
+      /not the 63 this build is pinned to/,
+    )
+  })
 })

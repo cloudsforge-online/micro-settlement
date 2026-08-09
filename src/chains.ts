@@ -69,7 +69,7 @@ import {
  * `shard` is deliberately absent. SHARD is in `CHAINS` only so that record is total; it never
  * exists on a chain and an outbound transaction for it could only ever be a lie.
  */
-export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp' | 'ltc'
+export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp' | 'ltc' | 'etc' | 'doge'
 
 export const CHAIN_IDS: readonly ChainId[] = Object.freeze([
   'ember',
@@ -78,6 +78,8 @@ export const CHAIN_IDS: readonly ChainId[] = Object.freeze([
   'sol',
   'xrp',
   'ltc',
+  'etc',
+  'doge',
 ])
 
 const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
@@ -87,6 +89,8 @@ const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
   sol: 'SOL',
   xrp: 'XRP',
   ltc: 'LTC',
+  etc: 'ETC',
+  doge: 'DOGE',
 })
 
 const CHAIN_FOR_ASSET: Readonly<Partial<Record<AssetCode, ChainId>>> = Object.freeze({
@@ -96,6 +100,8 @@ const CHAIN_FOR_ASSET: Readonly<Partial<Record<AssetCode, ChainId>>> = Object.fr
   SOL: 'sol',
   XRP: 'xrp',
   LTC: 'ltc',
+  ETC: 'etc',
+  DOGE: 'doge',
 })
 
 export function isChainId(value: string): value is ChainId {
@@ -124,11 +130,11 @@ export function familyOf(chain: ChainId): ChainFamily {
  *
  * Custody's `CHAIN_ASSET` is keyed by chain NAME — `ethereum`, `bitcoin`, `litecoin`, `solana`,
  * `xrp`, `ember` — because those are the values the rows it adopted from forge-keyvault already
- * carry. This service's slug is the asset code lowercased. The two agree on four of six and
- * disagree on exactly two, `eth` versus `ethereum` and `ltc` versus `litecoin`, and each
- * disagreement is a `binding_mismatch` at signing time: custody compares the caller's restated
- * `chain` against the stored row character for character. So the translation is a table with a name
- * rather than a `toLowerCase()` that happens to work for the other four.
+ * carry. This service's slug is the asset code lowercased. The two agree on four of the eight
+ * chains here and disagree on the other four, and each disagreement is a `binding_mismatch` at
+ * signing time: custody compares the caller's restated `chain` against the stored row character for
+ * character. So the translation is a table with a name rather than a `toLowerCase()` that happens
+ * to work for half of it.
  *
  * **`ltc → 'litecoin'` IS THE SECOND ENTRY THAT EARNS THIS TABLE**, and it earns it twice over.
  * Getting it wrong is not a 500: custody resolves the signing parameters from the row's stored
@@ -136,6 +142,29 @@ export function familyOf(chain: ChainId): ChainFamily {
  * expected is refused outright, and — worse — a name that resolved to `'bitcoin'` would sign a
  * Litecoin PSBT with a Bitcoin key. The value here is verified against
  * `custody/src/chains.ts:CHAIN_ASSET`, which spells it `litecoin`.
+ *
+ * ── THE LAST TWO ENTRIES ARE PROPOSALS, AND THIS PARAGRAPH IS WHY THAT IS SAFE ─────────────────
+ *
+ * **Custody names neither Ethereum Classic nor Dogecoin today.** Read on 2026-08-09: its
+ * `CHAIN_ASSET` holds exactly `ethereum`, `bitcoin`, `litecoin`, `solana`, `xrp`, `ember` and the
+ * generic `evm`, and `isKnownChain` is a `hasOwn` over that object — so `/v1/addresses` cannot mint
+ * an ETC or DOGE key at all, and there is no stored row for either name to be compared against.
+ * These two values are therefore what this service WOULD send, not something checked against a row
+ * that exists, and they must be confirmed against custody on the day it grows an entry.
+ *
+ * A name custody does not know is refused, which is the failure this service can afford. The one
+ * that must never be written here is `ethereum` for `etc`: an EVM address is the same 20 bytes on
+ * both chains, so custody would return the Ethereum treasury's address for an ETC pin and the two
+ * positions would be one row in this service's books. The signature itself would still be refused —
+ * `expectedEvmChainId('ethereum')` is 1/11155111 against the 61/63 an ETC payload declares, and
+ * SD-09 gate 3 compares them — but a treasury address is adopted long before anything is signed
+ * with it, and adopting Ethereum's under Ethereum Classic's name is a bookkeeping fault no gate at
+ * signing time can undo. `dogecoin` carries the same rule against `bitcoin`, and there the gate
+ * does not exist: a UTXO signature is not bound to a chain id.
+ *
+ * `dogecoin` is the more likely of the two to be right — custody's own suite already spells it that
+ * way where it asserts Dogecoin is refused — and it is also the one this service can never send,
+ * because `doge` is an unimplemented chain in the registry.
  */
 const CUSTODY_CHAIN: Readonly<Record<ChainId, string>> = Object.freeze({
   ember: 'ember',
@@ -144,6 +173,8 @@ const CUSTODY_CHAIN: Readonly<Record<ChainId, string>> = Object.freeze({
   sol: 'solana',
   xrp: 'xrp',
   ltc: 'litecoin',
+  etc: 'ethereum-classic',
+  doge: 'dogecoin',
 })
 
 export function custodyChainOf(chain: ChainId): string {

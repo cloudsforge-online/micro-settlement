@@ -174,12 +174,16 @@ function assertCustodyWouldSign(
 /* ------------------------------------------------------------------ the registry */
 
 describe('the registry', () => {
-  it('now reports sol as implemented, and only xrp as not', () => {
+  it('now reports sol as implemented, and xrp and doge as not', () => {
     // The previous entry said the blocker was "ENTIRELY CUSTODY-SIDE AND IT BLOCKS BOTH HALVES".
     // `SolanaPolicy` has a transfer shape and a pinned sweep shape now, so it blocks neither.
     assert.equal(chainFor('sol').unimplementedPhase, null)
-    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'eth', 'ltc', 'sol'])
+    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'etc', 'eth', 'ltc', 'sol'])
     assert.match(String(chainFor('xrp').unimplementedPhase), /XRPL adapter/)
+    // Dogecoin is the second, and it is the one whose blocker is on BOTH sides — see the registry
+    // entry. Named here as well as in `chains.test.ts` so that a change to this list has to
+    // acknowledge it rather than sort it in.
+    assert.match(String(chainFor('doge').unimplementedPhase), /no segwit/)
   })
 })
 
