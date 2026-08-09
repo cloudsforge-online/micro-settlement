@@ -1,11 +1,26 @@
 /**
- * EVM: Ethereum and Ember, one implementation.
+ * EVM: Ethereum, Ethereum Classic and Ember, one implementation.
  *
  * Hearth used to need its own everything — a UTXO selector, a change output, a JSON transaction
  * body, a REST broadcast and a REST confirmation lookup, none of which had an Ethereum equivalent.
  * The rebuild (hearth `docs/evm-spec.md`) deleted all of it: an EMBER payment is a legacy (type 0)
- * EVM transaction against a standard `eth_*` endpoint, so the two chains are the same six calls and
+ * EVM transaction against a standard `eth_*` endpoint, so the chains are the same six calls and
  * differ only in which node answers them and which chain id the signature commits to.
+ *
+ * **ETHEREUM CLASSIC COST THIS FILE NOTHING, AND THAT IS A FACT ABOUT THE FILE RATHER THAN ABOUT
+ * ETC.** ETC never adopted EIP-1559: there is no base fee, `eth_maxPriorityFeePerGas` is not
+ * answered, and a type-2 envelope is not decodable by its clients. A builder that had grown a 1559
+ * path would have needed a second one here and a second fee model in `withdrawals.ts`. This one
+ * never did — it has only ever emitted `type: 0` with a `gasPrice`, for Ember because its node has
+ * no type-2 decoder and for Ethereum because legacy is still accepted there — so the pre-London
+ * chain is the case the existing shape already served.
+ *
+ * The consequence worth stating, because it is what makes ETC cheap rather than merely possible:
+ * **a legacy fee is EXACT at plan time.** `gasLimit * gasPrice` is what the sender pays, with no
+ * base-fee movement between quoting and mining and no priority-fee refund afterwards, so the amount
+ * booked when the withdrawal is planned is the amount that leaves the treasury. Nothing in this
+ * service reads a receipt to correct a fee for any chain, and on ETC there is nothing a receipt
+ * could correct.
  *
  * **EVERY AMOUNT HERE IS WEI AND EVERY WEI IS A BIGINT.** One EMBER is 1e18 wei, four orders of
  * magnitude past what a double holds exactly, so there is no `Number()` anywhere on a value — not
@@ -482,6 +497,13 @@ export function evmChain(chain: ChainId): OutboundChain {
     // The block containing it is its own first confirmation, the same convention the deposit side
     // counts by — and the depth is the same declared depth, so an outbound payment is only final
     // once it is as deep as an incoming deposit has to be to be credited.
+    //
+    // `spec.confirmations`, never a constant here, and Ethereum Classic is the chain that makes the
+    // rule expensive to break. Its declared depth is very deep on purpose: ETC has been 51%-attacked
+    // and had blocks reorganised in the thousands, so finality there is bought with blocks and
+    // nothing else. Read as a number in this file it would look like a typo, and the edit that
+    // "fixed" it would be a settlement marked final above a reorg that had not finished. The depth
+    // belongs to the exact-pinned contract, which is also what the deposit side reads.
     const confirmations = head >= mined ? Number(head - mined) + 1 : 0
     return confirmations >= spec.confirmations
       ? { kind: 'confirmed', confirmations, minedHeight: mined }
@@ -650,9 +672,13 @@ export function evmChain(chain: ChainId): OutboundChain {
         // Exactly custody's `EVM_FIELDS` allowlist and no more. `signEvm` refuses "a field this
         // service does not sign", so an extra key here is a 403 rather than a wider signature.
         //
-        // Legacy (type 0). Ember v1 has no EIP-1559 and its node has no type-2 decoder, and custody
-        // refuses 1559 for it outright; Ethereum still accepts legacy transactions, so one shape
-        // serves both. Amounts are DECIMAL STRINGS: custody's `quantity` refuses a non-safe-integer
+        // Legacy (type 0), for all three chains and for a different reason on each. Ember v1 has no
+        // EIP-1559 and its node has no type-2 decoder; Ethereum Classic never adopted it, so a
+        // type-2 envelope is undecodable there too and custody's `LEGACY_GAS_ONLY_CHAINS` names
+        // `ethereum-classic` alongside `ember` so it can never be signed; Ethereum has 1559 and
+        // still accepts legacy. One shape serves all three, and the two chains that would refuse
+        // anything else are the reason it must stay one shape rather than become a choice.
+        // Amounts are DECIMAL STRINGS: custody's `quantity` refuses a non-safe-integer
         // number rather than rounding it, which is the fail-closed half of an 18-decimal amount.
         payload: {
           type: 0,

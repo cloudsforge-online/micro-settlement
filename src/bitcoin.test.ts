@@ -17,10 +17,13 @@ import {
   CUSTODY_MAX_SWEEP_SAT_PER_VB,
   MAX_SAT_PER_VB,
   MAX_SWEEP_SAT_PER_VB,
+  addressKindFor,
   assertUnderCustodysCeiling,
   bitcoinChain,
   btcToSats,
   buildSweepPsbt,
+  ceilingsFor,
+  custodyCeilings,
   finalisedVsize,
   networkFor,
   satsToBtc,
@@ -33,6 +36,7 @@ import {
 } from './bitcoin.ts'
 import {
   AddressError,
+  CUSTODY_CHAIN_DOGE,
   FeeOutOfBandError,
   InsufficientTreasuryError,
   assetOf,
@@ -850,24 +854,36 @@ describe('the network binding', () => {
   })
 
   /**
-   * **DOGECOIN IS BITCOIN-FAMILY AND THIS FILE MUST NOT GROW A ROW FOR IT.**
+   * **DOGECOIN HAS A ROW NOW, AND THE ROW IS THE SMALLEST PART OF ADDING IT.**
    *
-   * `NETWORKS` is where Litecoin was added, so it is the obvious place to add Dogecoin, and doing so
-   * would compile the moment `BitcoinFamilyChainId` admitted `'doge'`. It would also be wrong in a
-   * way no test above would catch: everything in this file is P2WPKH, Dogecoin has no segwit at all,
-   * and the failure is not a rejected address — it is `vsizeOf` applying the witness discount to
-   * inputs that have no witness, quoting a fee under half the transaction's real size. That
-   * transaction gets SIGNED and then dropped by every node below the relay floor.
+   * This test used to assert that `NETWORKS` had NO Dogecoin row and that `networkFor('doge')`
+   * threw, on the argument that `NETWORKS` is where Litecoin was added and is therefore the obvious
+   * place to add Dogecoin — and that the one-line addition would compile and be wrong, because
+   * everything in this file was P2WPKH and Dogecoin has no segwit at all. The failure it named was
+   * not a rejected address but `vsizeOf` applying the witness discount to inputs that have no
+   * witness, quoting a fee under half the transaction's real size, on a transaction that gets
+   * SIGNED and is then dropped by every node below the relay floor.
    *
-   * So the guard is the type, and this asserts the type is doing its job from the outside: the only
-   * `doge` in the registry is a refusal, and it has to stay one until there is a non-segwit build
-   * path here and Dogecoin keys in custody. The cast is the point — it is what a future edit
-   * would look like, and `networkFor` throwing rather than defaulting is what makes it loud.
+   * That argument was right and it is why the row was not enough. What is asserted now is the pair:
+   * the row exists, and it did not arrive alone. `addressKindFor` is the thing that makes the rest
+   * of the file chain-driven rather than incidental, so it is asserted here beside the network —
+   * a Dogecoin row with a `p2wpkh` kind would be exactly the change this test was written to stop.
    */
-  it('has no Dogecoin row, and throws rather than defaulting if asked for one', () => {
-    assert.throws(() => networkFor('doge' as BitcoinFamilyChainId, 'mainnet'))
-    assert.equal(chainFor('doge').unimplementedPhase !== null, true, 'doge must not gain an adapter here')
-    assert.equal(implementedChains().includes('doge' as never), false)
+  it('has a Dogecoin row, and a Dogecoin ADDRESS KIND to go with it', () => {
+    assert.ok(networkFor('doge', 'mainnet'))
+    assert.ok(networkFor('doge', 'testnet'))
+    assert.equal(addressKindFor('doge'), 'p2pkh', 'the row without this is the bug it replaced')
+    assert.equal(addressKindFor('btc'), 'p2wpkh')
+    assert.equal(addressKindFor('ltc'), 'p2wpkh')
+    assert.equal(chainFor('doge').unimplementedPhase, null)
+    assert.ok(implementedChains().includes('doge'))
+    // The mainnet and testnet parameters are distinct, which is the same binding the BTC case above
+    // asserts through bech32 — and here it has to be asserted on the base58 bytes, because
+    // Dogecoin's HRP is the empty string on both networks and would compare equal.
+    assert.notEqual(networkFor('doge', 'mainnet').pubKeyHash, networkFor('doge', 'testnet').pubKeyHash)
+    // And not Bitcoin's, which is the whole of what a wrong parameter table would look like.
+    assert.notEqual(networkFor('doge', 'mainnet').pubKeyHash, networkFor('btc', 'mainnet').pubKeyHash)
+    assert.notEqual(networkFor('doge', 'testnet').pubKeyHash, networkFor('btc', 'testnet').pubKeyHash)
   })
 })
 
@@ -1198,5 +1214,514 @@ describe('litecoin', () => {
     for (const coins of [1, 21_000_000, 44_000_000]) {
       assert.equal(btcToSats(coins, 'ltc'), BigInt(coins) * 100_000_000n, `${coins} did not survive`)
     }
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * DOGECOIN — the same adapter, and the chain where "the same adapter" was nearly a disaster.
+ *
+ * Litecoin proved this file can be given another chain's PARAMETERS. Dogecoin is the harder claim:
+ * it needs another chain's ASSUMPTIONS. Litecoin is Bitcoin with different constants; Dogecoin is
+ * Bitcoin without segwit, which changes the shape of an input, the size of a transaction, the way
+ * dust is computed, the relay floor, and the fee ceiling — five things, each of which was a single
+ * shared value in this file until now.
+ *
+ * ── THE ONE THAT DOES NOT FAIL LOUDLY IS THE ONE TO TEST HARDEST ───────────────────────────────
+ *
+ * Three of the five announce themselves. A `witnessUtxo` on a P2PKH input makes bitcoinjs SKIP the
+ * input and then throw `No inputs were signed`; a bech32 destination on a chain with no bech32
+ * fails to decode; a dust output is refused by `sendrawtransaction`. The vsize model does not: it
+ * produces a perfectly valid transaction that is simply under-priced, gets signed, gets broadcast,
+ * and is dropped below the relay floor with this chain's single outbound slot claimed. So the size
+ * assertions here MEASURE a real serialised legacy transaction rather than compare two constants.
+ *
+ * ── EVERY ADDRESS BELOW IS A PUBLISHED VECTOR ──────────────────────────────────────────────────
+ *
+ * `dogecoin/dogecoin`, `src/test/data/base58_keys_valid.json` — the file Dogecoin Core's own
+ * `base58_tests` runs against. It gives the address and the HASH Core decodes it to, and the script
+ * beside each one here is that hash wrapped in the standard template for its `addrType`, so this
+ * asserts the full mapping rather than "it did not throw". A vector generated in this repository
+ * would agree with any mistake this repository makes.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/** `dogecoin/src/test/data/base58_keys_valid.json`, mainnet: address → the script Core decodes. */
+const DOGE_MAINNET_VECTORS: readonly (readonly [string, string])[] = [
+  ['DD4KSSuBJqcjuTcvUg1CgUKeurPUFeEZkE', '76a91456d9b1d684d5abef32134ebc6883d75d3a53e9be88ac'],
+  ['DBjW6kna7rUPE4Mj9j4B3oK3xVA1SDHrdt', '76a914485290865b407657e0aedbdbb4aa6618310af50d88ac'],
+  ['D77Z1nmgSZxJTmtN65n2MVF9yvLSB4MpiC', '76a91415a585042e96300b5ad4f9d7c7c6cba2d56a098988ac'],
+  ['A7HRQk3GFCW2QasvdZxXuYj8kkQK5QrYLs', 'a914a2dd71f34fe73314d6e37c44035513f203aa400b87'],
+  ['A3RHoAQLPDSuBewbuvt5NMqEKasqs9ty3C', 'a9147879ea0f1053bcbd4c60c88f922f76d27e622e1e87'],
+] as const
+
+/** The same file, testnet. The `n…` prefix is Dogecoin's 0x71, NOT Bitcoin testnet's 0x6f. */
+const DOGE_TESTNET_VECTORS: readonly (readonly [string, string])[] = [
+  ['nhRsrUaxZou6sewjqaS37cJrMRJRgwVXdk', '76a9149131c29384f000c0d651660eefaf1717c8ca185588ac'],
+  ['ngbSgr1dhCqsLg6Z5tpsaCspwrH72x2Zk3', '76a9148808c94daaa2e4f53102703b2c3de534d670e87e88ac'],
+] as const
+
+const DOGE_TESTNET = networkFor('doge', 'testnet')
+
+/** A deterministic Dogecoin testnet P2PKH address. Derived: it is a fixture, not a claim. */
+function dogeP2pkh(seed: number): string {
+  const address = bitcoin.payments.p2pkh({
+    hash: Buffer.alloc(20, seed),
+    network: DOGE_TESTNET,
+  }).address
+  if (!address) throw new Error('could not derive a test address')
+  return address
+}
+
+const DOGE_TREASURY = dogeP2pkh(0x66)
+const DOGE_USER = dogeP2pkh(0x77)
+
+/**
+ * A real funding transaction paying the Dogecoin treasury, and its real txid.
+ *
+ * **The txid is DERIVED from the bytes rather than invented**, because that is the property the
+ * legacy path depends on: bitcoinjs refuses a `nonWitnessUtxo` whose hash does not match the
+ * outpoint the input names, and custody's `legacyPrevOut` checks the same thing before it believes
+ * anything else about the input. A fixture with a made-up txid would pass a test that only counted
+ * fields and fail the moment a real signer saw it.
+ */
+function dogeFunding(seed: number, sats: bigint, outputs = 1): { txid: string; hex: string; vout: number } {
+  const tx = new bitcoin.Transaction()
+  tx.addInput(Buffer.alloc(32, seed), 0, 0xffffffff, Buffer.from([0x51]))
+  for (let i = 0; i < outputs; i++) {
+    tx.addOutput(bitcoin.address.toOutputScript(DOGE_TREASURY, DOGE_TESTNET), Number(sats))
+  }
+  return { txid: tx.getId(), hex: tx.toHex(), vout: 0 }
+}
+
+interface FakeDogeNodeOptions {
+  readonly funding?: readonly { txid: string; hex: string; vout: number; sats: bigint }[]
+  readonly feerate?: number | null
+  readonly confirmations?: number
+  /** Answer `getrawtransaction` with an object instead of hex, as a node with no `txindex` does. */
+  readonly withholdRaw?: boolean
+}
+
+/**
+ * The Dogecoin node fake. Answers `getrawtransaction` with BYTES, which the Bitcoin fake never had
+ * to: the segwit path never asks for a previous transaction at all, so this method arriving twice
+ * with two different meanings — hex when `verbose` is false, an object when it is true — is itself
+ * part of what the legacy branch has to get right.
+ */
+function fakeDogeNode(options: FakeDogeNodeOptions = {}): { call: ChainCall; calls: string[] } {
+  const calls: string[] = []
+  const funding = options.funding ?? []
+  const rpc = async (method: string, params: readonly unknown[]): Promise<unknown> => {
+    calls.push(`${method}${params[1] === true ? ':verbose' : ''}`)
+    switch (method) {
+      case 'estimatesmartfee':
+        return options.feerate === null || options.feerate === undefined
+          ? {}
+          : { feerate: options.feerate, blocks: 3 }
+      case 'listunspent':
+        return funding
+          .filter(() => (options.confirmations ?? 30) >= Number(params[0]))
+          .map((f) => ({
+            txid: f.txid,
+            vout: f.vout,
+            amount: satsToBtc(f.sats),
+            scriptPubKey: bitcoin.address.toOutputScript(DOGE_TREASURY, DOGE_TESTNET).toString('hex'),
+            confirmations: options.confirmations ?? 30,
+            spendable: true,
+          }))
+      case 'getblockcount':
+        return 5_000_000
+      case 'getrawtransaction': {
+        const row = funding.find((f) => f.txid === String(params[0]))
+        if (!row) throw new Error('-5: No such mempool or blockchain transaction')
+        if (params[1] === true) return { txid: row.txid, confirmations: options.confirmations ?? 30 }
+        return options.withholdRaw ? { txid: row.txid } : row.hex
+      }
+      default:
+        throw new Error(`unexpected method ${method}`)
+    }
+  }
+  return { call: { network: 'testnet', rpc }, calls }
+}
+
+describe('dogecoin', () => {
+  it("decodes Core's own published vectors to Core's own published scripts", () => {
+    for (const [address, script] of DOGE_MAINNET_VECTORS) {
+      assert.equal(validateAddress('doge', address, 'mainnet'), address)
+      assert.equal(
+        bitcoin.address.toOutputScript(address, networkFor('doge', 'mainnet')).toString('hex'),
+        script,
+        `${address} decoded to the wrong script`,
+      )
+    }
+    for (const [address, script] of DOGE_TESTNET_VECTORS) {
+      assert.equal(validateAddress('doge', address, 'testnet'), address)
+      assert.equal(
+        bitcoin.address.toOutputScript(address, DOGE_TESTNET).toString('hex'),
+        script,
+        `${address} decoded to the wrong script`,
+      )
+    }
+    // The network binding, in both directions, on the base58 bytes. Dogecoin's HRP is the empty
+    // string on both networks, so the bech32 half of the Bitcoin test above has nothing to compare
+    // here and the version byte is the whole of the separation.
+    assert.throws(() => validateAddress('doge', DOGE_MAINNET_VECTORS[0]![0], 'testnet'), AddressError)
+    assert.throws(() => validateAddress('doge', DOGE_TESTNET_VECTORS[0]![0], 'mainnet'), AddressError)
+  })
+
+  it('REFUSES a Bitcoin address as a Dogecoin destination, and the reverse', () => {
+    for (const address of BTC_VECTORS) {
+      assert.equal(validateAddress('btc', address, 'mainnet'), address)
+      assert.throws(
+        () => validateAddress('doge', address, 'mainnet'),
+        AddressError,
+        `${address} is a Bitcoin address and was accepted as a Dogecoin destination`,
+      )
+      assert.equal(chainFor('doge').isValidDestination(address), false, address)
+    }
+    for (const [address] of DOGE_MAINNET_VECTORS) {
+      assert.throws(() => validateAddress('btc', address, 'mainnet'), AddressError)
+      assert.throws(() => validateAddress('ltc', address, 'mainnet'), AddressError)
+      assert.equal(chainFor('doge').isValidDestination(address), true, address)
+    }
+  })
+
+  /**
+   * **A BECH32 DESTINATION IS REFUSED FOR DOGECOIN, AND STILL ACCEPTED FOR LITECOIN.**
+   *
+   * Both halves, because each without the other is a different bug. Dogecoin has no segwit and
+   * therefore no bech32 at all: `bitcoinjs` would decode `bc1…` or `ltc1…` against Dogecoin's
+   * parameters and refuse it on the HRP, which is ALMOST the check — but Dogecoin's `bech32` field
+   * is the empty string, and an empty HRP is not a guard, it is an absence. The refusal is
+   * therefore explicit and comes from the address KIND rather than from a failed decode.
+   *
+   * The second half is the mirror-image bug this must not reintroduce. Refusing bech32 globally, or
+   * refusing anything that fails to parse as base58, would silently stop every Litecoin and Bitcoin
+   * segwit withdrawal — which is the form every deposit address in this estate takes.
+   */
+  it('refuses a bech32 destination for DOGE and still accepts one for LTC and BTC', () => {
+    const bech32Addresses = [
+      'ltc1qhdhvrwe6rgqns8fz28tee0hphr5x7ulw5exv4w',
+      'bc1qvyq0cc6rahyvsazfdje0twl7ez82ndmuac2lhv',
+    ] as const
+    for (const address of bech32Addresses) {
+      assert.throws(
+        () => validateAddress('doge', address, 'mainnet'),
+        AddressError,
+        `${address} is bech32 and was accepted as a Dogecoin destination`,
+      )
+      assert.equal(chainFor('doge').isValidDestination(address), false, address)
+    }
+    // The mirror image, unchanged: each is still payable on its own chain.
+    assert.equal(chainFor('ltc').isValidDestination(bech32Addresses[0]), true)
+    assert.equal(chainFor('btc').isValidDestination(bech32Addresses[1]), true)
+    assert.equal(validateAddress('ltc', bech32Addresses[0], 'mainnet'), bech32Addresses[0])
+    assert.equal(validateAddress('btc', bech32Addresses[1], 'mainnet'), bech32Addresses[1])
+    // And bech32m, the Taproot encoding, is refused for Dogecoin too rather than falling through a
+    // check that only knows about bech32. It is unpayable everywhere in this estate — see the
+    // Taproot test above for why — but it must be unpayable HERE for the reason stated in
+    // `validateAddress`, not by accident of an uninitialised ECC library.
+    for (const address of UNPAYABLE_TAPROOT) {
+      assert.throws(() => validateAddress('doge', address, 'mainnet'), AddressError)
+    }
+  })
+
+  /**
+   * **EVERY DOGECOIN INPUT CARRIES `nonWitnessUtxo` AND NO DOGECOIN INPUT CARRIES `witnessUtxo`.**
+   *
+   * The absence is asserted as hard as the presence. A PSBT carrying BOTH would sign — bitcoinjs
+   * prefers the witness field when it is present — and would produce a signature over the segwit
+   * digest for a legacy input, which is not a valid signature and is not detectable until a node
+   * refuses the finalised bytes.
+   */
+  it('builds a Dogecoin PSBT whose every input is a nonWitnessUtxo and never a witnessUtxo', async () => {
+    const funding = [{ ...dogeFunding(1, 500_000_000n), sats: 500_000_000n }]
+    const node = fakeDogeNode({ funding, feerate: 0.01 })
+    const built = await chainFor('doge').build(node.call, {
+      from: DOGE_TREASURY,
+      to: DOGE_USER,
+      value: 100_000_000n,
+      fee: 100_000_000n,
+      bounds: BOUNDS,
+      shape: 'payment',
+    })
+
+    const psbt = bitcoin.Psbt.fromBase64(built.payload as string, { network: DOGE_TESTNET })
+    assert.ok(psbt.data.inputs.length > 0)
+    for (const input of psbt.data.inputs) {
+      assert.ok(input.nonWitnessUtxo, 'a legacy input must carry the whole previous transaction')
+      assert.equal(input.witnessUtxo, undefined, 'a legacy input must NOT carry a witnessUtxo')
+      assert.equal(input.sighashType, bitcoin.Transaction.SIGHASH_ALL)
+    }
+    // The supplied previous transaction really is the one the outpoint names, which is what
+    // custody's `legacyPrevOut` re-checks before it believes the input's value.
+    const previous = bitcoin.Transaction.fromBuffer(psbt.data.inputs[0]!.nonWitnessUtxo!)
+    assert.equal(previous.getId(), psbt.txInputs[0]!.hash.reverse().toString('hex'))
+    assert.deepEqual(
+      psbt.txOutputs[0]!.script,
+      bitcoin.address.toOutputScript(DOGE_USER, DOGE_TESTNET),
+    )
+    // And the segwit chains are unaffected, which is the half a global change would have broken.
+    const ltcNode = fakeLtcNode({ utxos: [{ txid: '1'.repeat(64), vout: 0, sats: 500_000n }], feerate: 0.00001 })
+    const ltcBuilt = await chainFor('ltc').build(ltcNode.call, {
+      from: LTC_TREASURY,
+      to: LTC_USER,
+      value: 100_000n,
+      fee: 50_000n,
+      bounds: BOUNDS,
+      shape: 'payment',
+    })
+    for (const input of bitcoin.Psbt.fromBase64(ltcBuilt.payload as string, { network: LTC_TESTNET }).data.inputs) {
+      assert.ok(input.witnessUtxo, 'litecoin must still be segwit')
+      assert.equal(input.nonWitnessUtxo, undefined)
+    }
+  })
+
+  it('fetches each funding transaction once, however many coins came out of it', async () => {
+    // Three coins from one funding transaction is one `getrawtransaction`, not three. The cache is
+    // per PSBT rather than global on purpose: a global one would hold raw transactions for the life
+    // of the process for a chain whose transactions are large and whose treasury is swept often.
+    const shared = dogeFunding(9, 400_000_000n, 3)
+    const funding = [0, 1, 2].map((vout) => ({ ...shared, vout, sats: 400_000_000n }))
+    const node = fakeDogeNode({ funding, feerate: 0.01 })
+    await chainFor('doge').build(node.call, {
+      from: DOGE_TREASURY,
+      to: DOGE_USER,
+      value: 900_000_000n,
+      fee: 200_000_000n,
+      bounds: BOUNDS,
+      shape: 'payment',
+    })
+    assert.equal(node.calls.filter((c) => c === 'getrawtransaction').length, 1)
+  })
+
+  it('refuses rather than building a PSBT custody could not sign when the node withholds the bytes', async () => {
+    // A pruned node with no wallet import answers this call with something that is not hex. The
+    // alternative to refusing is a PSBT with an input custody must reject, discovered after the row
+    // is committed and this chain's single outbound slot is claimed.
+    const funding = [{ ...dogeFunding(4, 500_000_000n), sats: 500_000_000n }]
+    const node = fakeDogeNode({ funding, feerate: 0.01, withholdRaw: true })
+    await assert.rejects(
+      chainFor('doge').build(node.call, {
+        from: DOGE_TREASURY,
+        to: DOGE_USER,
+        value: 100_000_000n,
+        fee: 100_000_000n,
+        bounds: BOUNDS,
+        shape: 'payment',
+      }),
+      AddressError,
+    )
+  })
+
+  /**
+   * The size model, measured against a real legacy transaction rather than against a constant.
+   *
+   * This is the failure that does not announce itself, so it is the one measured end to end: a
+   * P2PKH input is ~148 bytes with no witness discount against a P2WPKH input's 68 vbytes, so the
+   * shared model under-quotes a Dogecoin spend by more than half.
+   */
+  it('prices a legacy spend at its REAL size, which is more than twice the segwit model', () => {
+    for (const [inputs, outputs] of [
+      [1, 1],
+      [1, 2],
+      [3, 2],
+      [5, 1],
+    ] as const) {
+      const tx = new bitcoin.Transaction()
+      for (let i = 0; i < inputs; i++) {
+        // A P2PKH scriptSig: a DER signature with its sighash byte, and a 33 byte compressed
+        // pubkey, each with its push opcode. No witness, and no discount.
+        //
+        // 72 bytes and not 71, deliberately: a low-S DER signature is one or the other with roughly
+        // even odds, and `vsizeOf` must be an UPPER bound on the size — quoting under the real size
+        // is a fee below the rate that was intended, which on a chain with a policy relay floor is
+        // a transaction that is never forwarded. So the model is measured against the larger of the
+        // two real cases.
+        tx.addInput(
+          Buffer.alloc(32, i + 1),
+          0,
+          undefined,
+          bitcoin.script.compile([Buffer.alloc(72, 1), Buffer.alloc(33, 2)]),
+        )
+      }
+      for (let o = 0; o < outputs; o++) {
+        tx.addOutput(bitcoin.address.toOutputScript(DOGE_TREASURY, DOGE_TESTNET), 1_000)
+      }
+      const actual = tx.virtualSize()
+      const predicted = vsizeOf(inputs, outputs, 'doge')
+      assert.ok(
+        predicted >= actual && predicted - actual <= 2,
+        `${inputs}-in ${outputs}-out: predicted ${predicted}, real ${actual} — must be an upper bound and tight`,
+      )
+      // And the segwit model would have been WRONG, not merely different. Stated as a ratio so it
+      // fails if either model drifts toward the other.
+      assert.ok(
+        vsizeOf(inputs, outputs, 'doge') > vsizeOf(inputs, outputs, 'btc'),
+        'the legacy model must never quote at or below the discounted one',
+      )
+    }
+    assert.ok(vsizeOf(5, 1, 'doge') > 2 * vsizeOf(5, 1, 'btc') - 60, 'the gap is inputs, and it is large')
+  })
+
+  /**
+   * **THE FEE CEILING IS PER-CHAIN, AND THE SHARED ONE WAS WRONG IN BOTH DIRECTIONS FOR DOGECOIN.**
+   *
+   * Dogecoin's ordinary fee is ~1000 koinu/vB — `RECOMMENDED_MIN_TX_FEE = COIN / 100` in
+   * `dogecoin/dogecoin`, `src/policy/policy.h`. That is not a fee market, it is a policy constant,
+   * and it sits ABOVE the shared sweep ceiling of 900 this service used to apply to every chain. So
+   * the old bound would have refused every Dogecoin sweep for ever, silently, as a fee that looked
+   * too high — while the same bound is a sane ceiling on Bitcoin, where 900 sat/vB is a once-a-year
+   * congestion event.
+   */
+  it('applies a DOGE fee bound that admits a rate the old shared bound would have refused', () => {
+    const rateBelowOldBound = 900n
+    const dogeOrdinary = 1_000n
+    // The old shared numbers, restated from what Bitcoin still carries so this is a comparison
+    // against the live values rather than against two literals typed here.
+    assert.equal(ceilingsFor('btc').sweep, rateBelowOldBound)
+    assert.ok(ceilingsFor('doge').sweep > dogeOrdinary, "Dogecoin's ordinary rate must be BUILDABLE")
+    assert.ok(ceilingsFor('doge').payment > ceilingsFor('doge').sweep)
+    // Bitcoin and Litecoin are untouched, so this is a per-chain table and not a global raise —
+    // the exact failure mode that "make the ceiling bigger" would have been.
+    assert.deepEqual(ceilingsFor('ltc'), ceilingsFor('btc'))
+    assert.equal(ceilingsFor('btc').payment, MAX_SAT_PER_VB)
+    assert.equal(ceilingsFor('btc').sweep, MAX_SWEEP_SAT_PER_VB)
+
+    // Custody's table is the authority and this service's mirror must be strictly tighter, on
+    // every chain and on both shapes. Asserted as a relationship rather than as values.
+    for (const chain of ['btc', 'ltc', 'doge'] as const) {
+      assert.ok(ceilingsFor(chain).sweep < custodyCeilings(chain).sweep, `${chain} sweep`)
+      assert.ok(ceilingsFor(chain).payment < custodyCeilings(chain).payment, `${chain} payment`)
+    }
+    assert.equal(custodyCeilings('btc').payment, CUSTODY_MAX_PAYMENT_SAT_PER_VB)
+    assert.equal(custodyCeilings('btc').sweep, CUSTODY_MAX_SWEEP_SAT_PER_VB)
+  })
+
+  it('refuses a DOGE fee above the DOGE bound, and accepts one the shared bound would have refused', () => {
+    const psbt = new bitcoin.Psbt({ network: DOGE_TESTNET })
+    const funding = dogeFunding(7, 500_000_000n)
+    psbt.addInput({
+      hash: funding.txid,
+      index: 0,
+      sighashType: bitcoin.Transaction.SIGHASH_ALL,
+      nonWitnessUtxo: Buffer.from(funding.hex, 'hex'),
+    })
+    psbt.addOutput({ address: DOGE_USER, value: 400_000_000 })
+    const vsize = BigInt(finalisedVsize(psbt, 'doge'))
+
+    // 10,000 koinu/vB: ten times Dogecoin's ordinary rate, and TWICE the shared payment ceiling of
+    // 5,000 that custody applied to every chain before its table became per-chain. This is the rate
+    // the old bound would have refused and the new one must admit.
+    assert.doesNotThrow(() =>
+      assertUnderCustodysCeiling(psbt, 10_000n * vsize, 'payment', 'doge'),
+    )
+    // The same rate on Bitcoin is still refused, so the bound moved for one chain and not for all.
+    assert.throws(
+      () => assertUnderCustodysCeiling(psbt, 10_000n * vsize, 'payment', 'btc'),
+      FeeOutOfBandError,
+    )
+    // And Dogecoin still HAS a ceiling. Above it, a node has quoted something absurd and the answer
+    // is to wait rather than to burn a customer's deposit on miner revenue.
+    assert.throws(
+      () => assertUnderCustodysCeiling(psbt, 60_000n * vsize, 'payment', 'doge'),
+      FeeOutOfBandError,
+    )
+    // The sweep shape is the tighter of the two on Dogecoin exactly as it is on Bitcoin.
+    assert.throws(
+      () => assertUnderCustodysCeiling(psbt, 20_000n * vsize, 'sweep', 'doge'),
+      FeeOutOfBandError,
+    )
+    assert.doesNotThrow(() => assertUnderCustodysCeiling(psbt, 5_000n * vsize, 'sweep', 'doge'))
+  })
+
+  it("falls back to Dogecoin's own relay floor, which is a hundred times Bitcoin's", async () => {
+    /*
+     * `dogecoin/dogecoin`, `src/validation.h`: `DEFAULT_MIN_RELAY_TX_FEE = RECOMMENDED_MIN_TX_FEE /
+     * 10` = 100,000 koinu per kvB = 100 koinu/vB, against 1 sat/vB on Bitcoin and Litecoin. The
+     * floor is only reached when `estimatesmartfee` has too little data — the ordinary state of a
+     * fresh node and of testnet — and a Dogecoin transaction built at 1 koinu/vB is a signed
+     * transaction no node forwards, permanently, because a policy floor does not fall the way a fee
+     * market does.
+     */
+    const node = fakeDogeNode({ feerate: null })
+    const fee = await chainFor('doge').estimateFee(node.call, BOUNDS)
+    assert.equal(fee, 100n * BigInt(vsizeOf(1, 2, 'doge')))
+
+    const btc = await chainFor('btc').estimateFee(fakeBtcNode({ feerate: null }).call, BOUNDS)
+    assert.equal(btc, 1n * BigInt(vsizeOf(1, 2, 'btc')))
+  })
+
+  it("uses Dogecoin's flat dust limit of 0.01 DOGE, not a size-derived threshold", async () => {
+    /*
+     * `dogecoin/dogecoin`, `src/primitives/transaction.h` defines `IsDust(dustLimit)` as
+     * `nValue < dustLimit` — flat, where Bitcoin and Litecoin scale `DUST_RELAY_TX_FEE` by the size
+     * of the output plus the input that would one day spend it. `src/policy/policy.h` gives
+     * `DEFAULT_DUST_LIMIT = RECOMMENDED_MIN_TX_FEE = COIN / 100` = 1,000,000 koinu.
+     *
+     * Bitcoin's 546 is not conservative here, it is wrong in the dangerous direction by a factor of
+     * nearly two thousand: a 1,000-koinu change output would be built, signed, and answered `dust`
+     * by `sendrawtransaction`, after this chain's single outbound slot was claimed.
+     */
+    const funding = [{ ...dogeFunding(2, 500_000_000n), sats: 500_000_000n }]
+    const node = fakeDogeNode({ funding, feerate: 0.01 })
+    const payment = (value: bigint): Promise<unknown> =>
+      chainFor('doge').build(node.call, {
+        from: DOGE_TREASURY,
+        to: DOGE_USER,
+        value,
+        fee: 100_000_000n,
+        bounds: BOUNDS,
+        shape: 'payment',
+      })
+    // Comfortably above Bitcoin's 546 and Litecoin's 5,460, and below Dogecoin's 1,000,000 — the
+    // window that only Dogecoin's own number closes. A test at 100 would pass against every
+    // threshold in the table and prove nothing.
+    await assert.rejects(payment(100_000n), FeeOutOfBandError)
+    assert.ok(await payment(1_000_001n), 'just above it is a threshold, not a ban on small payments')
+  })
+
+  it("reads Dogecoin's confirmation depth from the registry rather than restating it", async () => {
+    // 30, against Bitcoin's 6 — a minute a block against ten. Read from the exact-pinned
+    // contracts-chain, so this fails if the package and the adapter ever disagree.
+    const depth = chainSpec('DOGE').confirmations
+    assert.ok(depth > chainSpec('BTC').confirmations)
+    const shallow = dogeFunding(3, 500_000_000n)
+    const node = fakeDogeNode({
+      funding: [{ ...shallow, sats: 500_000_000n }],
+      confirmations: depth - 1,
+    })
+    assert.equal(await chainFor('doge').spendableBalance(node.call, DOGE_TREASURY), 0n)
+    const deep = fakeDogeNode({ funding: [{ ...shallow, sats: 500_000_000n }], confirmations: depth })
+    assert.equal(await chainFor('doge').spendableBalance(deep.call, DOGE_TREASURY), 500_000_000n)
+  })
+
+  it('is an implemented chain, and hands custody the name custody stores', () => {
+    assert.equal(chainFor('doge').unimplementedPhase, null)
+    assert.equal(chainFor('doge').chain, 'doge')
+    assert.equal(chainFor('doge').family, 'bitcoin')
+    assert.equal(chainFor('doge').tokens, null)
+    assert.ok(implementedChains().includes('doge'))
+    // `doge` is this service's slug; `dogecoin` is the string custody compares character for
+    // character before it signs, and it is asserted here against the exported constant rather than
+    // against a literal typed a second time. `bitcoin` here would resolve to the wrong treasury,
+    // and on a UTXO chain there is no chain id in the signature to catch it afterwards.
+    assert.equal(custodyChainOf('doge'), CUSTODY_CHAIN_DOGE)
+    assert.notEqual(CUSTODY_CHAIN_DOGE, custodyChainOf('btc'))
+    assert.equal(custodyFamilyOf('doge'), 'bitcoin')
+    assert.equal(chainForAsset('DOGE'), 'doge')
+    assert.equal(assetOf('doge'), 'DOGE')
+  })
+
+  it("bounds the amount by Dogecoin's MAX_MONEY, which is not a supply cap", () => {
+    // `dogecoin/src/amount.h`: `MAX_MONEY = 10000000000 * COIN`. It is a consensus sanity bound on
+    // a single value and Dogecoin has no fixed supply at all, so it is far above anything that
+    // exists — which is fine, because the job of this bound is to refuse a node answer that is
+    // impossible, not to model economics.
+    assert.equal(btcToSats(10_000_000_000, 'doge'), 1_000_000_000_000_000_000n)
+    assert.throws(() => btcToSats(10_000_000_001, 'doge'), AddressError)
+    // Bitcoin's 21 million would refuse a genuine Dogecoin balance, which is the copy this table
+    // exists to stop.
+    assert.throws(() => btcToSats(1_000_000_000, 'btc'), AddressError)
+    assert.equal(btcToSats(1_000_000_000, 'doge'), 100_000_000_000_000_000n)
   })
 })

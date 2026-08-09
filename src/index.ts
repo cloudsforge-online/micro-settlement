@@ -25,9 +25,9 @@ import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@clo
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
 import { SERVICE, env } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
-import { createServer, implementedChains, registerServiceMetrics } from './server.ts'
+import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
-import { rpcFactory } from './registry.ts'
+import { chainStatuses, rpcFactory } from './registry.ts'
 import { buildUpstreams } from './upstreams.ts'
 import type { Db } from './outbox.ts'
 import type { OutboundDeps } from './outbound.ts'
@@ -54,12 +54,26 @@ logger.info('starting', {
   // Said at boot rather than discovered from a refused withdrawal an hour later. A chain with an
   // adapter but no endpoint is the failure most likely to be a deploy mistake.
   //
+  // **EVERY chain, not only the implemented ones, and each with a status rather than a boolean.**
+  // It listed `implementedChains()` alone, which answered the question "is this deploy wired up"
+  // and left the more common one unanswerable: an operator looking for DOGE saw no DOGE row and
+  // could not tell whether this build lacks the adapter or the deploy lacks the endpoint. Those
+  // are two different tickets, filed against two different repositories. The three statuses are
+  // exhaustive over `CHAIN_IDS` and are the three real conditions:
+  //
+  //   * `ready` — there is an adapter and an endpoint. Withdrawals work.
+  //   * `no_endpoint` — there is an adapter and no `SETTLEMENT_RPC_URLS` entry. Every call ends at
+  //     `NoEndpointError`, which is classified and refunded at the deadline. **The service starts
+  //     anyway**: refusing to boot for a chain nobody is using would take down the chains that do
+  //     work, and pretending it works would leave a user's balance reserved for a quarter.
+  //   * `unimplemented` — no adapter in this build, whatever the deploy supplies.
+  //
   // `Boolean(...)` IS THE WHOLE LINE'S SAFETY AND IT IS NOT AN ABBREVIATION. A UTXO endpoint is
   // `http://rpcuser:rpcpassword@host:8332` — Core has no anonymous JSON-RPC — so the value here is
   // a credential, and this line is emitted on every start of every replica. Report that an
   // endpoint exists; never report which one. `redactUserinfo` in env.ts is the same rule at the
   // only other place a raw entry from this map could have reached a log.
-  chains: implementedChains().map((chain) => ({ chain, endpoint: Boolean(env.rpcUrls[chain]) })),
+  chains: chainStatuses(env.rpcUrls),
 })
 
 // 3. The database pool. Opened before the schema assertion for the obvious reason that the

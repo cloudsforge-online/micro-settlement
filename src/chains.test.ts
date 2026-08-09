@@ -1,5 +1,5 @@
 /**
- * The registry, and the three chains that are real objects and are not implemented.
+ * The registry, and the one chain that is a real object and is not implemented.
  *
  * The point of these tests is that an unimplemented chain is not a hole in a lookup table. Every
  * `ChainId` resolves to an object, every method of an unimplemented one throws a
@@ -11,6 +11,8 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   CHAIN_IDS,
+  CUSTODY_CHAIN_DOGE,
+  CUSTODY_CHAIN_ETC,
   NotImplementedError,
   assetOf,
   chainForAsset,
@@ -20,7 +22,7 @@ import {
   isChainId,
   isNetwork,
 } from './chains.ts'
-import { chainFor, implementedChains } from './registry.ts'
+import { chainFor, chainStatuses, implementedChains } from './registry.ts'
 import { planBuildFailure } from './withdrawals.ts'
 
 describe('chain identity', () => {
@@ -32,9 +34,10 @@ describe('chain identity', () => {
     assert.equal(familyOf('xrp'), 'xrp')
     // The two contracts-chain added on 2026-08-08, and both are asserted because both are the kind
     // of family membership that is easy to argue backwards from the adapter. ETC really is `evm`
-    // and really does share `evm.ts`; DOGE really is `bitcoin` and deliberately does NOT share
-    // `bitcoin.ts`, because the family says the RPC and the transaction structure are Bitcoin's and
-    // says nothing about segwit. A family is not a capability.
+    // and shares `evm.ts` unchanged; DOGE really is `bitcoin` and now shares `bitcoin.ts` — but it
+    // took a per-chain address kind, prev-out field, vsize model, dust threshold, relay floor and
+    // fee ceiling to get there, because the family says the RPC and the transaction structure are
+    // Bitcoin's and says nothing about segwit. A family is not a capability.
     assert.equal(familyOf('etc'), 'evm')
     assert.equal(familyOf('doge'), 'bitcoin')
   })
@@ -66,19 +69,31 @@ describe('chain identity', () => {
   })
 
   /**
-   * The two names custody does not hold yet, and the one value each may never take.
+   * The two newest names, and the one value each may never take.
    *
-   * `etc` and `doge` are the only entries in that table not checked against a row custody actually
-   * stores, because custody's `CHAIN_ASSET` has neither — so what is asserted here is not that the
-   * strings are right. It is that they are not the specific wrong ones. `ethereum` for `etc` and
-   * `bitcoin` for `doge` would each RESOLVE: custody would answer with the other chain's treasury
-   * address, and this service would adopt one position as another's. A name custody does not know
-   * is refused and costs a log line; a name it knows for a different chain is a bookkeeping fault
-   * that no gate at signing time can undo, because a pin is adopted long before anything is signed.
+   * These were the only entries in that table not checked against a row custody actually stores,
+   * because custody's `CHAIN_ASSET` had neither. It has both now — `dogecoin → 'DOGE'` and
+   * `'ethereum-classic' → 'ETC'`, read on 2026-08-09 — so the positive assertion is worth making,
+   * and it is made **against the exported constant the table itself reads**, not against a string
+   * literal typed a second time. A literal here would agree only with itself: someone editing
+   * `CUSTODY_CHAIN` would change the table, this test would go red, and the obvious fix would be to
+   * change the literal too, which is a test that ratifies whatever the code says.
+   *
+   * The negative assertions are the ones that matter most and they are unconditional. `ethereum`
+   * for `etc` and `bitcoin` for `doge` would each RESOLVE: custody would answer with the other
+   * chain's treasury address, and this service would adopt one position as another's. A name
+   * custody does not know is refused and costs a log line; a name it knows for a DIFFERENT chain is
+   * a bookkeeping fault that no gate at signing time can undo, because a pin is adopted long before
+   * anything is signed. On DOGE there is not even a gate to undo it with — a UTXO signature commits
+   * to no chain id at all.
    */
   it('never lets a new chain borrow an existing chain’s custody name', () => {
-    assert.notEqual(custodyChainOf('etc'), 'ethereum')
-    assert.notEqual(custodyChainOf('doge'), 'bitcoin')
+    assert.equal(custodyChainOf('etc'), CUSTODY_CHAIN_ETC)
+    assert.equal(custodyChainOf('doge'), CUSTODY_CHAIN_DOGE)
+    assert.notEqual(CUSTODY_CHAIN_ETC, 'ethereum')
+    assert.notEqual(CUSTODY_CHAIN_DOGE, 'bitcoin')
+    assert.notEqual(custodyChainOf('etc'), custodyChainOf('eth'))
+    assert.notEqual(custodyChainOf('doge'), custodyChainOf('btc'))
     // And no two chains share a name, which is the general form of the rule above.
     const names = CHAIN_IDS.map((chain) => custodyChainOf(chain))
     assert.equal(new Set(names).size, names.length, 'two chains translate to one custody name')
@@ -104,7 +119,7 @@ describe('the registry', () => {
     }
   })
 
-  it('implements ember, eth, etc, btc, ltc and sol today — xrp and doge are not', () => {
+  it('implements everything but xrp today', () => {
     // BTC joined when `bitcoin.ts` landed and SOL when `solana.ts` did. Both were once refused for
     // reasons about custody that this repository had written down and that are no longer true —
     // see the block at the head of `registry.ts` for how each claim was wrong.
@@ -115,15 +130,49 @@ describe('the registry', () => {
     // one-word edit, and the one-word edit is what would have shipped Bitcoin's parameters under
     // Litecoin's name.
     //
-    // ETC joined on the same terms and DOGE did not, which is the pair worth reading together.
-    // Both are "the same family as a chain already here". ETC's family claim survives contact with
-    // the builder — `evm.ts` signs legacy type-0 for `ember` and `eth` alike, and legacy is all a
-    // pre-London chain will accept — so there the one-word edit really is the whole change. DOGE's
-    // does not: `bitcoin.ts` is P2WPKH from end to end and Dogecoin has no segwit, so the same edit
-    // would quote every fee at under half the transaction's real size. Family membership is what
-    // the registry consults; whether the adapter's ASSUMPTIONS hold is a separate question, and it
-    // has to be asked once per chain.
-    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'etc', 'eth', 'ltc', 'sol'])
+    // ETC and DOGE joined together and on completely different terms, which is the pair worth
+    // reading together. Both are "the same family as a chain already here". ETC's family claim
+    // survives contact with the builder — `evm.ts` signs legacy type-0 for `ember` and `eth` alike,
+    // and legacy is all a pre-London chain will accept — so there the one-word edit really was the
+    // whole change. DOGE's did not: `bitcoin.ts` was P2WPKH from end to end and Dogecoin has no
+    // segwit, so the one-word edit would have quoted every fee at under half the transaction's real
+    // size and produced signed payments no node relays. It took a per-chain address kind, prev-out
+    // field, vsize model, dust threshold, relay floor and fee ceiling before the word could be
+    // written. Family membership is what the registry consults; whether the adapter's ASSUMPTIONS
+    // hold is a separate question, and it has to be asked once per chain.
+    assert.deepEqual([...implementedChains()].sort(), ['btc', 'doge', 'ember', 'etc', 'eth', 'ltc', 'sol'])
+  })
+
+  /**
+   * A chain with an adapter and no endpoint is UNAVAILABLE, and the service still starts.
+   *
+   * Three statuses over every `ChainId`, because the two ways a chain does not work are two
+   * different tickets against two different repositories. `unimplemented` is this build's
+   * limitation and no deploy change fixes it; `no_endpoint` is the deploy's and no release fixes
+   * it. The boot line in `index.ts` reports exactly this, which is what makes "why can I not
+   * withdraw DOGE" answerable from a log rather than from a refused withdrawal an hour later.
+   *
+   * **Nothing here may throw for a missing endpoint.** Refusing to boot because one chain is
+   * unconfigured takes down the chains that do work; answering `ready` anyway leaves a user's
+   * balance reserved until the deadline. Reporting is the only correct third option.
+   */
+  it('reports an adapter with no endpoint as unavailable rather than throwing', () => {
+    // Not URLs. This function reads presence and never a value — see the redaction argument on
+    // `rpcUrls` in `env.ts` — and a test carrying a real endpoint here would be the first place a
+    // credential-shaped string got written into this repository.
+    const statuses = chainStatuses({ ember: 'configured', doge: 'configured' })
+    const status = (chain: string): string => statuses.find((s) => s.chain === chain)!.status
+    assert.equal(statuses.length, CHAIN_IDS.length, 'every chain is named, including the broken ones')
+    assert.equal(status('ember'), 'ready')
+    assert.equal(status('doge'), 'ready', 'an endpoint is all DOGE was ever missing')
+    assert.equal(status('etc'), 'no_endpoint')
+    assert.equal(status('btc'), 'no_endpoint')
+    assert.equal(status('xrp'), 'unimplemented', 'no endpoint could make this one work')
+    // The empty deploy: every implemented chain unavailable, and this still answers rather than
+    // raising. This is the shape of a fresh environment, and a fresh environment must boot.
+    const bare = chainStatuses({})
+    assert.equal(bare.filter((s) => s.status === 'ready').length, 0)
+    assert.equal(bare.filter((s) => s.status === 'unimplemented').length, 1)
   })
 
   /**
@@ -134,7 +183,7 @@ describe('the registry', () => {
    * adapter reaches production.
    */
   it('throws NotImplementedError from every method of an unimplemented chain', async () => {
-    for (const chain of ['xrp', 'doge'] as const) {
+    for (const chain of ['xrp'] as const) {
       const adapter = chainFor(chain)
       assert.ok(adapter.unimplementedPhase, `${chain} must name its phase`)
       assert.throws(() => adapter.canonicalise('x'), NotImplementedError)
@@ -165,17 +214,22 @@ describe('the registry', () => {
   /**
    * XRP names whose limitation it is, and it is THIS service's.
    *
-   * That is the whole content of the remaining entry and it is worth asserting: BTC and SOL were
-   * both unimplemented on the strength of claims about CUSTODY, and both claims turned out to be
-   * either wrong when written or stale by the time they were read. XRP is the opposite case —
-   * custody signs it today, with a payment shape and a pinned sweep shape — so the message must not
-   * blame custody for it.
+   * That is the whole content of the remaining entry and it is worth asserting: BTC, SOL and DOGE
+   * were each unimplemented at some point on the strength of claims about CUSTODY, and every one of
+   * those claims turned out to be either wrong when written or stale by the time it was read. XRP
+   * is the opposite case — custody signs it today, with a payment shape and a pinned sweep shape —
+   * so the message must not blame custody for it.
+   *
+   * **The four chains that left this list are asserted to have left it**, because an entry here is
+   * a permanent refusal with an immediate refund, and a chain that works while its adapter still
+   * says it does not is a withdrawal refunded for a reason that is no longer true.
    */
   it('names whose limitation each unimplemented chain is', () => {
-    assert.equal(chainFor('btc').unimplementedPhase, null, 'btc is implemented')
-    assert.equal(chainFor('sol').unimplementedPhase, null, 'sol is implemented')
+    for (const chain of ['btc', 'sol', 'ltc', 'doge', 'etc'] as const) {
+      assert.equal(chainFor(chain).unimplementedPhase, null, `${chain} is implemented`)
+    }
     assert.match(chainFor('xrp').unimplementedPhase!, /XRPL adapter/)
-    const refusal = (chain: 'xrp' | 'doge'): string => {
+    const refusal = (chain: 'xrp'): string => {
       try {
         chainFor(chain).canonicalise('x')
         return ''
@@ -185,13 +239,6 @@ describe('the registry', () => {
     }
     assert.match(refusal('xrp'), /custody already signs XRP/, 'the gap is on this side and must say so')
     assert.match(refusal('xrp'), /this side/)
-
-    // DOGE is the third case: BOTH sides, and the message says both because an operator reading a
-    // `failure_reason` column needs to know that pointing this service at a Dogecoin node would
-    // not help. The builder's assumption is named first because it is this repository's to fix.
-    assert.match(chainFor('doge').unimplementedPhase!, /no segwit/)
-    assert.match(refusal('doge'), /witnessUtxo/, 'the message must name what this side assumes')
-    assert.match(refusal('doge'), /Custody has no Dogecoin network parameters/)
   })
 
   it('classifies an unimplemented chain as a permanent, immediately refunded build failure', () => {

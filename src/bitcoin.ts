@@ -76,7 +76,7 @@ import {
 /* ------------------------------------------------------------------ networks */
 
 /**
- * The chains this one adapter serves. **Two chains, one implementation, and that is the hazard.**
+ * The chains this one adapter serves. **Three chains, one implementation, and that is the hazard.**
  *
  * Litecoin's `ChainFamily` is `'bitcoin'` and genuinely is: it speaks the same JSON-RPC, has the
  * same transaction structure and the same script language, which is why `listunspent`, the coin
@@ -84,17 +84,28 @@ import {
  * What it does NOT share is the network parameters — see the block below — so every function here
  * that used to close over Bitcoin's now takes the chain.
  *
- * **`doge` IS BITCOIN-FAMILY IN contracts-chain AND IS DELIBERATELY NOT LISTED HERE.** The extract
- * is written out chain by chain instead of being derived from the family for exactly this case: it
- * makes `bitcoinChain('doge')` a compile error rather than a plausible one-word edit. Dogecoin has
- * no segwit, and everything below assumes segwit — `encodePsbt` commits each input as a
- * `witnessUtxo` and `vsizeOf` prices inputs with the witness discount. The first of those cannot be
- * signed for a base58 input and fails loudly; the second quotes a Dogecoin fee at under half the
- * true vsize and does not, which is a broadcast that every node drops after a signature was spent
- * on it. `registry.ts` carries the argument in full at the `doge` entry, which is an
- * `unimplementedChain` naming that work.
+ * ── DOGECOIN, AND WHAT IT COST TO ADMIT IT ─────────────────────────────────────────────────────
+ *
+ * This list said, until now, that `doge` was "deliberately not listed here" and that
+ * `bitcoinChain('doge')` had to stay a compile error. **That was the right call and it is now
+ * discharged rather than reversed**, because the two things it named have both been built:
+ *
+ *   * `encodePsbt` committed every input as a `witnessUtxo`, which is not a thing a base58 input
+ *     can be signed as. It now chooses `witnessUtxo` or `nonWitnessUtxo` from the chain's ADDRESS
+ *     KIND (see `ADDRESS_KIND`), which is the same choice custody makes from the same fact.
+ *   * `vsizeOf` priced every input with the witness discount. It is now per-kind too: a P2PKH input
+ *     is ~148 bytes with no discount, so the old number quoted a Dogecoin fee at well under half
+ *     the transaction's real size — a signed payment that every node then drops below the relay
+ *     floor. That is the failure that does NOT announce itself, and it is why the two were done
+ *     together rather than one at a time.
+ *
+ * **NOTHING HERE MAY BE DERIVED FROM `ChainFamily`.** The extract is still written out chain by
+ * chain, and the reason is stronger now than when it was a refusal: family membership says the RPC
+ * and the transaction structure are Bitcoin's, and says nothing whatever about segwit. A fourth
+ * bitcoin-family chain added to `contracts-chain` must still be a deliberate edit here, and must
+ * still answer the address-kind question before it can be listed.
  */
-export type BitcoinFamilyChainId = Extract<ChainId, 'btc' | 'ltc'>
+export type BitcoinFamilyChainId = Extract<ChainId, 'btc' | 'ltc' | 'doge'>
 
 /**
  * ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -155,12 +166,122 @@ const LITECOIN_TESTNET: bitcoin.Network = Object.freeze({
   wif: 0xef,
 })
 
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **DOGECOIN'S NETWORK PARAMETERS. THERE IS NO BECH32 HRP AND THAT IS NOT A GAP IN THIS TABLE.**
+ *
+ * Every byte is from `dogecoin/dogecoin`, `src/chainparams.cpp`, read at `master` on 2026-08-09,
+ * and every one is identical to the table custody derives and signs under (`custody/src/chains.ts`,
+ * `DOGECOIN_MAINNET`). They MUST be identical for the reason the Litecoin block gives: custody's
+ * `ECPair.fromWIF` binds the key to its own parameters, so a PSBT built here under different ones is
+ * refused after the row is committed and this chain's single outbound slot is claimed.
+ *
+ * Mainnet sets PUBKEY_ADDRESS 30, SCRIPT_ADDRESS 22, SECRET_KEY 158; testnet sets 113, 196, 241.
+ * **There is no `bech32_hrp` line in that file for any network** — SegWit exists only as a BIP-9
+ * deployment whose timeout is 0, i.e. permanently off — so the field below is the empty string
+ * because there is no value, not because one is outstanding.
+ *
+ * **THE EMPTY HRP IS NOT THE GUARD, AND BELIEVING IT WAS WOULD BE THE BUG.** `bitcoin.Network`
+ * makes the field required, so the absence has to be spelled somehow, and an empty string is the
+ * only spelling that cannot be mistaken for a real HRP. What it does NOT do is make segwit
+ * unreachable: custody measured `payments.p2wpkh` with an empty HRP returning a well-formed-looking
+ * string that is an address on no chain, and `bitcoin.address.fromBech32` decodes any HRP at all
+ * before anybody compares it to this. So the segwit refusals on this side are explicit —
+ * `ADDRESS_KIND` selects the input field and `validateAddress` refuses a bech32 destination by
+ * decoding it and saying so — and neither of them reads this field.
+ *
+ * TWO DIFFERENCES FROM THE LITECOIN BLOCK, both checked rather than carried over:
+ *
+ *  1. **The BIP-32 version bytes are Dogecoin's own**, `0x02facafd` / `0x02fac398` (`dgub`/`dgpv`),
+ *     where Litecoin Core uses Bitcoin's and the distinct `Ltub` pair is only SLIP-0132's display
+ *     convention. Here Core itself carries the distinct bytes. As with Litecoin they never appear in
+ *     a derived address and this service never serialises an extended key.
+ *  2. **There is no SCRIPT_ADDRESS2.** Litecoin has two P2SH prefixes and this chain has one, so
+ *     the narrowing argument that makes `scriptHash: 0x32` load-bearing on Litecoin has no
+ *     counterpart here.
+ *
+ * Testnet reuses Bitcoin's `tpub`/`tprv` bytes, which is what the file says — a real collision, not
+ * a transcription error, and recorded as read.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const DOGECOIN_MAINNET: bitcoin.Network = Object.freeze({
+  messagePrefix: '\x19Dogecoin Signed Message:\n',
+  bip32: { public: 0x02facafd, private: 0x02fac398 },
+  /** No segwit, therefore no HRP. See the block above for why this is not the refusal. */
+  bech32: '',
+  /** 30 → `D…`. The only address kind Dogecoin has. */
+  pubKeyHash: 0x1e,
+  /** 22 → `9…`/`A…`. Recorded for completeness; nothing here creates a P2SH output. */
+  scriptHash: 0x16,
+  /** 158 → a compressed WIF beginning `Q`. Never used here; custody holds the keys. */
+  wif: 0x9e,
+})
+
+const DOGECOIN_TESTNET: bitcoin.Network = Object.freeze({
+  messagePrefix: '\x19Dogecoin Signed Message:\n',
+  bip32: { public: 0x043587cf, private: 0x04358394 },
+  bech32: '',
+  /** 113 → `n…`. */
+  pubKeyHash: 0x71,
+  /** 196 → `2…`. **THE SAME BYTE AS BITCOIN TESTNET'S AND AS LITECOIN TESTNET'S DECODE VALUE**,
+   * which is a collision in the chains rather than a mistake here. It does not exist on mainnet,
+   * where 5, 50 and 22 are disjoint. */
+  scriptHash: 0xc4,
+  wif: 0xf1,
+})
+
 const NETWORKS: Readonly<
   Record<BitcoinFamilyChainId, Readonly<Record<Network, bitcoin.Network>>>
 > = Object.freeze({
   btc: Object.freeze({ mainnet: bitcoin.networks.bitcoin, testnet: bitcoin.networks.testnet }),
   ltc: Object.freeze({ mainnet: LITECOIN_MAINNET, testnet: LITECOIN_TESTNET }),
+  doge: Object.freeze({ mainnet: DOGECOIN_MAINNET, testnet: DOGECOIN_TESTNET }),
 })
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE ADDRESS KIND IS THE CHAIN'S, AND IT IS THE SINGLE FACT EVERY DOGECOIN DIFFERENCE FOLLOWS
+ * FROM.**
+ *
+ * It decides four things, and they used to be four independent hard-coded assumptions scattered
+ * through this file:
+ *
+ *   * which field a PSBT input carries — `witnessUtxo` for P2WPKH, `nonWitnessUtxo` for P2PKH;
+ *   * how big an input and an output are, and therefore what a fee rate multiplies (`vsizeOf`);
+ *   * what the smallest transaction custody could finalise looks like (`finalisedVsize`);
+ *   * whether a bech32 destination can be paid at all (`validateAddress`).
+ *
+ * **IT IS NOT DERIVABLE FROM THE FAMILY AND IT IS NOT DERIVABLE FROM `bech32` BEING BLANK.** The
+ * family is `'bitcoin'` for all three chains. The blank HRP is an artefact of `bitcoin.Network`
+ * requiring the field; nothing in bitcoinjs treats it as a refusal. So it is stated once, here, and
+ * every one of the four reads it — which is the same shape custody arrived at from the other side
+ * (`custody/src/chains.ts`, `bitcoinAddressKind`), for the same reason: when the choice was made
+ * three times independently, adding a chain meant remembering three edits and forgetting one meant
+ * a transaction that is built one way and priced another.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export type BitcoinAddressKind = 'p2wpkh' | 'p2pkh'
+
+const ADDRESS_KIND: Readonly<Record<BitcoinFamilyChainId, BitcoinAddressKind>> = Object.freeze({
+  btc: 'p2wpkh',
+  ltc: 'p2wpkh',
+  // Not a legacy PREFERENCE. Dogecoin never activated segwit, so this is the only kind it has.
+  doge: 'p2pkh',
+})
+
+/** The address kind this chain's treasury and deposit addresses are. @see ADDRESS_KIND */
+export function addressKindFor(chain: BitcoinFamilyChainId): BitcoinAddressKind {
+  const kind = ADDRESS_KIND[chain]
+  if (!kind) {
+    // The same refusal `networkFor` makes and for the same reason: a default would be `p2wpkh`,
+    // which is precisely the wrong answer for the next chain that has no segwit.
+    throw new AddressError(
+      `no address kind is defined for '${chain}' — refusing to assume segwit, which would price ` +
+        "every input at a discount the chain does not give and commit it in a field it cannot sign",
+    )
+  }
+  return kind
+}
 
 /**
  * The bitcoinjs network for a (chain, network).
@@ -195,18 +316,45 @@ export function networkFor(chain: BitcoinFamilyChainId, network: Network): bitco
 const SATS_PER_BTC = 100_000_000n
 
 /**
- * The supply cap of each chain, in smallest units. **LITECOIN'S IS FOUR TIMES BITCOIN'S.**
+ * The `MAX_MONEY` of each chain, in smallest units. **LITECOIN'S IS FOUR TIMES BITCOIN'S AND
+ * DOGECOIN'S IS FOUR HUNDRED AND SEVENTY-SIX TIMES LITECOIN'S.**
  *
  * `MAX_MONEY` is `21000000 * COIN` in `bitcoin/src/consensus/amount.h` and `84000000 * COIN` in
  * `litecoin/src/consensus/amount.h`. Reusing Bitcoin's for Litecoin would refuse a genuine node
  * answer as malformed; reusing Litecoin's for Bitcoin would accept an impossible one as real. It is
  * a sanity bound on a number that arrived over JSON, and a sanity bound calibrated to the wrong
  * chain is not one.
+ *
+ * **DOGECOIN'S IS NOT A SUPPLY CAP AND CALLING IT ONE WOULD BE WRONG IN BOTH DIRECTIONS.**
+ * `dogecoin/dogecoin`, `src/amount.h`, read at `master` on 2026-08-09, sets
+ * `MAX_MONEY = 10000000000 * COIN` with the comment "maximum of 100B coins (given some randomness),
+ * max transaction 10,000,000,000". Dogecoin has no cap — it emits 10,000 DOGE per block for ever —
+ * so this number is BELOW the eventual supply and ABOVE any transaction Core will accept, which is
+ * exactly what it is for: a per-amount consensus bound, which is the only thing this constant was
+ * ever used as. The variable is named for the role rather than for the folklore.
  */
 const MAX_UNITS: Readonly<Record<BitcoinFamilyChainId, bigint>> = Object.freeze({
   btc: 2_100_000_000_000_000n,
   ltc: 8_400_000_000_000_000n,
+  doge: 1_000_000_000_000_000_000n,
 })
+
+/**
+ * The largest amount `bitcoinjs-lib` can put in a transaction output.
+ *
+ * **THIS BITES ON DOGECOIN AND ON NEITHER OF THE OTHER TWO, WHICH IS WHY IT IS CHECKED HERE RATHER
+ * THAN TRUSTED TO THE LIBRARY.** `Psbt.addOutput` takes a JavaScript `number`, and
+ * `bufferutils.verifuint` refuses anything above `0x1fffffffffffff` with a bare
+ * `Error('RangeError: value out of range')` — no chain, no amount, no indication that the value was
+ * the problem. Bitcoin's whole `MAX_MONEY` is 2.1e15 and Litecoin's is 8.4e15, both under that
+ * ceiling, so on those two chains the branch is unreachable by construction. Dogecoin's is 1e18, and
+ * ~90.07 million DOGE in one output is a treasury balance rather than an impossibility.
+ *
+ * Refused as an `AddressError` so it is a classified build failure that releases the row, instead of
+ * a bare `Error` surfacing from inside the encoder with nothing an operator can act on. The fix for
+ * an operator who meets it is to split the payment, and the message says so.
+ */
+const MAX_ENCODABLE_UNITS = 9_007_199_254_740_991n
 
 /** Retained for the existing Bitcoin call sites and tests. @see MAX_UNITS */
 export const MAX_SATOSHIS = MAX_UNITS.btc
@@ -253,23 +401,56 @@ export function satsToBtc(sats: bigint): number {
 }
 
 /**
- * The virtual size, in vbytes, of a P2WPKH spend with `inputs` inputs and `outputs` outputs.
+ * The virtual size, in vbytes, of a spend with `inputs` inputs and `outputs` outputs.
  *
- * Every input this service spends is P2WPKH of the treasury address — custody refuses anything
+ * Every input this service spends is of the treasury address's own kind — custody refuses anything
  * else — so the size is exact rather than estimated, and being exact is what lets the fee be
- * checked against the locked quote instead of hoped about:
+ * checked against the locked quote instead of hoped about.
+ *
+ * **P2WPKH** (`btc`, `ltc`):
  *
  *   base: 4 version + 1 segwit marker/flag counted in weight + varint counts + 4 locktime
  *   per input: 32 txid + 4 vout + 1 empty scriptSig + 4 sequence = 41 vbytes of base,
  *              plus a 108-weight-unit witness (1 item count + 1+72 sig + 1+33 pubkey) = 27 vbytes
  *   per output: 8 value + 1 script length + 22 script (OP_0 <20-byte hash>) = 31 vbytes
  *
+ * **P2PKH** (`doge`). **THIS IS THE NUMBER THAT MAKES DOGECOIN SAFE TO QUOTE, AND THE OLD ONE WAS
+ * NOT MERELY IMPRECISE.** There is no witness, so there is no marker, no flag and no discount:
+ *
+ *   base: 4 version + varint counts + 4 locktime = 10 bytes — one less than segwit's 10.5,
+ *         because the marker and flag are simply absent rather than discounted
+ *   per input: 32 txid + 4 vout + 1 script length + 107 scriptSig (1+72 DER sig with its sighash
+ *              byte, 1+33 compressed pubkey) + 4 sequence = 148 bytes, all of them charged
+ *   per output: 8 value + 1 script length + 25 script (DUP HASH160 <20> EQUALVERIFY CHECKSIG)
+ *              = 34 bytes
+ *
+ * 148 against 68 is why this could not stay one function with one table. A one-input two-output
+ * Dogecoin spend is 226 bytes and the segwit arithmetic calls it 141 — so a fee quoted the old way
+ * pays 62% of what the transaction needs, and the result is not a rejected build. It is a SIGNED
+ * transaction that every node drops for paying under the relay floor, with this chain's single
+ * outbound slot claimed and a user waiting on it.
+ *
  * Rounded up, because a fractional vbyte is charged as a whole one.
  */
-export function vsizeOf(inputs: number, outputs: number): number {
-  const base = 10.5 + inputs * 41 + outputs * 31
-  const witness = inputs * 27
-  return Math.ceil(base + witness)
+const SIZES: Readonly<
+  Record<BitcoinAddressKind, { readonly base: number; readonly input: number; readonly output: number }>
+> = Object.freeze({
+  p2wpkh: Object.freeze({ base: 10.5, input: 68, output: 31 }),
+  p2pkh: Object.freeze({ base: 10, input: 148, output: 34 }),
+})
+
+export function vsizeOf(
+  inputs: number,
+  outputs: number,
+  /**
+   * Defaulted to `btc` so the Bitcoin call sites and the vectors in `bitcoin.test.ts` read as they
+   * did. It is NOT defaulted where it matters: `bitcoinChain` closes over its own chain and passes
+   * it at every call, so a new chain cannot pick up Bitcoin's sizes by omission.
+   */
+  chain: BitcoinFamilyChainId = 'btc',
+): number {
+  const size = SIZES[addressKindFor(chain)]
+  return Math.ceil(size.base + inputs * size.input + outputs * size.output)
 }
 
 /* ------------------------------------------------------------------ addresses */
@@ -294,6 +475,36 @@ export function validateAddress(
 ): string {
   const trimmed = address.trim()
   if (trimmed.length === 0) throw new AddressError(`a ${chain} address may not be empty`)
+  /*
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   * **A BECH32 DESTINATION ON A CHAIN WITH NO SEGWIT, REFUSED BY DECODING IT AND SAYING SO.**
+   *
+   * `toOutputScript` below would refuse a `bc1…` for Dogecoin as well, because `fromBech32`
+   * compares the decoded HRP against `network.bech32` and Dogecoin's is the empty string. That
+   * refusal is an ACCIDENT of how the absence had to be spelled, and it is the wrong thing to rely
+   * on twice over: it produces the generic "not a valid doge address" message, which sends an
+   * operator looking for a typo; and it would evaporate the day anybody wrote a plausible-looking
+   * HRP into that field to make some other library happy.
+   *
+   * So the refusal is explicit and it is the chain's ADDRESS KIND that drives it, not the blank
+   * field. A Dogecoin address is base58 and there is no second form — no segwit, therefore no
+   * bech32, therefore no `doge1…` to add later.
+   *
+   * **THE MIRROR IMAGE IS THE BUG THIS MUST NOT REINTRODUCE.** A `bc1…` accepted for a Litecoin
+   * withdrawal is what the Litecoin network table exists to prevent, and it is prevented by the
+   * HRP being inside the bech32 checksum: `ltc` and `bc` decode to different scripts and neither
+   * validates against the other's parameters. Nothing here weakens that — this branch is reached
+   * only for a chain whose kind is `p2pkh`, and both segwit chains fall straight through to
+   * `toOutputScript` exactly as before. `bitcoin.test.ts` asserts both halves.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  if (addressKindFor(chain) === 'p2pkh' && isBech32(trimmed)) {
+    throw new AddressError(
+      `${trimmed} is a bech32 (segwit) address and ${chain} has no segwit — its addresses are ` +
+        'base58 only, so this is not a typo to be corrected but a destination that does not exist ' +
+        'on this chain. Paying it would create an output nobody can spend.',
+    )
+  }
   try {
     bitcoin.address.toOutputScript(trimmed, networkFor(chain, network))
   } catch {
@@ -305,6 +516,27 @@ export function validateAddress(
     )
   }
   return trimmed
+}
+
+/**
+ * Is this string a bech32 or bech32m address of ANY human-readable part?
+ *
+ * The HRP is deliberately not compared against anything. The question this answers is "is this the
+ * segwit form at all", asked of a chain that has no segwit form, so `bc1…`, `ltc1…`, `tb1…` and a
+ * hypothetical `doge1…` are all equally the wrong shape and must all be named as such.
+ *
+ * `fromBech32` covers bech32m as well, which is checked rather than assumed: it tries the bech32
+ * constant first, falls through to the bech32m one, and rejects the version/encoding pairs that do
+ * not go together (`bitcoinjs-lib`, `src/address.js`). So one call answers for witness version 0 and
+ * for taproot alike, and a `doge` destination in either form is named for what it is.
+ */
+function isBech32(address: string): boolean {
+  try {
+    bitcoin.address.fromBech32(address)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /* ------------------------------------------------------------------ the node */
@@ -392,7 +624,11 @@ export function selectCoins(
   target: bigint,
   feeRatePerVb: bigint,
   dustThreshold: bigint,
-  /** Only so the refusal names the right chain in an operator's `failure_reason`. */
+  /**
+   * Names the chain in an operator's `failure_reason` — **and sizes every input**, which it did
+   * not do when this parameter was added. A Dogecoin input is more than twice a Litecoin one, so
+   * on this chain the argument is the difference between a fee and a rejected broadcast.
+   */
   chain: BitcoinFamilyChainId = 'btc',
 ): Selection {
   const chosen: Utxo[] = []
@@ -402,7 +638,7 @@ export function selectCoins(
     total += utxo.sats
 
     // Two outputs: the payment and the change.
-    const withChange = feeRatePerVb * BigInt(vsizeOf(chosen.length, 2))
+    const withChange = feeRatePerVb * BigInt(vsizeOf(chosen.length, 2, chain))
     if (total >= target + withChange) {
       const change = total - target - withChange
       if (change >= dustThreshold) {
@@ -410,7 +646,7 @@ export function selectCoins(
       }
       // Change would be dust. Drop the output and let the difference go to the fee, which is
       // cheaper for everyone than an output nobody can afford to spend.
-      const withoutChange = feeRatePerVb * BigInt(vsizeOf(chosen.length, 1))
+      const withoutChange = feeRatePerVb * BigInt(vsizeOf(chosen.length, 1, chain))
       if (total >= target + withoutChange) {
         return { inputs: chosen, change: 0n, fee: total - target }
       }
@@ -418,7 +654,7 @@ export function selectCoins(
     }
 
     // The exact-payment case: no change at all, one output.
-    const withoutChange = feeRatePerVb * BigInt(vsizeOf(chosen.length, 1))
+    const withoutChange = feeRatePerVb * BigInt(vsizeOf(chosen.length, 1, chain))
     if (total >= target + withoutChange && total - target - withoutChange < dustThreshold) {
       return { inputs: chosen, change: 0n, fee: total - target }
     }
@@ -455,10 +691,12 @@ export function sweepPlan(
   utxos: readonly Utxo[],
   feeRatePerVb: bigint,
   dustThreshold: bigint,
+  /** Sizes the inputs. @see vsizeOf — a P2PKH input is 148 bytes against P2WPKH's 68. */
+  chain: BitcoinFamilyChainId = 'btc',
 ): SweepPlan | null {
   if (utxos.length === 0) return null
   const total = totalOf(utxos)
-  const fee = feeRatePerVb * BigInt(vsizeOf(utxos.length, 1))
+  const fee = feeRatePerVb * BigInt(vsizeOf(utxos.length, 1, chain))
   const value = total - fee
   // Sweeping less than it costs to sweep destroys value, and an output at or below the dust
   // threshold costs more to spend than it holds — it would manufacture a coin nothing can ever
@@ -481,12 +719,30 @@ export function sweepPlan(
  * assumes when it predicts one. Shorter ones exist — a leading zero byte drops out of `r` or `s`
  * about once in 256 — and they are covered by the margin between this service's ceiling and
  * custody's rather than by pretending to model them. `bitcoin.test.ts` measures that margin.
+ *
+ * **THE SAME SIGNATURE GOES IN A DIFFERENT PLACE ON A LEGACY INPUT**, so the kind is read here too.
+ * A P2PKH spend has no witness at all and carries `<sig> <pubkey>` in the scriptSig, which is
+ * 1 + 71 + 1 + 33 = 106 bytes of transaction that gets no discount. Setting a witness on a legacy
+ * input would not merely mis-measure it — it would make the transaction serialise in the segwit
+ * format, and `virtualSize` would then divide a witness Dogecoin cannot have by four.
  */
-export function finalisedVsize(psbt: bitcoin.Psbt): number {
+export function finalisedVsize(psbt: bitcoin.Psbt, chain: BitcoinFamilyChainId = 'btc'): number {
   const tx = new bitcoin.Transaction()
+  const kind = addressKindFor(chain)
   psbt.txInputs.forEach((input, i) => {
-    tx.addInput(input.hash, input.index, input.sequence)
-    tx.setWitness(i, [Buffer.alloc(71, 1), Buffer.alloc(33, 2)])
+    if (kind === 'p2wpkh') {
+      tx.addInput(input.hash, input.index, input.sequence)
+      tx.setWitness(i, [Buffer.alloc(71, 1), Buffer.alloc(33, 2)])
+    } else {
+      // `<push 71><71-byte sig><push 33><33-byte pubkey>`, built as script rather than as a raw
+      // buffer so the push opcodes are the ones a real scriptSig would carry.
+      tx.addInput(
+        input.hash,
+        input.index,
+        input.sequence,
+        bitcoin.script.compile([Buffer.alloc(71, 1), Buffer.alloc(33, 2)]),
+      )
+    }
   })
   for (const output of psbt.txOutputs) tx.addOutput(output.script, output.value)
   return tx.virtualSize()
@@ -506,20 +762,135 @@ export function assertUnderCustodysCeiling(
   fee: bigint,
   shape: OutboundShape,
   /**
-   * Only so the refusal names the right chain. **The CEILINGS are deliberately not per-chain**,
-   * because custody's are not: `signBitcoin` reads one pair of constants whatever the row's chain
-   * (`custody/src/signing.ts,925`). They are a rate in the chain's own smallest unit per
-   * vbyte, so 5,000 is a looser bound in value terms for LTC than for BTC — which is the safe
-   * direction for a CEILING, and inventing a tighter Litecoin number here would mean this service
-   * refusing PSBTs custody would happily sign, in a place no operator would think to look.
+   * The chain, and it now selects the CEILING as well as naming it in the refusal.
+   *
+   * **THIS PARAMETER'S DOCUMENTATION USED TO SAY THE OPPOSITE, AND THE SENTENCE WAS TRUE WHEN IT
+   * WAS WRITTEN.** It read: "the CEILINGS are deliberately not per-chain, because custody's are
+   * not: `signBitcoin` reads one pair of constants whatever the row's chain". That was a correct
+   * reading of custody at the time and it stopped being correct on 2026-08-09, when custody made
+   * its own pair a per-chain table for Dogecoin's sake (`custody/src/signing.ts`,
+   * `FEE_RATE_CEILINGS`). Left alone it would not have failed loudly — it would have refused every
+   * Dogecoin sweep, for ever, at build time. See the ceiling block below.
    */
   chain: BitcoinFamilyChainId = 'btc',
 ): void {
-  const ceiling = shape === 'sweep' ? CUSTODY_MAX_SWEEP_SAT_PER_VB : CUSTODY_MAX_PAYMENT_SAT_PER_VB
-  const vsize = BigInt(finalisedVsize(psbt))
+  const ceilings = CUSTODY_CEILINGS[chain]
+  const ceiling = shape === 'sweep' ? ceilings.sweep : ceilings.payment
+  const vsize = BigInt(finalisedVsize(psbt, chain))
   if (fee / vsize >= ceiling) {
     throw new FeeOutOfBandError(chain, 'above', fee, ceiling * vsize)
   }
+}
+
+/* ------------------------------------------------------------------ the encoder */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE ONE PSBT ENCODER, AND THE ONE PLACE `witnessUtxo` AND `nonWitnessUtxo` ARE CHOSEN BETWEEN.**
+ *
+ * Shared by the withdrawal path and the sweep path, because the two differ only in WHICH coins and
+ * WHICH outputs — and sharing the construction is what stops the sweep drifting away from the
+ * encoding custody has already validated a withdrawal against. It used to be shared in intent and
+ * duplicated in fact: `buildSweepPsbt` carried its own `addInput` loop, so the field choice existed
+ * twice and would have had to be made correctly twice.
+ *
+ * ── WHY THE CHOICE IS A LOOKUP AND NOT A DEFAULT ───────────────────────────────────────────────
+ *
+ *   * **P2WPKH → `witnessUtxo`.** A segwit signature COMMITS TO THE VALUE of the input it spends,
+ *     and only this field carries it. That is the whole reason custody takes a PSBT rather than a
+ *     raw transaction, and its `witnessPrevOut` refuses an input without one — "its value is
+ *     unknown".
+ *   * **P2PKH → `nonWitnessUtxo`, the whole previous transaction.** A pre-segwit signature does not
+ *     commit to the value, so there is no field to put one in: the only way to know what an input
+ *     is worth and whose script it pays is to be handed the transaction that created it. bitcoinjs
+ *     enforces this and custody's `legacyPrevOut` checks the supplied transaction really is the one
+ *     the outpoint names before it believes anything else about the input.
+ *
+ * **THE WRONG FIELD DOES NOT THROW WHERE ANYONE WOULD SEE IT.** custody measured this against the
+ * pinned bitcoinjs on 2026-08-09: a P2PKH input given only a `witnessUtxo` is silently SKIPPED by
+ * `signAllInputs`, which then throws `No inputs were signed` — a bare Error naming neither the input
+ * nor the reason, arriving at custody's route as a 500 with no audit row. So the field is selected
+ * from `ADDRESS_KIND` at the single site that builds an input, and the chain that has no segwit
+ * cannot reach the segwit branch at all.
+ *
+ * ── THE COST OF THE LEGACY BRANCH, WHICH IS A ROUND TRIP PER DISTINCT FUNDING TRANSACTION ───────
+ *
+ * `listunspent` does not return raw transactions, so each one is fetched. It is cached per call
+ * because a treasury paid by one transaction into several outputs is ordinary — three coins from
+ * one funding transaction is one `getrawtransaction`, not three.
+ *
+ * `getrawtransaction` without `txindex` answers for a WALLET transaction, and every input here is
+ * one by construction: `listunspent` is filtered to an address, which only returns coins the node's
+ * own wallet watches. An operator running a pruned node with no wallet import would fail at this
+ * call rather than silently building something unsignable, which is the right end of that trade.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export async function encodePsbt(
+  call: ChainCall,
+  chain: BitcoinFamilyChainId,
+  from: string,
+  inputs: readonly Utxo[],
+  outputs: readonly { address: string; sats: bigint }[],
+): Promise<bitcoin.Psbt> {
+  const net = networkFor(chain, call.network)
+  const kind = addressKindFor(chain)
+  const psbt = new bitcoin.Psbt({ network: net })
+  const script = bitcoin.address.toOutputScript(from, net)
+  const rawByTxid = new Map<string, Buffer>()
+
+  for (const utxo of inputs) {
+    const common = {
+      hash: utxo.txid,
+      index: utxo.vout,
+      // SIGHASH_ALL only. Anything else leaves part of the transaction editable after signing, and
+      // custody refuses it, so stating it here means a mismatch fails at build rather than at the
+      // signing request.
+      sighashType: bitcoin.Transaction.SIGHASH_ALL,
+    }
+    if (kind === 'p2wpkh') {
+      psbt.addInput({ ...common, witnessUtxo: { script, value: encodableValue(chain, utxo.sats) } })
+    } else {
+      psbt.addInput({ ...common, nonWitnessUtxo: await previousTransaction(call, utxo.txid, rawByTxid) })
+    }
+  }
+  for (const output of outputs) {
+    psbt.addOutput({ address: output.address, value: encodableValue(chain, output.sats) })
+  }
+  return psbt
+}
+
+/** The raw bytes of a funding transaction, fetched once per txid per PSBT. @see encodePsbt */
+async function previousTransaction(
+  call: ChainCall,
+  txid: string,
+  cache: Map<string, Buffer>,
+): Promise<Buffer> {
+  const held = cache.get(txid)
+  if (held) return held
+  // `false` is the default and is stated: the verbose form answers an object, and this needs the
+  // bytes. `statusOf` asks the same method the other way for the opposite reason.
+  const hex = await call.rpc('getrawtransaction', [txid, false])
+  if (typeof hex !== 'string' || hex.length === 0) {
+    throw new AddressError(
+      `getrawtransaction did not answer with the bytes of ${txid} — a legacy input cannot be ` +
+        'signed without the whole transaction it spends, so this is refused rather than built ' +
+        'into a PSBT that custody would have to reject',
+    )
+  }
+  const raw = Buffer.from(hex, 'hex')
+  cache.set(txid, raw)
+  return raw
+}
+
+/** An amount as a `number`, or a named refusal. @see MAX_ENCODABLE_UNITS */
+function encodableValue(chain: BitcoinFamilyChainId, units: bigint): number {
+  if (units > MAX_ENCODABLE_UNITS) {
+    throw new AddressError(
+      `${units} is more of ${chain} than a transaction output can carry through this encoder ` +
+        `(${MAX_ENCODABLE_UNITS} smallest units) — split the payment`,
+    )
+  }
+  return Number(units)
 }
 
 /* ------------------------------------------------------------------ the adapter */
@@ -548,25 +919,58 @@ export function assertUnderCustodysCeiling(
  * Every other constant in this file survives the copy from Bitcoin. This one does not, and it is
  * the reason the dust threshold is a per-chain table rather than one number with a comment.
  *
- * The P2PKH figure is used for both chains rather than the P2WPKH one, unchanged from before: every
- * output this service creates is P2WPKH, so the higher number is a deliberate margin, and a margin
- * on dust costs a few satoshis of miner fee where being under costs the transaction.
+ * The P2PKH figure is used for both segwit chains rather than the P2WPKH one, unchanged from
+ * before: every output this service creates on them is P2WPKH, so the higher number is a deliberate
+ * margin, and a margin on dust costs a few satoshis of miner fee where being under costs the
+ * transaction.
+ *
+ * **DOGECOIN'S IS NOT DERIVED FROM A SIZE AT ALL, AND THE DIFFERENCE IS A DIFFERENT ALGORITHM AND
+ * NOT A DIFFERENT NUMBER.** Read at `master` on 2026-08-09: `dogecoin/dogecoin`,
+ * `src/primitives/transaction.h`, defines `IsDust(dustLimit)` as `nValue < dustLimit` — a flat
+ * comparison, where Bitcoin and Litecoin scale `DUST_RELAY_TX_FEE` by the size of the output plus
+ * the input that would one day spend it. So there is no P2PKH-versus-P2WPKH choice to make here;
+ * there is one number, and `src/policy/policy.h` gives it as
+ * `DEFAULT_DUST_LIMIT = RECOMMENDED_MIN_TX_FEE` = `COIN / 100` = **1,000,000 koinu** (0.01 DOGE).
+ *
+ * **THE SOFT LIMIT IS TAKEN AND NOT THE HARD ONE, DELIBERATELY.** The same file sets
+ * `DEFAULT_HARD_DUST_LIMIT = DEFAULT_DUST_LIMIT / 10` (100,000 koinu), and `policy.cpp` refuses a
+ * transaction as non-standard — `reason = "dust"` — only below the HARD limit. Between the two, an
+ * output is relayable but obliges the transaction to pay extra fee for the privilege. Taking the
+ * soft limit therefore keeps this service's changes and sweeps out of the band where a node's
+ * answer depends on its own `-dustlimit` setting, at a cost of at most 0.009 DOGE of change handed
+ * to a miner. Taking the hard one would buy nothing and would put every marginal output at the
+ * mercy of an operator's node configuration.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 const DEFAULT_DUST: Readonly<Record<BitcoinFamilyChainId, bigint>> = Object.freeze({
   btc: 546n,
   ltc: 5_460n,
+  doge: 1_000_000n,
 })
 
 /**
  * Core's own relay floor, in smallest units per vbyte. Below it a transaction is not forwarded.
  *
- * **One for both, and that was checked rather than assumed.** `DEFAULT_MIN_RELAY_TX_FEE` is 1000
- * per kilo-vbyte in `bitcoin/src/validation.h` and 1000 in `litecoin/src/validation.h` — the two
- * chains agree here even though they disagree by a factor of ten on dust, which is exactly why
- * neither was taken on trust from the other.
+ * **BITCOIN AND LITECOIN AGREE AND DOGECOIN IS A HUNDRED TIMES HIGHER**, and every one of the three
+ * was read rather than inferred from the others. `DEFAULT_MIN_RELAY_TX_FEE` is 1000 per kilo-vbyte
+ * in `bitcoin/src/validation.h` and 1000 in `litecoin/src/validation.h` — the two agree here even
+ * though they differ by a factor of ten on dust, which is exactly why neither was taken on trust.
+ * `dogecoin/dogecoin`, `src/validation.h`, read at `master` on 2026-08-09, instead says
+ * `DEFAULT_MIN_RELAY_TX_FEE = RECOMMENDED_MIN_TX_FEE / 10` — `COIN / 1000`, i.e. 100,000 koinu per
+ * kilo-vbyte, **100 koinu/vB**.
+ *
+ * **THIS IS A FLOOR AND ITS ONLY USE IS TO REPLACE A MISSING ESTIMATE**, which is what makes the
+ * hundredfold difference matter rather than merely be true. `feeRate` falls back to it when
+ * `estimatesmartfee` has too little data — the ordinary state of a fresh node and of testnet — and a
+ * Dogecoin transaction built at 1 koinu/vB would be a signed transaction no node forwards. The
+ * failure would look exactly like a stuck mempool and would be permanent, because a policy floor
+ * does not fall the way a fee market does.
  */
-const MIN_RELAY_SAT_PER_VB = 1n
+const MIN_RELAY_PER_VB: Readonly<Record<BitcoinFamilyChainId, bigint>> = Object.freeze({
+  btc: 1n,
+  ltc: 1n,
+  doge: 100n,
+})
 /** How many blocks `estimatesmartfee` is asked to target. */
 const FEE_TARGET_BLOCKS = 3
 
@@ -578,10 +982,12 @@ const FEE_TARGET_BLOCKS = 3
  *
  * There is one number here that must not be got wrong and it is a RELATIONSHIP, not a value.
  * custody's `signBitcoin` sets `psbt.setMaximumFeeRate(ceiling)` and then refuses outright at
- * `feeRate >= ceiling` (custody/src/signing.ts), with two ceilings of its own:
+ * `feeRate >= ceiling` (custody/src/signing.ts), reading a per-chain table of its own
+ * (`FEE_RATE_CEILINGS`, read on 2026-08-09):
  *
- *     MAX_SWEEP_FEE_RATE   = 1_000   (custody/src/signing.ts)
- *     MAX_PAYMENT_FEE_RATE = 5_000   (custody/src/signing.ts)
+ *     bitcoin   sweep 1_000   payment 5_000
+ *     litecoin  sweep 1_000   payment 5_000
+ *     dogecoin  sweep 10_000  payment 50_000
  *
  * Until this block existed, this service carried ONE ceiling, `MAX_SAT_PER_VB = 5_000`, applied to
  * both shapes. Two things were wrong with that and they are different failures:
@@ -608,15 +1014,68 @@ const FEE_TARGET_BLOCKS = 3
  *
  * The relationship is asserted, not asserted about: `bitcoin.test.ts` computes the worst-case rate
  * custody can measure for a transaction this service built at its own ceiling, for input counts
- * from one to fifty, and requires every one of them to stay under custody's. Move either constant
- * and that test goes red.
+ * from one to fifty, on every chain, and requires every one of them to stay under custody's. Move
+ * either constant and that test goes red.
+ *
+ * ── AND THEN THE CEILINGS BECAME PER-CHAIN, WHICH IS THE THIRD FAILURE ──────────────────────────
+ *
+ * **A SINGLE PAIR OF NUMBERS WOULD HAVE REFUSED EVERY DOGECOIN SWEEP THAT EVER EXISTED, AND WOULD
+ * HAVE DONE IT WITHOUT EVER LOOKING WRONG.** This block used to argue explicitly that the ceilings
+ * should NOT be per-chain, on the grounds that a rate in the chain's own smallest unit is a looser
+ * bound in value terms for a cheaper coin, "which is the safe direction for a CEILING". That
+ * argument holds for Litecoin and breaks completely on Dogecoin, and the reason is that it assumed
+ * the coin was cheaper but the FEE MARKET was the same shape. Dogecoin's is not a market at all:
+ *
+ *     dogecoin/dogecoin  src/policy/policy.h    RECOMMENDED_MIN_TX_FEE = COIN / 100
+ *
+ * — 0.01 DOGE per kilobyte, which is **1,000 koinu/vB**, read at `master` on 2026-08-09. That is
+ * the rate Core's own wallet pays. It is not a congestion spike, it is the floor of normal
+ * operation, and it is set by policy rather than by bidding, so there is no cheaper block to wait
+ * for. Against the old shared numbers:
+ *
+ *   * the SWEEP ceiling of 900 sits BELOW Dogecoin's ordinary fee, so every sweep would have been
+ *     refused at build time, on every deposit address, permanently. Not a stall that clears — the
+ *     deposits would simply never have been swept, and the only symptom would have been a
+ *     `fee_out_of_band` on a chain nobody had a reason to suspect;
+ *   * the PAYMENT ceiling of 4,500 would have passed, at four and a half times the normal rate, so
+ *     the defect would have been invisible on the withdrawal path that people watch and total on
+ *     the sweeper that they do not.
+ *
+ * custody reached the same conclusion from the other side on the same day and its table is above.
+ * These are 90% of custody's, chain by chain, which is the same margin the Bitcoin pair has always
+ * carried and is what the input-count assertion actually measures. DOGE's numbers are therefore
+ * Core's recommended rate times nine for a sweep and times forty-five for a payment: far enough
+ * above normal that no ordinary transaction is refused, far enough below custody's that the vsize
+ * slack cannot close the gap, and still bounding a one-input one-output sweep's burn at well under
+ * 0.02 DOGE.
  * ════════════════════════════════════════════════════════════════════════════════════════════════
  */
 
-/** custody/src/signing.ts. Restated so the test can compare, never used as this service's own. */
-export const CUSTODY_MAX_SWEEP_SAT_PER_VB = 1_000n
-/** custody/src/signing.ts. Same. */
-export const CUSTODY_MAX_PAYMENT_SAT_PER_VB = 5_000n
+export interface FeeCeilings {
+  readonly sweep: bigint
+  readonly payment: bigint
+}
+
+/**
+ * custody/src/signing.ts, `FEE_RATE_CEILINGS`. Restated so the test can compare the two tables and
+ * so `assertUnderCustodysCeiling` refuses exactly what custody would. **Never used as this
+ * service's own bound** — that is `CEILINGS` below.
+ */
+const CUSTODY_CEILINGS: Readonly<Record<BitcoinFamilyChainId, FeeCeilings>> = Object.freeze({
+  btc: Object.freeze({ sweep: 1_000n, payment: 5_000n }),
+  ltc: Object.freeze({ sweep: 1_000n, payment: 5_000n }),
+  doge: Object.freeze({ sweep: 10_000n, payment: 50_000n }),
+})
+
+/** @see CUSTODY_CEILINGS */
+export function custodyCeilings(chain: BitcoinFamilyChainId): FeeCeilings {
+  return CUSTODY_CEILINGS[chain]
+}
+
+/** Retained for the existing Bitcoin call sites and tests. @see CUSTODY_CEILINGS */
+export const CUSTODY_MAX_SWEEP_SAT_PER_VB = CUSTODY_CEILINGS.btc.sweep
+/** Same. */
+export const CUSTODY_MAX_PAYMENT_SAT_PER_VB = CUSTODY_CEILINGS.btc.payment
 
 /**
  * This service's own ceilings. Strictly below custody's, by more than the vsize slack can consume.
@@ -626,9 +1085,28 @@ export const CUSTODY_MAX_PAYMENT_SAT_PER_VB = 5_000n
  * background job with nobody waiting, so stalling one is self-healing in a way a burn is not; a
  * withdrawal has a user waiting, which is why its ceiling is the looser of the two here exactly as
  * it is in custody.
+ *
+ * **Dogecoin's pair is the one place "wait for a cheaper block" is not the fallback**, because its
+ * rate is policy rather than price. That is why its ceiling is nine times the rate a Dogecoin node
+ * will actually quote rather than a whisker above it: the headroom is for a future change to
+ * `RECOMMENDED_MIN_TX_FEE`, which has been cut before — `DEFAULT_MIN_RELAY_TX_FEE` is a tenth of it
+ * and `DEFAULT_INCREMENTAL_RELAY_FEE` a hundredth, so the constants already span two decades.
  */
-export const MAX_SWEEP_SAT_PER_VB = 900n
-export const MAX_SAT_PER_VB = 4_500n
+const CEILINGS: Readonly<Record<BitcoinFamilyChainId, FeeCeilings>> = Object.freeze({
+  btc: Object.freeze({ sweep: 900n, payment: 4_500n }),
+  ltc: Object.freeze({ sweep: 900n, payment: 4_500n }),
+  doge: Object.freeze({ sweep: 9_000n, payment: 45_000n }),
+})
+
+/** This service's own bound for a chain. @see CEILINGS */
+export function ceilingsFor(chain: BitcoinFamilyChainId): FeeCeilings {
+  return CEILINGS[chain]
+}
+
+/** Retained for the existing Bitcoin call sites and tests. @see CEILINGS */
+export const MAX_SWEEP_SAT_PER_VB = CEILINGS.btc.sweep
+/** Same. */
+export const MAX_SAT_PER_VB = CEILINGS.btc.payment
 
 export interface BitcoinChainOptions {
   readonly dustThreshold?: bigint
@@ -652,24 +1130,27 @@ export function bitcoinChain(
 ): OutboundChain {
   const dust = options.dustThreshold ?? DEFAULT_DUST[chain]
   const spec = chainSpec(assetOf(chain))
+  const ceilings = CEILINGS[chain]
+  const floor = MIN_RELAY_PER_VB[chain]
 
   /**
-   * sat/vB from the node, bounded by the ceiling for THIS shape.
+   * The chain's own base unit per vB from the node, bounded by the ceiling for THIS shape.
    *
    * The shape is a parameter rather than one clamp for both, because the two ceilings are five
    * times apart and the tighter one is the one custody will actually apply to a sweep. See the
    * ceiling block above.
    */
   async function feeRate(call: ChainCall, shape: OutboundShape): Promise<bigint> {
-    const ceiling = shape === 'sweep' ? MAX_SWEEP_SAT_PER_VB : MAX_SAT_PER_VB
+    const ceiling = shape === 'sweep' ? ceilings.sweep : ceilings.payment
     const answer = await call.rpc('estimatesmartfee', [FEE_TARGET_BLOCKS])
     const row = (answer ?? {}) as Record<string, unknown>
-    // `feerate` is BTC per kilovbyte. Absent means the node has too little data to estimate, which
-    // is a real state on a fresh node and on testnet — the floor is used rather than guessing high.
-    if (typeof row['feerate'] !== 'number') return MIN_RELAY_SAT_PER_VB
+    // `feerate` is the coin per kilovbyte. Absent means the node has too little data to estimate,
+    // which is a real state on a fresh node and on testnet — the floor is used rather than guessing
+    // high, and on Dogecoin that floor is a hundred times Bitcoin's. @see MIN_RELAY_PER_VB
+    if (typeof row['feerate'] !== 'number') return floor
     const perKvb = btcToSats(row['feerate'], chain)
     const perVb = perKvb / 1_000n
-    if (perVb < MIN_RELAY_SAT_PER_VB) return MIN_RELAY_SAT_PER_VB
+    if (perVb < floor) return floor
     if (perVb > ceiling) return ceiling
     return perVb
   }
@@ -700,41 +1181,6 @@ export function bitcoinChain(
   }
 
   /**
-   * Build a PSBT spending `inputs` and paying `outputs`, funded by `from`.
-   *
-   * The one encoder, shared by the withdrawal path and the sweep path, because the two differ only
-   * in WHICH coins and WHICH outputs — and sharing the construction is what stops the sweep drifting
-   * away from the encoding custody has already validated a withdrawal against.
-   */
-  function encodePsbt(
-    net: bitcoin.Network,
-    from: string,
-    inputs: readonly Utxo[],
-    outputs: readonly { address: string; sats: bigint }[],
-  ): bitcoin.Psbt {
-    const psbt = new bitcoin.Psbt({ network: net })
-    const script = bitcoin.address.toOutputScript(from, net)
-    for (const utxo of inputs) {
-      psbt.addInput({
-        hash: utxo.txid,
-        index: utxo.vout,
-        // The VALUE is why this is a PSBT and not a raw transaction: a segwit signature commits to
-        // the value of each input, and only this field carries it. custody's `signBitcoin` refuses
-        // an input without one — "its value is unknown" — and it is right to.
-        witnessUtxo: { script, value: Number(utxo.sats) },
-        // SIGHASH_ALL only. Anything else leaves part of the transaction editable after signing,
-        // and custody refuses it, so stating it here means a mismatch fails at build rather than
-        // at the signing request.
-        sighashType: bitcoin.Transaction.SIGHASH_ALL,
-      })
-    }
-    for (const output of outputs) {
-      psbt.addOutput({ address: output.address, value: Number(output.sats) })
-    }
-    return psbt
-  }
-
-  /**
    * Build one outbound transaction, of either shape.
    *
    * **The two shapes select their coins by two different rules and that is the whole of the
@@ -745,7 +1191,6 @@ export function bitcoinChain(
    * a sweep through the withdrawal builder used to produce.
    */
   async function buildOutbound(call: ChainCall, input: BuildInput): Promise<UnsignedOutbound> {
-    const net = networkFor(chain, call.network)
     validateAddress(chain, input.from, call.network)
     validateAddress(chain, input.to, call.network)
     if (input.value <= 0n) {
@@ -794,7 +1239,7 @@ export function bitcoinChain(
     const outputs: { address: string; sats: bigint }[] = [{ address: input.to, sats: input.value }]
 
     if (input.shape === 'sweep') {
-      const plan = sweepPlan(utxos, rate, dust)
+      const plan = sweepPlan(utxos, rate, dust, chain)
       if (!plan) {
         // Nothing at depth, or not enough to be worth moving. Either way the coins are not there,
         // which classifies as a treasury failure and is retried rather than refunded on the spot.
@@ -826,7 +1271,7 @@ export function bitcoinChain(
       }
     }
 
-    const psbt = encodePsbt(net, input.from, inputs, outputs)
+    const psbt = await encodePsbt(call, chain, input.from, inputs, outputs)
     assertUnderCustodysCeiling(psbt, fee, input.shape, chain)
 
     return {
@@ -886,7 +1331,7 @@ export function bitcoinChain(
      */
     async estimateFee(call, bounds) {
       const rate = await feeRate(call, 'payment')
-      const fee = rate * BigInt(vsizeOf(1, 2))
+      const fee = rate * BigInt(vsizeOf(1, 2, chain))
       if (fee > bounds.maxFeeWei) {
         throw new FeeOutOfBandError(chain, 'above', fee, bounds.maxFeeWei)
       }
@@ -908,7 +1353,7 @@ export function bitcoinChain(
      */
     async sweepQuote(call, address, bounds) {
       const rate = await feeRate(call, 'sweep')
-      const plan = sweepPlan(await listUnspent(call, address, spec.confirmations), rate, dust)
+      const plan = sweepPlan(await listUnspent(call, address, spec.confirmations), rate, dust, chain)
       if (!plan) return null
       if (plan.fee > bounds.maxFeeWei) {
         throw new FeeOutOfBandError(chain, 'above', plan.fee, bounds.maxFeeWei)
@@ -1080,24 +1525,25 @@ export async function buildSweepPsbt(
   chain: BitcoinFamilyChainId = 'btc',
   dustThreshold: bigint = DEFAULT_DUST[chain],
 ): Promise<{ psbtBase64: string; value: bigint; fee: bigint } | null> {
-  const net = networkFor(chain, call.network)
   validateAddress(chain, from, call.network)
   validateAddress(chain, treasury, call.network)
 
-  const plan = sweepPlan(await listUnspent(call, from, minConfirmations), feeRatePerVb, dustThreshold)
+  const plan = sweepPlan(
+    await listUnspent(call, from, minConfirmations),
+    feeRatePerVb,
+    dustThreshold,
+    chain,
+  )
   if (plan === null) return null
 
-  const psbt = new bitcoin.Psbt({ network: net })
-  const script = bitcoin.address.toOutputScript(from, net)
-  for (const utxo of plan.inputs) {
-    psbt.addInput({
-      hash: utxo.txid,
-      index: utxo.vout,
-      witnessUtxo: { script, value: Number(utxo.sats) },
-      sighashType: bitcoin.Transaction.SIGHASH_ALL,
-    })
-  }
-  psbt.addOutput({ address: treasury, value: Number(plan.value) })
+  // **`encodePsbt` RATHER THAN A SECOND `addInput` LOOP**, which is the change that made this
+  // function safe to keep. It carried its own loop, hard-coding `witnessUtxo` — so the day a chain
+  // with no segwit was admitted, the shape custody's policy asks for would have been built one way
+  // by `build` and another way here, and the second one is the entry point an operator reaches for
+  // when they are reproducing a sweep by hand at the worst possible moment.
+  const psbt = await encodePsbt(call, chain, from, plan.inputs, [
+    { address: treasury, sats: plan.value },
+  ])
   assertUnderCustodysCeiling(psbt, plan.fee, 'sweep', chain)
 
   return { psbtBase64: psbt.toBase64(), value: plan.value, fee: plan.fee }

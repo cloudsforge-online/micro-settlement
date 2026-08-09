@@ -174,16 +174,17 @@ function assertCustodyWouldSign(
 /* ------------------------------------------------------------------ the registry */
 
 describe('the registry', () => {
-  it('now reports sol as implemented, and xrp and doge as not', () => {
+  it('now reports sol as implemented, and only xrp as not', () => {
     // The previous entry said the blocker was "ENTIRELY CUSTODY-SIDE AND IT BLOCKS BOTH HALVES".
     // `SolanaPolicy` has a transfer shape and a pinned sweep shape now, so it blocks neither.
     assert.equal(chainFor('sol').unimplementedPhase, null)
-    assert.deepEqual([...implementedChains()].sort(), ['btc', 'ember', 'etc', 'eth', 'ltc', 'sol'])
+    assert.deepEqual([...implementedChains()].sort(), ['btc', 'doge', 'ember', 'etc', 'eth', 'ltc', 'sol'])
     assert.match(String(chainFor('xrp').unimplementedPhase), /XRPL adapter/)
-    // Dogecoin is the second, and it is the one whose blocker is on BOTH sides — see the registry
-    // entry. Named here as well as in `chains.test.ts` so that a change to this list has to
-    // acknowledge it rather than sort it in.
-    assert.match(String(chainFor('doge').unimplementedPhase), /no segwit/)
+    // Dogecoin used to be named here as the second unimplemented chain, on the argument that its
+    // blocker was on BOTH sides. Half of that was a claim about custody that had gone stale before
+    // it was read, and the other half — this file's P2WPKH-only builder — is built. It is asserted
+    // as IMPLEMENTED here rather than removed, so a list that loses it again has to say why.
+    assert.equal(chainFor('doge').unimplementedPhase, null)
   })
 })
 
