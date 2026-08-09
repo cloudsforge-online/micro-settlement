@@ -83,6 +83,16 @@ import {
  * selector, the PSBT encoder, the broadcast and the UTXO-based death proof are all reused unchanged.
  * What it does NOT share is the network parameters — see the block below — so every function here
  * that used to close over Bitcoin's now takes the chain.
+ *
+ * **`doge` IS BITCOIN-FAMILY IN contracts-chain AND IS DELIBERATELY NOT LISTED HERE.** The extract
+ * is written out chain by chain instead of being derived from the family for exactly this case: it
+ * makes `bitcoinChain('doge')` a compile error rather than a plausible one-word edit. Dogecoin has
+ * no segwit, and everything below assumes segwit — `encodePsbt` commits each input as a
+ * `witnessUtxo` and `vsizeOf` prices inputs with the witness discount. The first of those cannot be
+ * signed for a base58 input and fails loudly; the second quotes a Dogecoin fee at under half the
+ * true vsize and does not, which is a broadcast that every node drops after a signature was spent
+ * on it. `registry.ts` carries the argument in full at the `doge` entry, which is an
+ * `unimplementedChain` naming that work.
  */
 export type BitcoinFamilyChainId = Extract<ChainId, 'btc' | 'ltc'>
 

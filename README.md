@@ -171,11 +171,30 @@ withdrawal path to pay it back — leaving the tokens at the deposit address is 
 
 ## Chains
 
-`ember` and `eth` are one implementation (`src/evm.ts`); `btc` and `ltc` are another
-(`src/bitcoin.ts`) and `sol` is `src/solana.ts`. `xrp` is a **real object on the real interface that
-throws `NotImplementedError` naming its phase** — not absent from the registry, not a stub returning
-zero. `chainFor` is total, so an unsupported chain is a classified, immediately-refunded build
-failure rather than a `TypeError` in a job handler.
+`ember`, `eth` and `etc` are one implementation (`src/evm.ts`); `btc` and `ltc` are another
+(`src/bitcoin.ts`) and `sol` is `src/solana.ts`. `xrp` and `doge` are **real objects on the real
+interface that throw `NotImplementedError` naming their phase** — not absent from the registry, not
+stubs returning zero. `chainFor` is total, so an unsupported chain is a classified,
+immediately-refunded build failure rather than a `TypeError` in a job handler.
+
+**ETC and DOGE arrived together in `contracts-chain` and landed on opposite sides of that line, for
+one reason: family membership says what the RPC and the transaction structure are, and says nothing
+about whether the adapter's assumptions hold.** Both looked like a one-word registry edit.
+
+* **Ethereum Classic really was one.** It never adopted London, so it has no base fee and will not
+  accept a `maxFeePerGas` — but `evm.ts` has only ever built `type: 0` with a `gasPrice`, for Ember
+  (whose node has no type-2 decoder) as much as for Ethereum. The shape that already served both is
+  the shape ETC requires, so the pre-London property costs nothing here; `assertChainId` holds the
+  node to 61/63 and the 7,500-confirmation depth arrives through `chainSpec`. **No `etc` endpoint is
+  configured and none should be** — the adapter being capable and the deployment being pointed at a
+  node are two decisions, and only the first has been made.
+* **Dogecoin was not.** It has no segwit: its addresses are base58 only, and `bitcoin.ts` is P2WPKH
+  end to end. `bitcoinChain('doge')` would commit every input as a `witnessUtxo`, which bitcoinjs-lib
+  will not sign for a non-witness script, and would price `vsize` with the witness discount — a fee
+  under half the transaction's real size, which is a *signed* payment that every node then drops
+  below the relay floor. The first failure is loud; the second is not, and it is why there is an
+  `unimplementedChain` entry instead of a row in `NETWORKS`. Custody has no Dogecoin parameters and
+  derives P2WPKH only, so both halves are new work.
 
 **Litecoin is `bitcoinChain('ltc')` — the same code, and deliberately not the same constants.** It
 speaks the same JSON-RPC and has the same transaction structure, so the follower, the coin selector,

@@ -28,6 +28,7 @@ import {
   sweepPlan,
   validateAddress,
   vsizeOf,
+  type BitcoinFamilyChainId,
   type Utxo,
 } from './bitcoin.ts'
 import {
@@ -846,6 +847,27 @@ describe('the network binding', () => {
     assert.equal(networkFor('btc', 'mainnet'), bitcoin.networks.bitcoin)
     assert.equal(networkFor('btc', 'testnet'), bitcoin.networks.testnet)
     assert.notEqual(networkFor('btc', 'mainnet').bech32, networkFor('btc', 'testnet').bech32)
+  })
+
+  /**
+   * **DOGECOIN IS BITCOIN-FAMILY AND THIS FILE MUST NOT GROW A ROW FOR IT.**
+   *
+   * `NETWORKS` is where Litecoin was added, so it is the obvious place to add Dogecoin, and doing so
+   * would compile the moment `BitcoinFamilyChainId` admitted `'doge'`. It would also be wrong in a
+   * way no test above would catch: everything in this file is P2WPKH, Dogecoin has no segwit at all,
+   * and the failure is not a rejected address — it is `vsizeOf` applying the witness discount to
+   * inputs that have no witness, quoting a fee under half the transaction's real size. That
+   * transaction gets SIGNED and then dropped by every node below the relay floor.
+   *
+   * So the guard is the type, and this asserts the type is doing its job from the outside: the only
+   * `doge` in the registry is a refusal, and it has to stay one until there is a non-segwit build
+   * path here and Dogecoin keys in custody. The cast is the point — it is what a future edit
+   * would look like, and `networkFor` throwing rather than defaulting is what makes it loud.
+   */
+  it('has no Dogecoin row, and throws rather than defaulting if asked for one', () => {
+    assert.throws(() => networkFor('doge' as BitcoinFamilyChainId, 'mainnet'))
+    assert.equal(chainFor('doge').unimplementedPhase !== null, true, 'doge must not gain an adapter here')
+    assert.equal(implementedChains().includes('doge' as never), false)
   })
 })
 
