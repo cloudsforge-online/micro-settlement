@@ -53,6 +53,7 @@ import {
 } from './chains.ts'
 import { chainFor, implementedChains, NoEndpointError } from './registry.ts'
 import { adjudicate, type AdjudicateDeps } from './adjudicate.ts'
+import { WITHDRAWAL_STUCK } from './stuck.ts'
 import { isBooked } from './fees.ts'
 import {
   callFor,
@@ -223,6 +224,29 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       help: 'Inbound events, by topic and outcome.',
       kind: 'counter',
       labels: ['topic', 'outcome'],
+    })
+    .register({
+      /*
+       * The one metric here whose NAME is not this service's to choose: `alerts.yaml` already reads
+       * it, in `WithdrawalStuck` (`>= 1`, `for: 5m`, severity page) and inside
+       * `MoneyMetricContractMissing`'s `absent()`. It is exported last because it is the odd one
+       * out — see `stuck.ts` for what counts as stuck, why the queue states are excluded, and why a
+       * `_total` suffix is carrying a gauge.
+       *
+       * A GAUGE, and deliberately so despite the suffix: the rule reads a level and its runbook
+       * expects the page to clear on adjudication, which a monotonic counter can never do. The
+       * counter-shaped signal is `settlement_stuck_total` a few registrations above, which is a
+       * different measurement of a different thing and is not what this rule wants.
+       *
+       * Sampled in `beforeScrape`, so it is a query against live rows rather than a tally this
+       * service maintains — which is what lets it still report when the worker is the broken part.
+       */
+      name: WITHDRAWAL_STUCK,
+      help:
+        'Withdrawals parked for an operator, or past SETTLEMENT_STUCK_MINUTES with no worker ' +
+        'having parked them. A LEVEL despite the _total suffix: it falls to zero on adjudication.',
+      kind: 'gauge',
+      labels: ['chain', 'network'],
     })
 }
 

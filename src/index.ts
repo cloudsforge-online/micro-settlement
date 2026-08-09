@@ -33,6 +33,7 @@ import type { Db } from './outbox.ts'
 import type { OutboundDeps } from './outbound.ts'
 import type { WorkerDeps } from './worker.ts'
 import { tokensFor, type TokenSweepDeps } from './sweeps.ts'
+import { publishStuckWithdrawals } from './stuck.ts'
 
 // 1. Environment. Importing `./env.ts` validated it; a missing or placeholder secret has already
 //    exited with a structured line naming the variable.
@@ -245,6 +246,16 @@ const server = createServer({
     const stats = await queue.stats()
     metrics.set('jobs_pending', stats.pending)
     metrics.set('jobs_overdue', stats.overdue)
+    // `withdrawal_stuck` joins them here rather than being incremented by the worker, and
+    // that is the whole design: a tally the worker keeps cannot report a dead worker, and a dead
+    // worker is one of the two ways a withdrawal gets stuck. The route logs and continues if this
+    // throws, so a scrape never fails on it. See `stuck.ts`.
+    await publishStuckWithdrawals({
+      sql: db,
+      metrics,
+      network: env.network,
+      stuckMinutes: env.stuckMinutes,
+    })
   },
 })
 
