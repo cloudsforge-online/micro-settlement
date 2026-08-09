@@ -209,11 +209,20 @@ jobs:
       # ────────────────────────────────────────────────────────────────────────────────────────
       - name: 'AD — no test can reach a real network'
         run: |
-          if grep -rn 'rpcFactory' src/*.test.ts | grep -vE '^src/registry\.test\.ts:'; then
+          # Comments are stripped first, exactly as the `registry.test.ts` check below already does
+          # and for exactly the same reason — this is the seventh. On 2026-08-09 this guard failed
+          # on a COMMENT in `src/bitcoin.test.ts` that explains why the node fakes throw the real
+          # `RpcError` the transport surfaces rather than a bare `Error`; naming the function is
+          # what makes that explanation useful, and a guard that cannot tell prose from a socket
+          # teaches people to delete the prose. A line whose FIRST non-space characters are `//`,
+          # `*` or `/*` opens nothing. A trailing comment on a line of code is still caught, which
+          # is the same line the sibling check draws. @see micro-org#268
+          if grep -rn 'rpcFactory' src/*.test.ts \
+             | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)' \
+             | grep -vE '^src/registry\.test\.ts:'; then
             echo '::error::a test builds the real RPC transport; chain calls go through fakeNode'
             exit 1
           fi
-          # Comments are stripped first: six guards in this estate have fired on their own prose.
           if grep -n 'rpcFactory' src/registry.test.ts \
              | grep -vE '^[0-9]+:[[:space:]]*(//|\*|/\*)' \
              | grep -vF "from './registry.ts'" \

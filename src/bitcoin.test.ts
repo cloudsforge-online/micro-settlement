@@ -45,7 +45,7 @@ import {
   custodyFamilyOf,
   type ChainCall,
 } from './chains.ts'
-import { chainFor, implementedChains } from './registry.ts'
+import { RpcError, chainFor, implementedChains } from './registry.ts'
 
 /* ------------------------------------------------------------------ fixtures */
 
@@ -76,6 +76,16 @@ interface FakeBtcNodeOptions {
   readonly utxos?: readonly FakeUtxo[]
   /** BTC per kvB, as `estimatesmartfee` reports it. Absent means the node cannot estimate. */
   readonly feerate?: number | null
+  /**
+   * The WHOLE `estimatesmartfee` answer, verbatim, for the shapes `feerate` cannot express.
+   *
+   * `feerate: null` above produces `{}`, which is a shape **no node in this estate has ever
+   * returned** — the fake invented it, and inventing it is how two of the three real "I have no
+   * estimate" answers went unhandled for the life of the adapter. @see NO_ESTIMATE_RPC_MESSAGE
+   */
+  readonly feeAnswer?: unknown
+  /** The node raises a JSON-RPC error instead of answering. The message is Core's, verbatim. */
+  readonly feeError?: string
   readonly height?: number
   readonly confirmationsByTxid?: Readonly<Record<string, number>>
   /** Outpoints `gettxout` still reports, as `txid:vout`. Anything else has been spent. */
@@ -97,6 +107,10 @@ function fakeBtcNode(options: FakeBtcNodeOptions = {}): {
     calls.push(method)
     switch (method) {
       case 'estimatesmartfee':
+        // A JSON-RPC `error` envelope, as `rpcFactory` surfaces one. The real type and not a bare
+        // `Error`, so a narrowing of the catch in `feeRate` cannot pass here and fail on the node.
+        if (options.feeError !== undefined) throw new RpcError('estimatesmartfee', options.feeError)
+        if (options.feeAnswer !== undefined) return options.feeAnswer
         return options.feerate === null || options.feerate === undefined
           ? {}
           : { feerate: options.feerate, blocks: 3 }
@@ -971,6 +985,10 @@ function fakeLtcNode(options: FakeBtcNodeOptions = {}): { call: ChainCall; broad
   const rpc = async (method: string, params: readonly unknown[]): Promise<unknown> => {
     switch (method) {
       case 'estimatesmartfee':
+        // A JSON-RPC `error` envelope, as `rpcFactory` surfaces one. The real type and not a bare
+        // `Error`, so a narrowing of the catch in `feeRate` cannot pass here and fail on the node.
+        if (options.feeError !== undefined) throw new RpcError('estimatesmartfee', options.feeError)
+        if (options.feeAnswer !== undefined) return options.feeAnswer
         return options.feerate === null || options.feerate === undefined
           ? {}
           : { feerate: options.feerate, blocks: 3 }
@@ -1296,6 +1314,10 @@ function dogeFunding(seed: number, sats: bigint, outputs = 1): { txid: string; h
 interface FakeDogeNodeOptions {
   readonly funding?: readonly { txid: string; hex: string; vout: number; sats: bigint }[]
   readonly feerate?: number | null
+  /** @see FakeBtcNodeOptions.feeAnswer */
+  readonly feeAnswer?: unknown
+  /** @see FakeBtcNodeOptions.feeError */
+  readonly feeError?: string
   readonly confirmations?: number
   /** Answer `getrawtransaction` with an object instead of hex, as a node with no `txindex` does. */
   readonly withholdRaw?: boolean
@@ -1314,6 +1336,10 @@ function fakeDogeNode(options: FakeDogeNodeOptions = {}): { call: ChainCall; cal
     calls.push(`${method}${params[1] === true ? ':verbose' : ''}`)
     switch (method) {
       case 'estimatesmartfee':
+        // A JSON-RPC `error` envelope, as `rpcFactory` surfaces one. The real type and not a bare
+        // `Error`, so a narrowing of the catch in `feeRate` cannot pass here and fail on the node.
+        if (options.feeError !== undefined) throw new RpcError('estimatesmartfee', options.feeError)
+        if (options.feeAnswer !== undefined) return options.feeAnswer
         return options.feerate === null || options.feerate === undefined
           ? {}
           : { feerate: options.feerate, blocks: 3 }
@@ -1638,10 +1664,10 @@ describe('dogecoin', () => {
     /*
      * `dogecoin/dogecoin`, `src/validation.h`: `DEFAULT_MIN_RELAY_TX_FEE = RECOMMENDED_MIN_TX_FEE /
      * 10` = 100,000 koinu per kvB = 100 koinu/vB, against 1 sat/vB on Bitcoin and Litecoin. The
-     * floor is only reached when `estimatesmartfee` has too little data — the ordinary state of a
-     * fresh node and of testnet — and a Dogecoin transaction built at 1 koinu/vB is a signed
-     * transaction no node forwards, permanently, because a policy floor does not fall the way a fee
-     * market does.
+     * floor is reached whenever the node says it has no estimate, which on the mainnet estate is
+     * every call and for ever — see `NO_ESTIMATE_RPC_MESSAGE` — and a Dogecoin transaction built at
+     * 1 koinu/vB is a signed transaction no node forwards, permanently, because a policy floor does
+     * not fall the way a fee market does.
      */
     const node = fakeDogeNode({ feerate: null })
     const fee = await chainFor('doge').estimateFee(node.call, BOUNDS)
@@ -1723,5 +1749,92 @@ describe('dogecoin', () => {
     // exists to stop.
     assert.throws(() => btcToSats(1_000_000_000, 'btc'), AddressError)
     assert.equal(btcToSats(1_000_000_000, 'doge'), 100_000_000_000_000_000n)
+  })
+})
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * THE ANSWER THREE DIFFERENT NODES GIVE WHEN THEY HAVE NO FEE ESTIMATE.
+ *
+ * `feeRate` has always documented one behaviour — "no estimate, so take the relay floor" — and had
+ * it for one of the three spellings a bitcoin-family node actually uses. The other two came out as
+ * exceptions, so the documented fallback did not happen on two of the three nodes running on the
+ * mainnet estate host. Every shape below is a VERBATIM answer measured from those nodes on
+ * 2026-08-09, not a shape invented for a fake; the fake's own `{}` is neither of them and is the
+ * reason this went unnoticed. See `NO_ESTIMATE_RPC_MESSAGE` in `bitcoin.ts` for the sources.
+ *
+ * Also asserted, and it is the half that matters more: every OTHER node fault still propagates. A
+ * catch wide enough to swallow an outage would build every transaction on the estate at the relay
+ * floor and say nothing, which is a worse defect than the one this closes.
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ */
+describe('the fee estimate this deployment will never get', () => {
+  const paymentFee = (chain: BitcoinFamilyChainId, perVb: bigint): bigint =>
+    perVb * BigInt(vsizeOf(1, 2, chain))
+
+  it("takes the floor from litecoind's `errors` answer, which blocksonly makes permanent", async () => {
+    // `litecoind 0.21.5.6`, `/data/chains/litecoin/litecoin.conf: blocksonly=1`, at the tip
+    // (`initialblockdownload: false`, 3,156,788 blocks, 10 peers). Every target from 2 to 144
+    // answers this, and always will: with no mempool the estimator has nothing to learn from.
+    const node = fakeLtcNode({
+      feeAnswer: { errors: ['Insufficient data or no feerate found'], blocks: 0 },
+    })
+    assert.equal(await chainFor('ltc').estimateFee(node.call, BOUNDS), paymentFee('ltc', 1n))
+  })
+
+  it("takes the floor from dogecoind's `feerate: -1`, which is a number and is not a fee", async () => {
+    // `dogecoind 1.14.9`, whose Core base predates the `errors` array and uses the old sentinel.
+    // `-1` satisfies `typeof x === 'number'`, so it passed the guard and reached `btcToSats`,
+    // which refuses a negative amount — an `AddressError` out of a fee quote, on a chain whose
+    // node sets no `blocksonly` at all and simply has no estimate yet.
+    const node = fakeDogeNode({ feeAnswer: { feerate: -1, blocks: 25 } })
+    assert.equal(await chainFor('doge').estimateFee(node.call, BOUNDS), paymentFee('doge', 100n))
+    // And the floor it lands on is Dogecoin's own, not the one Bitcoin and Litecoin share. A
+    // hundredfold difference is the gap between a relayed transaction and a signed one nobody
+    // forwards, so falling back to the WRONG floor is barely better than throwing.
+    assert.notEqual(paymentFee('doge', 100n), paymentFee('doge', 1n))
+  })
+
+  it("takes the floor from bitcoind's `Fee estimation disabled`, which arrives as an exception", async () => {
+    // `bitcoind 27.0`, same `blocksonly=1`. Core 25 and later do not construct the estimator at
+    // all under it — `bitcoin/bitcoin`, `src/init.cpp`, `if (!peerman_opts.ignore_incoming_txs)` —
+    // and `src/rpc/server_util.cpp` `EnsureFeeEstimator` throws `RPC_INTERNAL_ERROR` with this
+    // message. Measured: `error code: -32603, error message: Fee estimation disabled`.
+    const node = fakeBtcNode({ feeError: 'Fee estimation disabled' })
+    assert.equal(await chainFor('btc').estimateFee(node.call, BOUNDS), paymentFee('btc', 1n))
+    // The sweep shape reads the same estimate through the tighter ceiling, and a sweep is the
+    // path with nobody watching — so it is the one where an exception becomes a deposit that is
+    // simply never consolidated.
+    const sweep = fakeBtcNode({
+      feeError: 'Fee estimation disabled',
+      utxos: [{ txid: '11'.repeat(32), vout: 0, sats: 5_000_000n }],
+    })
+    const quote = await chainFor('btc').sweepQuote(sweep.call, TREASURY, BOUNDS)
+    assert.ok(quote, 'a sweep of a funded address is still quotable without an estimator')
+  })
+
+  it('lets every other node fault propagate, so an outage cannot quietly become the floor', async () => {
+    // Real Core refusals, none of which says anything about the fee estimator. Each one means the
+    // node cannot be trusted to answer at all, and quoting the relay floor through them would
+    // build the estate's transactions at 1 sat/vB during an incident, silently.
+    for (const message of [
+      'Method not found',
+      'Loading block index...',
+      'Work queue depth exceeded',
+      'Insufficient funds',
+    ]) {
+      await assert.rejects(
+        () => chainFor('btc').estimateFee(fakeBtcNode({ feeError: message }).call, BOUNDS),
+        (err: unknown) => err instanceof RpcError && err.message === message,
+        `${message} must not be read as "no estimate"`,
+      )
+    }
+  })
+
+  it('still prefers a real estimate wherever a node has one, so the floor is a fallback', async () => {
+    // The floor being permanent HERE is a fact about this deployment's node configuration, not a
+    // decision this adapter makes. Point it at a relaying node and the estimate wins immediately.
+    const node = fakeLtcNode({ feerate: 0.00005 })
+    assert.equal(await chainFor('ltc').estimateFee(node.call, BOUNDS), paymentFee('ltc', 5n))
   })
 })

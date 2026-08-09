@@ -124,7 +124,10 @@ function runSuite() {
     })
     return { failures: [] }
   } catch (err) {
-    const out = `${err.stdout ?? ''}${err.stderr ?? ''}`
+    // Stripped of SGR escapes first: `node:test` colours its output whenever `FORCE_COLOR` is set,
+    // and a coloured `✖` line starts with an escape rather than whitespace, so the pattern below
+    // misses every one of them and reports every KILLED mutation as a survivor. @see mutations-fees.mjs
+    const out = (`${err.stdout ?? ''}${err.stderr ?? ''}`).replace(/\u001b\[[0-9;]*m/g, '')
     // `^\s*` and not `^\s+`: a case nested in a `describe` is indented, a top-level one is not.
     const names = [...out.matchAll(/^\s*✖ (.+?) \(/gm)].map((m) => m[1])
     return { failures: [...new Set(names)] }
