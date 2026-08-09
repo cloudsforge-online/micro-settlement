@@ -825,8 +825,22 @@ export function stuckDeadlinePassed(
   stuckMinutes: number,
   now: number = Date.now(),
 ): boolean {
-  const since = (row.broadcastAt ?? row.createdAt).getTime()
-  return now - since > Math.max(1, stuckMinutes) * 60_000
+  return (row.broadcastAt ?? row.createdAt) < stuckCutoff(stuckMinutes, now)
+}
+
+/**
+ * The same deadline as an INSTANT, for the callers that have to express it in SQL.
+ *
+ * `stuckDeadlinePassed` decides about a row already in memory; `stuck.ts` has to ask the same
+ * question of every open withdrawal at once and cannot pull them all back to do it. Both go through
+ * here so the clamp — `Math.max(1, …)`, which is what stops a misconfigured
+ * `SETTLEMENT_STUCK_MINUTES=0` from declaring every fresh broadcast stuck and paging on it — exists
+ * once. A second copy of that clamp in a `where` clause is exactly how the metric and the worker
+ * would come to disagree about which rows are stuck, and they must not: they are the two halves of
+ * one alert.
+ */
+export function stuckCutoff(stuckMinutes: number, now: number = Date.now()): Date {
+  return new Date(now - Math.max(1, stuckMinutes) * 60_000)
 }
 
 /* ------------------------------------------------------------------ asking the chain */
