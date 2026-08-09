@@ -236,7 +236,10 @@ function runSuite(fresh = false) {
     )
     return { failures: [] }
   } catch (err) {
-    const out = `${err.stdout ?? ''}${err.stderr ?? ''}`
+    // Stripped of SGR escapes first: `node:test` colours its output whenever `FORCE_COLOR` is set,
+    // and a coloured `✖` line starts with an escape rather than whitespace, so the pattern below
+    // misses every one of them and reports every KILLED mutation as a survivor. @see mutations-fees.mjs
+    const out = (`${err.stdout ?? ''}${err.stderr ?? ''}`).replace(/\u001b\[[0-9;]*m/g, '')
     const failures = [...out.matchAll(/^\s+✖ (.+?) \(/gm)].map((m) => m[1])
     return { failures }
   }

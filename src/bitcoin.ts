@@ -960,11 +960,14 @@ const DEFAULT_DUST: Readonly<Record<BitcoinFamilyChainId, bigint>> = Object.free
  * kilo-vbyte, **100 koinu/vB**.
  *
  * **THIS IS A FLOOR AND ITS ONLY USE IS TO REPLACE A MISSING ESTIMATE**, which is what makes the
- * hundredfold difference matter rather than merely be true. `feeRate` falls back to it when
- * `estimatesmartfee` has too little data — the ordinary state of a fresh node and of testnet — and a
- * Dogecoin transaction built at 1 koinu/vB would be a signed transaction no node forwards. The
- * failure would look exactly like a stuck mempool and would be permanent, because a policy floor
- * does not fall the way a fee market does.
+ * hundredfold difference matter rather than merely be true. `feeRate` falls back to it whenever the
+ * node says it has no estimate, and a Dogecoin transaction built at 1 koinu/vB would be a signed
+ * transaction no node forwards. The failure would look exactly like a stuck mempool and would be
+ * permanent, because a policy floor does not fall the way a fee market does.
+ *
+ * **ON THIS ESTATE THE FALLBACK IS NOT A FALLBACK, IT IS THE ONLY PATH.** This sentence used to
+ * read "the ordinary state of a fresh node and of testnet", which describes something a node grows
+ * out of. Nothing here grows out of it. See `NO_ESTIMATE_RPC_MESSAGE` below.
  */
 const MIN_RELAY_PER_VB: Readonly<Record<BitcoinFamilyChainId, bigint>> = Object.freeze({
   btc: 1n,
@@ -973,6 +976,113 @@ const MIN_RELAY_PER_VB: Readonly<Record<BitcoinFamilyChainId, bigint>> = Object.
 })
 /** How many blocks `estimatesmartfee` is asked to target. */
 const FEE_TARGET_BLOCKS = 3
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE FLOOR IS THIS DEPLOYMENT'S FEE SOURCE, PERMANENTLY AND BY DEPLOYMENT CHOICE. IT IS NOT A
+ * DEGRADED MODE AND NOTHING IS WAITING FOR IT TO END.**
+ *
+ * The note this block replaces — and its twin in `deploy/compose/docker-compose.estate.yml`, above
+ * `x-wallet-fee-quotes` — deferred a decision "once `estimatesmartfee` answers". It cannot answer,
+ * and the reason is a line in the node's own configuration rather than anything about the chain.
+ *
+ * ── WHAT WAS MEASURED, ON THE MAINNET ESTATE HOST, 2026-08-09 ───────────────────────────────────
+ *
+ *     /data/chains/litecoin/litecoin.conf   blocksonly=1  txindex=1  prune=0  par=3
+ *     getblockchaininfo    blocks 3156788, initialblockdownload FALSE, 10 peers, up 15h
+ *     getmempoolinfo       size 0, bytes 0, mempoolminfee 0.00001
+ *     estimatesmartfee 2|3|6|12|24|144
+ *                          {"errors":["Insufficient data or no feerate found"],"blocks":0}
+ *
+ * **"The node is still syncing" is not available as an explanation.** It is at the tip.
+ *
+ * `blocksonly=1` means the node accepts no loose transactions from peers, so its mempool is empty
+ * by construction. Core's estimator learns only by watching a transaction ENTER the mempool and
+ * later confirm, so a node with no mempool entries has nothing to learn from and never will. The
+ * chain is not quiet — the same 144 blocks carried 30,169 transactions.
+ *
+ * ── THE REAL CONDITION FOR REVISITING IS `blocksonly=0`, AND IT IS A DEPLOY DECISION ────────────
+ *
+ * Not a release, not a sync, not a busier chain. Somebody removes `blocksonly` from
+ * `litecoin.conf` and restarts the node, and then the estimator needs hours of mempool history
+ * before it answers at all. **This repository does not make that change and should not**: relay is
+ * the expensive half of running a node, and this box runs three chains beside sixty containers
+ * with `par=3` and `maxconnections=32`. micro-org#268 reaches the same conclusion from the
+ * operator's side and calls dropping `blocksonly` the wrong trade on this box.
+ *
+ * ── AND THE FLOOR IS ADEQUATE ON THE ONE CHAIN THIS DEPLOYMENT ACTUALLY RUNS, MEASURED ──────────
+ *
+ * `getblockstats` reports `feerate_percentiles` from CONFIRMED transactions, so it works fine under
+ * `blocksonly`. Over Litecoin mainnet blocks 3,156,645–3,156,788 (144 blocks, 30,169 transactions),
+ * read 2026-08-09, in litoshi/vB:
+ *
+ *     statistic                  median across blocks   p90 across blocks   max
+ *     block's 10th-pct feerate            1                     1            10
+ *     block's 50th-pct feerate            5                     5            10
+ *     block's 90th-pct feerate           11                    44           301
+ *     block's average feerate            12                    23            87
+ *
+ * The row that settles it is the first: in at least nine blocks out of ten, the cheapest tenth of
+ * the block's weight paid **1 litoshi/vB** — this floor exactly. Litecoin blocks have room, so a
+ * transaction built at the floor is in the band they routinely include. That is a measurement and
+ * not a hope, and it is the reason nothing here reaches for a live quote.
+ *
+ * **If a live quote is ever wanted it comes from `getblockstats`, not from `estimatesmartfee`** —
+ * percentiles over a trailing window, from confirmed blocks, available under `blocksonly`.
+ *
+ * ── THE RESIDUAL, STATED RATHER THAN LEFT TO BE DISCOVERED ──────────────────────────────────────
+ *
+ * `SETTLEMENT_RPC_URLS` carries `ember` and `ltc` today, so Litecoin is the only chain in this
+ * family that this measurement covers. `bitcoind` is running on the same host with the identical
+ * `blocksonly=1`, and Bitcoin's blocks are not Litecoin's: a BTC transaction at 1 sat/vB is above
+ * the relay floor and would still sit unconfirmed. **Pointing this service at that node is a
+ * deploy change that needs its own fee decision first**, and this block is where whoever makes it
+ * should stop. Nothing in this file blocks it, because a refusal nobody can test against a live
+ * endpoint is a refusal that breaks the day the endpoint appears.
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * The three ways a bitcoin-family node says **"I have no estimate"**, and they are three because
+ * the estate runs three Core lineages that are a decade apart.
+ *
+ * Every one of them means the same thing and every one of them takes the floor. Until this existed
+ * only the first was handled, and the other two came out of `feeRate` as exceptions — so the
+ * fallback the block above describes did not happen on two of the three nodes this host runs.
+ * Measured on the mainnet estate host, 2026-08-09:
+ *
+ *   1. **`feerate` absent, with an `errors` array.** `litecoind 0.21.5.6` (Core 0.21 lineage), and
+ *      any Core from 0.16. `{"errors":["Insufficient data or no feerate found"],"blocks":0}`.
+ *      Handled correctly since this function was written.
+ *
+ *   2. **`feerate: -1`.** `dogecoind 1.14.9`, whose Core base predates the `errors` array and uses
+ *      the old sentinel: `{"feerate":-1,"blocks":25}`. `-1` IS a number, so it passed the type
+ *      guard, and `btcToSats` refuses a negative amount — every DOGE fee quote would have thrown
+ *      `AddressError` rather than falling back to 100 koinu/vB. `dogecoind` does not even set
+ *      `blocksonly`; it simply has no estimate while it is 36% through its initial sync.
+ *
+ *   3. **A JSON-RPC error, `Fee estimation disabled`.** `bitcoind 27.0`, which does not construct
+ *      an estimator AT ALL under `blocksonly`. `bitcoin/bitcoin`, read at `master` on 2026-08-09:
+ *      `src/init.cpp` guards the estimator's construction with `if (!peerman_opts.ignore_incoming_txs)`
+ *      under the comment "Don't initialize fee estimation with old data if we don't relay
+ *      transactions, as they would never get updated", and `src/rpc/server_util.cpp`
+ *      `EnsureFeeEstimator` answers a null estimator with
+ *      `throw JSONRPCError(RPC_INTERNAL_ERROR, "Fee estimation disabled")`. Measured:
+ *      `error code: -32603, error message: Fee estimation disabled`. So on Core 25 and later,
+ *      `blocksonly` turns "no estimate" from a value into an exception — and this service's
+ *      transport turns a JSON-RPC `error` envelope into a thrown `RpcError` (`registry.ts`).
+ *
+ * **Only that exact message is caught, and that narrowness is the guarantee.** Every other RPC
+ * fault — a node that is down, a wrong credential, a method that does not exist — must still
+ * propagate. Swallowing them would build every transaction on the estate at the relay floor during
+ * an outage, silently, which is a far worse defect than the one this closes.
+ *
+ * BTC and DOGE have no endpoint in `SETTLEMENT_RPC_URLS` today, so (2) and (3) are latent rather
+ * than live. Both nodes are already running on this host; adding either chain to that variable is
+ * a one-line deploy edit, and until this change it was a one-line deploy edit that broke every fee
+ * quote on the chain it enabled.
+ */
+const NO_ESTIMATE_RPC_MESSAGE = 'Fee estimation disabled'
 
 /* ------------------------------------------------------------------ the two fee ceilings */
 
@@ -1142,13 +1252,28 @@ export function bitcoinChain(
    */
   async function feeRate(call: ChainCall, shape: OutboundShape): Promise<bigint> {
     const ceiling = shape === 'sweep' ? ceilings.sweep : ceilings.payment
-    const answer = await call.rpc('estimatesmartfee', [FEE_TARGET_BLOCKS])
+    let answer: unknown
+    try {
+      answer = await call.rpc('estimatesmartfee', [FEE_TARGET_BLOCKS])
+    } catch (err) {
+      // Spelling three of "I have no estimate", and the only exception this catches. Matched on
+      // Core's own words rather than on a code, which is the same rule `broadcast` follows for
+      // "transaction already in block chain" — and matched NARROWLY, because every other RPC fault
+      // here has to keep propagating. @see NO_ESTIMATE_RPC_MESSAGE
+      if (err instanceof Error && err.message.includes(NO_ESTIMATE_RPC_MESSAGE)) return floor
+      throw err
+    }
     const row = (answer ?? {}) as Record<string, unknown>
-    // `feerate` is the coin per kilovbyte. Absent means the node has too little data to estimate,
-    // which is a real state on a fresh node and on testnet — the floor is used rather than guessing
-    // high, and on Dogecoin that floor is a hundred times Bitcoin's. @see MIN_RELAY_PER_VB
-    if (typeof row['feerate'] !== 'number') return floor
-    const perKvb = btcToSats(row['feerate'], chain)
+    // `feerate` is the coin per kilovbyte. Spellings one and two of "I have no estimate": absent
+    // with an `errors` array on Core 0.16 and later, and the `-1` sentinel on the older lineage
+    // `dogecoind` still carries. Both take the floor rather than guessing high, and on Dogecoin
+    // that floor is a hundred times Bitcoin's. @see NO_ESTIMATE_RPC_MESSAGE, MIN_RELAY_PER_VB
+    //
+    // `!(quoted > 0)` and not `quoted <= 0`, so a `NaN` — which is a number to `typeof` and
+    // compares false against everything — lands on the floor instead of reaching `Math.round`.
+    const quoted = row['feerate']
+    if (typeof quoted !== 'number' || !(quoted > 0)) return floor
+    const perKvb = btcToSats(quoted, chain)
     const perVb = perKvb / 1_000n
     if (perVb < floor) return floor
     if (perVb > ceiling) return ceiling
