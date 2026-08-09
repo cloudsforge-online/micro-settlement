@@ -1,11 +1,11 @@
 /**
- * `withdrawal_stuck_total` — the number the estate's loudest page reads.
+ * `withdrawal_stuck` — the number the estate's loudest page reads.
  *
- * `WithdrawalStuck` fires on `withdrawal_stuck_total >= 1` for 5m at severity `page`, sev 1, and
+ * `WithdrawalStuck` fires on `withdrawal_stuck >= 1` for 5m at severity `page`, sev 1, and
  * `MoneyMetricContractMissing` names the same string inside an `absent()`. Measured on the mainnet
  * Prometheus on 2026-08-09: `MoneyMetricContractMissing` was firing, and firing on exactly this one
  * of its three disjuncts — `ledger_trial_balance_delta` and `indexer_lag_blocks` both had series and
- * `withdrawal_stuck_total` had never existed. So the page has never been able to fire either. This
+ * `withdrawal_stuck` had never existed. So the page has never been able to fire either. This
  * module is the missing exporter.
  *
  * ── WHAT COUNTS AS STUCK, AND WHY IT IS NOT SIMPLY "OPEN" ─────────────────────────────────────
@@ -60,26 +60,29 @@
  * These two disagree and the disagreement is in the deployed artefacts, so it is stated here rather
  * than quietly resolved. `_total` conventionally suffixes a monotonic counter, and Prometheus
  * tooling — `rate()`, `increase()`, the Grafana unit picker — assumes it. But the deployed rule is
- * `withdrawal_stuck_total >= 1`, which is a level: it asks "are any withdrawals stuck right now",
+ * `withdrawal_stuck >= 1`, which is a level: it asks "are any withdrawals stuck right now",
  * and its runbook expects the page to CLEAR once an operator adjudicates. A monotonic counter can
  * never clear, so exporting one under that expression would produce a page that fires on the first
  * stuck withdrawal the estate ever has and can then never be resolved without editing Prometheus.
  *
- * So this is registered `kind: 'gauge'` and the exposition says `# TYPE withdrawal_stuck_total
- * gauge`, matching what the rule reads rather than what the suffix implies. The right end state is
- * for the deploy repo to rename both the metric and the expression to `withdrawal_stuck`; that is a
- * change to a repository this one does not own, and until it happens the name the rule asks for is
- * the name that gets exported. Note that the increase-shaped signal already exists and is
- * unaffected: `settlement_stuck_total{chain,purpose}` is a genuine monotonic transition counter
- * incremented by `markStuck`, and it is emphatically NOT what this rule should be repointed at, for
- * the reason above.
+ * So the suffix went, rather than the gauge. The metric is `withdrawal_stuck`, registered
+ * `kind: 'gauge'`, and `alerts.yaml` reads `withdrawal_stuck >= 1` — renamed in the same release
+ * this metric first ships in, which is the only moment the rename is free. It had never been
+ * scraped anywhere: the rule has been deployed since the alerting plane was written and has been
+ * evaluating against no series the whole time, so there is no dashboard history to break and no
+ * recording rule to migrate. Every later moment costs a migration; this one costs an edit.
+ *
+ * Note that the increase-shaped signal already exists and is unaffected:
+ * `settlement_stuck_total{chain,purpose}` is a genuine monotonic transition counter incremented by
+ * `markStuck`, and it is emphatically NOT what this rule should be repointed at — `>= 1` against a
+ * counter is a page that fires on the estate's first stuck withdrawal and can never be cleared.
  *
  * ── ZEROS ARE PUBLISHED, WHICH IS HALF THE POINT ──────────────────────────────────────────────
  *
  * `MoneyMetricContractMissing` is an `absent()`, so a metric that appears only when something is
  * wrong answers it with "missing" on every healthy day. Every implemented chain on this
  * deployment's network is therefore seeded at 0 on every scrape, which both silences that alert
- * honestly and makes the healthy state legible: a `withdrawal_stuck_total{chain="btc"} 0` is a
+ * honestly and makes the healthy state legible: a `withdrawal_stuck{chain="btc"} 0` is a
  * positive statement that this service looked and found none, which absence never is.
  */
 
@@ -90,7 +93,7 @@ import { stuckCutoff } from './outbound.ts'
 import type { Db } from './outbox.ts'
 
 /** The exact string `alerts.yaml` names, in both `WithdrawalStuck` and `MoneyMetricContractMissing`. */
-export const WITHDRAWAL_STUCK = 'withdrawal_stuck_total'
+export const WITHDRAWAL_STUCK = 'withdrawal_stuck'
 
 export interface StuckWithdrawals {
   readonly chain: ChainId

@@ -246,7 +246,7 @@ const server = createServer({
     const stats = await queue.stats()
     metrics.set('jobs_pending', stats.pending)
     metrics.set('jobs_overdue', stats.overdue)
-    // `withdrawal_stuck_total` joins them here rather than being incremented by the worker, and
+    // `withdrawal_stuck` joins them here rather than being incremented by the worker, and
     // that is the whole design: a tally the worker keeps cannot report a dead worker, and a dead
     // worker is one of the two ways a withdrawal gets stuck. The route logs and continues if this
     // throws, so a scrape never fails on it. See `stuck.ts`.

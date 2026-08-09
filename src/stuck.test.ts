@@ -1,7 +1,7 @@
 /**
- * `withdrawal_stuck_total` — the metric behind the estate's loudest page.
+ * `withdrawal_stuck` — the metric behind the estate's loudest page.
  *
- * `WithdrawalStuck` is `withdrawal_stuck_total >= 1` for 5m at severity page, sev 1, and its
+ * `WithdrawalStuck` is `withdrawal_stuck >= 1` for 5m at severity page, sev 1, and its
  * runbook opens "freeze before diagnosing". `MoneyMetricContractMissing` names the same string in
  * an `absent()` and on 2026-08-09 was firing on exactly that disjunct and no other. So there are
  * two ways to get this wrong and they fail in opposite directions:
@@ -46,7 +46,7 @@ import {
  * silent, green-to-green breakage this file exists to prevent. One assertion pins the module's
  * constant to the literal, so there is still exactly one spelling in the source.
  */
-const STUCK = 'withdrawal_stuck_total'
+const STUCK = 'withdrawal_stuck'
 
 /**
  * `./stuck.ts`, imported per case rather than at the top of the file.
@@ -68,7 +68,7 @@ function gauge(metrics: Metrics, chain: string, network: string): number | null 
 
 /* ================================================================== without a database */
 
-describe('the shape withdrawal_stuck_total is exported in', () => {
+describe('the shape withdrawal_stuck is exported in', () => {
   /** A database with no stuck withdrawals to report: the healthy day the zeros have to survive. */
   const emptyDb = ((): readonly unknown[] => []) as unknown as Db
 
