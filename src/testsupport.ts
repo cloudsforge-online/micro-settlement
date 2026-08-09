@@ -418,6 +418,15 @@ export interface FakeCustody extends CustodyClient {
    * right to insist the difference be stated.
    */
   onSign?: ((request: SignRequest) => Promise<void>) | undefined
+  /**
+   * What the NEXT mint answers with, replacing whatever `fakeCustody({ mint })` fixed at
+   * construction.
+   *
+   * A rotation is two mints in one test and they must answer different addresses — the point of a
+   * rotation is that the pin MOVES. Without this the second provisioning re-mints the first
+   * address and the test proves nothing, quietly.
+   */
+  setMint(address: string): void
 }
 
 export function fakeCustody(options: { readonly mint?: string } = {}): FakeCustody {
@@ -429,6 +438,7 @@ export function fakeCustody(options: { readonly mint?: string } = {}): FakeCusto
   let failure: Error | null = null
   let pinFailure: Error | null = null
   let minted = 0
+  let mint = options.mint
 
   const fake: FakeCustody = {
     requests,
@@ -453,6 +463,9 @@ export function fakeCustody(options: { readonly mint?: string } = {}): FakeCusto
     },
     failTreasuryPin(err) {
       pinFailure = err
+    },
+    setMint(address) {
+      mint = address
     },
     async sign(request: SignRequest): Promise<SignedResult> {
       requests.push(request)
@@ -485,8 +498,7 @@ export function fakeCustody(options: { readonly mint?: string } = {}): FakeCusto
     },
     async mintTreasury(chain, network): Promise<TreasuryCandidate> {
       minted += 1
-      const address =
-        options.mint ?? canonicaliseEvm(`0x${minted.toString(16).padStart(40, 'c')}`)
+      const address = mint ?? canonicaliseEvm(`0x${minted.toString(16).padStart(40, 'c')}`)
       return { address, reused: false }
     },
     async pinTreasury(chain, network, address) {
@@ -511,9 +523,33 @@ export interface FakeIndexer extends IndexerClient {
    * under the wrong prefix is not in the custody set, and the failure would be indistinguishable
    * from not registering at all — silent, and visible only as a withdrawal freeze weeks later.
    */
-  readonly watched: readonly { readonly chain: string; readonly network: string; readonly address: string; readonly label: string }[]
+  readonly watched: readonly {
+    readonly chain: string
+    readonly network: string
+    readonly address: string
+    readonly label: string
+    /**
+     * The claim that travelled with the registration, which is a separate assertion from the label.
+     *
+     * A claim is a statement about an address's past and this service is entitled to make it for
+     * exactly one kind of address. Recording it here is what lets a test show that an ADOPTED pin
+     * never carries one — a wrong claim is invisible on this side and shows up one repository over
+     * as a balance derived over history nobody walked.
+     */
+    readonly freshlyDerived: boolean
+  }[]
   /** Refuse the next `watch`, as a missing `indexer:write` grant or an outage would. */
   setWatchFails(value: boolean): void
+  /**
+   * Behave like a UTXO chain the indexer walked from a cold-start height rather than from genesis.
+   *
+   * In that state the real indexer refuses a custody balance for any address for which nobody has
+   * stated a height below which it had no activity (micro-org#252, `history_unknown`), and an
+   * unwatched address has stated nothing — so the refusal survives every retry until somebody
+   * registers the address WITH a claim. That deadlock is the whole reason the derived-here path
+   * exists, and a fake that answers a number for an unwatched address cannot express it.
+   */
+  setColdStarted(value: boolean): void
   /**
    * What the indexer will say one address holds. Absent means it REFUSES, not that it holds zero.
    *
@@ -534,11 +570,18 @@ export interface FakeIndexer extends IndexerClient {
 export function fakeIndexer(): FakeIndexer {
   const known = new Map<string, IndexedTransaction>()
   const asked: string[] = []
-  const watched: { chain: string; network: string; address: string; label: string }[] = []
+  const watched: {
+    chain: string
+    network: string
+    address: string
+    label: string
+    freshlyDerived: boolean
+  }[] = []
   const measured: string[] = []
   const balances = new Map<string, bigint>()
   let unavailable = false
   let watchFails = false
+  let coldStarted = false
   return {
     asked,
     watched,
@@ -546,11 +589,30 @@ export function fakeIndexer(): FakeIndexer {
     setWatchFails(value) {
       watchFails = value
     },
+    setColdStarted(value) {
+      coldStarted = value
+    },
     setBalance(address, balance) {
       balances.set(address.toLowerCase(), balance)
     },
     async custodyBalance(_chain, _network, address) {
       measured.push(address)
+      if (coldStarted) {
+        // The claim, and only a claim made on THIS address, lifts the refusal. Checked against the
+        // watch log rather than a flag so the ordering is what decides it: a caller that measures
+        // before watching gets the refusal no matter how entitled it was to the claim it never
+        // made.
+        const claimed = watched.some(
+          (entry) => entry.address.toLowerCase() === address.toLowerCase() && entry.freshlyDerived,
+        )
+        if (!claimed) {
+          const { IndexerUnavailableError } = await import('./indexerclient.ts')
+          throw new IndexerUnavailableError(
+            `GET /v1/custody/…/addresses/${address} → 503 history_unknown: nobody has stated from ` +
+              'which height this address could have had activity',
+          )
+        }
+      }
       const balance = balances.get(address.toLowerCase())
       if (balance === undefined) {
         // Absent is a REFUSAL, never a zero — the same line the real indexer holds. A test that
@@ -565,12 +627,12 @@ export function fakeIndexer(): FakeIndexer {
         requiredConfirmations: 60,
       }
     },
-    async watch(chain, network, address, label) {
+    async watch(chain, network, address, label, freshlyDerived = false) {
       if (watchFails) {
         const { IndexerUnavailableError } = await import('./indexerclient.ts')
         throw new IndexerUnavailableError('the fake indexer refused the registration')
       }
-      watched.push({ chain, network, address, label })
+      watched.push({ chain, network, address, label, freshlyDerived })
     },
     set(hash, transaction) {
       if (transaction) known.set(hash.toLowerCase(), transaction)
