@@ -22,11 +22,12 @@ import { solanaChain } from './solana.ts'
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * THE CLAIMS THIS TABLE USED TO MAKE ABOUT CUSTODY, AND HOW EACH ONE WAS WRONG
  *
- * Two entries here carried paragraphs about what custody would and would not sign. Both are now
- * gone from the table because both chains are implemented, and both are summarised here instead —
- * not out of sentiment, but because **this file is the second place in this repository where a
- * confident claim about another repository turned out to be false**, and the pattern is worth
- * being able to recognise the third time.
+ * Four entries here have now carried paragraphs about what custody would and would not sign. All
+ * four are gone from the table because all four chains are implemented, and they are summarised
+ * here instead — not out of sentiment, but because **this is the recurring defect of a polyrepo**:
+ * a claim about another repository is a measurement with no test holding it, and nothing anywhere
+ * fails when it stops being true. Every claim about custody in this file now carries the date it
+ * was read, for that reason and no other.
  *
  *   * **The BTC entry was wrong when it was written.** It said "neither a withdrawal nor a sweep
  *     is possible until that policy exists", citing `SWEEPABLE_FAMILIES`. The gate it cited reads
@@ -44,6 +45,14 @@ import { solanaChain } from './solana.ts'
  *     `solanaShapeForPurpose` gives `mint` — the only shape `createAccount` is reachable under —
  *     to `deployer` alone, so a `treasury` address LOST `createAccount` in the same change that
  *     gave it a transfer.
+ *   * **The DOGE and ETC entries were true when written and went stale together**, and they went
+ *     stale in ONE upstream change, which is the part worth noticing. DOGE's said custody "has no
+ *     Dogecoin network parameters and derives P2WPKH only"; ETC's said custody "holds no Ethereum
+ *     Classic keys at all". Read again on 2026-08-09, `CHAIN_ASSET` names both `dogecoin` and
+ *     `ethereum-classic`, `BITCOIN_FAMILY_CHAINS` carries Dogecoin's parameters and a `p2pkh`
+ *     address kind, `signBitcoin` has a legacy prev-out path, `LEGACY_GAS_ONLY_CHAINS` names
+ *     `ethereum-classic`, and `FEE_RATE_CEILINGS` gives Dogecoin its own pair. Two refusals in
+ *     this table were, by then, describing a repository that no longer existed.
  *
  * What has NOT changed, and what this service therefore still does not ask for: SPL Transfer,
  * Approve, SetAuthority, Burn and CloseAccount are refused under all three Solana shapes. A SOL
@@ -65,15 +74,21 @@ const CHAINS: Readonly<Record<ChainId, OutboundChain>> = Object.freeze({
    * property that would have been a blocker on a 1559-only builder costs nothing here.
    *
    * What the chain argument does buy is `assertChainId`, which holds the node to the 61/63 the
-   * contract declares before anything is signed, and the 7,500-confirmation depth that `statusOf`
-   * reads through `chainSpec`. Neither is restated here.
+   * contract declares before anything is signed, and the confirmation depth that `statusOf` reads
+   * through `chainSpec`. Neither is restated here, and the depth in particular is not: ETC's is very
+   * deep on purpose — a chain that has been 51%-attacked repeatedly is one where finality is bought
+   * with blocks — and a local constant would be somebody's opportunity to decide it looked high.
    *
-   * **NO ENDPOINT IS CONFIGURED FOR IT AND NONE SHOULD BE.** The estate runs no Ethereum Classic
-   * node; `SETTLEMENT_RPC_URLS` has no `etc` key in any manifest, so every call on this chain ends
-   * at `NoEndpointError`, which is classified and refunded at the deadline. The adapter being
-   * capable and the deployment being pointed at a node are two decisions, and only the first is
-   * made here. The other half — custody holds no Ethereum Classic keys at all — is written up on
-   * `CUSTODY_CHAIN` in `chains.ts`.
+   * **NO ENDPOINT IS CONFIGURED FOR IT TODAY, AND THAT IS NOW A DEPLOYMENT FACT RATHER THAN A
+   * POLICY.** This entry used to say "and none should be", on the strength of three claims: the
+   * estate runs no Ethereum Classic node, nothing observes the chain, and custody holds no keys for
+   * it. **The third is no longer true** — custody's `CHAIN_ASSET` names `ethereum-classic`, its HD
+   * derivation gives it SLIP-0044 coin type 61, and `LEGACY_GAS_ONLY_CHAINS` names it so a type-2
+   * envelope can never be signed for it (all read on 2026-08-09). The other two still are. So the
+   * shape of the statement changes: pointing this service at an ETC node is a decision an operator
+   * may now legitimately make, and until they do, every call on this chain ends at
+   * `NoEndpointError`, which is classified and refunded at the deadline. The adapter being capable
+   * and the deployment being pointed at a node remain two decisions; only the first is made here.
    */
   etc: evmChain('etc'),
   btc: bitcoinChain('btc'),
@@ -88,42 +103,37 @@ const CHAINS: Readonly<Record<ChainId, OutboundChain>> = Object.freeze({
    */
   ltc: bitcoinChain('ltc'),
   /*
-   * **DOGECOIN IS BITCOIN-FAMILY AND IS NOT `bitcoinChain('doge')`. THE ONE-WORD EDIT IS THE BUG.**
+   * **DOGECOIN IS `bitcoinChain('doge')` NOW, AND THE ONE-WORD EDIT WAS STILL THE BUG.**
    *
-   * `chains.test.ts` says of Litecoin that "a chain can be added here with a one-word edit, and the
-   * one-word edit is what would have shipped Bitcoin's parameters under Litecoin's name". Dogecoin
-   * is the case where the one-word edit does not even have that excuse: `family: 'bitcoin'` in
-   * contracts-chain is true of its RPC and its transaction structure, and false of the only thing
-   * this adapter needs.
+   * This entry was an `unimplementedChain` and its refusal is worth keeping in front of whoever
+   * reads this next, because the work it named is precisely the work that was done — it was a
+   * SPECIFICATION, not an excuse:
    *
-   * **Dogecoin has no segwit.** Its addresses are base58 only — P2PKH at version byte 0x1e, P2SH at
-   * 0x16 — and this builder is P2WPKH from end to end:
+   *   * "`encodePsbt` adds every input as a `witnessUtxo`", which a base58 input cannot be signed
+   *     as. `bitcoin.ts` now chooses the field from `ADDRESS_KIND`, and Dogecoin's inputs carry
+   *     `nonWitnessUtxo` — the whole funding transaction, fetched per input and cached per PSBT.
+   *   * "`vsizeOf` charges 41 base vbytes plus a 27-vbyte witness per input", which under-quotes a
+   *     P2PKH input by more than half. `vsizeOf` is per-kind now: 148 bytes an input, 34 an output,
+   *     no discount anywhere. That was the half that did NOT fail loudly, and it is why the two
+   *     could not be done one at a time.
    *
-   *   * `encodePsbt` adds every input as a `witnessUtxo`. bitcoinjs-lib refuses to sign a
-   *     non-witness script presented that way, so a Dogecoin PSBT built here is unsignable — which
-   *     is the good half, because it fails loudly.
-   *   * `vsizeOf` charges 41 base vbytes plus a 27-vbyte witness per input. A P2PKH input is ~148
-   *     bytes with no witness discount, so the fee this service quoted would be under half the
-   *     transaction's real size: a payment that is built, signed, broadcast and then dropped by
-   *     every node below the relay floor. That one does NOT fail loudly, and it is the reason this
-   *     entry exists rather than a row in `NETWORKS`.
+   * **AND THE CLAIM ABOUT CUSTODY WAS ALREADY STALE WHEN IT WAS READ**, which is the fourth one
+   * this file's header has had to record. It said "custody has no Dogecoin network parameters and
+   * derives P2WPKH only, so the signing half does not exist either". Read again on 2026-08-09:
+   * `CHAIN_ASSET` names `dogecoin`, `BITCOIN_FAMILY_CHAINS` carries Dogecoin's mainnet and testnet
+   * parameters, `bitcoinAddressKind` answers `p2pkh` for it, `signBitcoin` has a `legacyPrevOut`
+   * path that requires and verifies `nonWitnessUtxo`, and `FEE_RATE_CEILINGS` gives Dogecoin its own
+   * pair. Custody's half is built. The claim was true when written and nothing announced its end —
+   * the same pattern as the SOL entry above, and the reason every claim here now carries the date it
+   * was read.
    *
-   * Custody cannot sign it either, read on 2026-08-09 rather than assumed — the mistake this file's
-   * header records four times over. `CHAIN_ASSET` has no `dogecoin`, `BITCOIN_FAMILY_NETWORKS` has
-   * no Dogecoin parameters, `bitcoinNetwork` throws for it by design and custody's own suite
-   * asserts that it throws, and custody derives P2WPKH and nothing else. So both halves are new
-   * work — a non-segwit build path here and a non-segwit derive-and-sign path there — which is
-   * 29-native-assets.md's "half an integration each", not a configuration change.
+   * **WHAT IS STILL TRUE: THERE IS NO DOGECOIN ENDPOINT.** `SETTLEMENT_RPC_URLS` has no `doge` key
+   * in any manifest, so every call on this chain ends at `NoEndpointError` — classified, refunded at
+   * the deadline, and reported at boot as an unavailable chain rather than discovered from a refused
+   * withdrawal an hour later. The adapter being capable and the deployment being pointed at a node
+   * are two decisions, exactly as for `etc` above.
    */
-  doge: unimplementedChain(
-    'doge',
-    'phase 8 — Dogecoin, a UTXO chain with no segwit',
-    'Dogecoin is bitcoin-family and this adapter is P2WPKH from end to end: it commits every input ' +
-      'as a witnessUtxo, which a base58 Dogecoin input cannot be signed as, and it prices vsize ' +
-      'with the witness discount, which would under-quote a Dogecoin fee by more than half and ' +
-      'produce a signed payment no node relays. Custody has no Dogecoin network parameters and ' +
-      'derives P2WPKH only, so the signing half does not exist either.',
-  ),
+  doge: bitcoinChain('doge'),
   sol: solanaChain(),
   xrp: unimplementedChain(
     'xrp',
@@ -143,6 +153,34 @@ export function chainFor(chain: ChainId): OutboundChain {
 /** Chains this deployment can actually move money on. Used by the fee route and by the sweeper. */
 export function implementedChains(): readonly ChainId[] {
   return CHAIN_IDS.filter((id) => CHAINS[id].unimplementedPhase === null)
+}
+
+/**
+ * Whether each chain can move money right now, and why not when it cannot.
+ *
+ * **The two ways a chain is unavailable are different tickets, so they are different words.**
+ * `unimplemented` is this build's limitation and no deploy change fixes it; `no_endpoint` is the
+ * deploy's and no release fixes it. Reported as one line at boot for every `ChainId` — including
+ * the ones that do not work, which is the whole point, because a chain that is simply absent from
+ * a list is a chain an operator cannot ask a question about.
+ *
+ * **Nothing here reads a URL, only whether one is present.** `urls` is a secret: see the boot line
+ * in `index.ts` and `redactUserinfo` in `env.ts`.
+ */
+export type ChainAvailability = 'ready' | 'no_endpoint' | 'unimplemented'
+
+export function chainStatuses(
+  urls: Readonly<Record<string, string>>,
+): readonly { readonly chain: ChainId; readonly status: ChainAvailability }[] {
+  return CHAIN_IDS.map((chain) => ({
+    chain,
+    status:
+      CHAINS[chain].unimplementedPhase !== null
+        ? 'unimplemented'
+        : urls[chain]
+          ? 'ready'
+          : 'no_endpoint',
+  }))
 }
 
 /* ------------------------------------------------------------------ the transport */
@@ -178,9 +216,9 @@ export class NoEndpointError extends Error {
  * The endpoint is configured, and its credentials cannot be read.
  *
  * **A subclass of `NoEndpointError` on purpose.** Every place that already classifies a missing
- * endpoint reaches it by `instanceof` — `jobs.ts:310` (do not retry, this will not clear on a
- * tick), `server.ts:390` (503 `no_endpoint`), `withdrawals.ts:469` (classification `endpoint`,
- * refunded at the deadline rather than immediately) — and the two faults are the same kind: an
+ * endpoint reaches it by `instanceof` — `jobs.ts` (do not retry, this will not clear on a tick),
+ * `server.ts` (503 `no_endpoint`), `withdrawals.ts` (classification `endpoint`, refunded at the
+ * deadline rather than immediately) — and the two faults are the same kind: an
  * operator wrote `SETTLEMENT_RPC_URLS` in a way this service cannot use, and nothing on that chain
  * moves until they write it again. Inheriting means the classification is not forgotten in three
  * files by whoever adds the fourth.
@@ -301,7 +339,7 @@ export function rpcFactory(options: RpcOptions): (chain: ChainId) => JsonRpc {
         defaultRetries: 0,
         /*
          * The STATIC bag, not `token`. `@cloudsforge/http` merges four sources in a fixed order
-         * (runtime/packages/http/src/index.ts:374-393): the accept default, this bag, then
+         * (`runtime/packages/http/src/index.ts`): the accept default, this bag, then
          * `token` as a Bearer, then the caller's per-request headers. A node credential is a
          * default for every call to this node and not an instruction for one call, so this is
          * its layer — and `token` is the wrong one twice over: it emits `Bearer`, and it would

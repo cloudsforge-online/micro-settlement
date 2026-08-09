@@ -8,6 +8,7 @@
 
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { chainSpec } from '@cloudsforge/contracts-chain'
 import { keccak256, sha3_256 } from './keccak.ts'
 import {
   TRANSFER_GAS,
@@ -300,21 +301,68 @@ describe('building an EVM transfer', () => {
    * are both asserted, because a builder that added them alongside `gasPrice` would still leave
    * `type` at 0.
    */
-  it('builds ETC as legacy, with no 1559 field and against the 63 the contract pins', async () => {
+  it('builds ETC as legacy, with no 1559 field, on BOTH networks', async () => {
     const etc = chainFor('etc')
-    const node = fakeNode({ chainId: 63, balances: { [TREASURY.toLowerCase()]: 10n ** 19n } })
-    const unsigned = await etc.build(
-      { network: 'testnet', rpc: node.rpc },
-      { from: TREASURY, to: ALICE, value: 10n ** 17n, fee: TEST_FEE, bounds: TEST_BOUNDS, shape: 'payment' },
-    )
-    const payload = fields(unsigned.payload)
-    assert.equal(payload['type'], 0)
-    assert.equal(payload['chainId'], 63)
-    assert.equal(payload['maxFeePerGas'], undefined)
-    assert.equal(payload['maxPriorityFeePerGas'], undefined)
-    assert.equal(payload['gasPrice'], '40000000000')
+    /*
+     * **BOTH NETWORKS, AND THE EXPECTED IDS COME FROM THE CONTRACT RATHER THAN FROM HERE.**
+     *
+     * 61 is ETC mainnet and 63 is Mordor. Writing them as literals in this file would make the test
+     * agree with itself: the value the builder emits is read from the same exact-pinned package the
+     * assertion would then restate, so a wrong entry there would move both sides together. What is
+     * pinned as a literal instead is the SHAPE of the mistake — that the two networks are different
+     * and that neither is Ethereum's — plus the numbers in one place, `chainSpec`, which custody
+     * resolves independently and refuses a disagreement with.
+     */
+    const expected = chainSpec('ETC').chainId!
+    assert.notEqual(expected.mainnet, expected.testnet, 'a shared id is a signature valid on both')
+    assert.notEqual(expected.mainnet, chainSpec('ETH').chainId!.mainnet)
+    assert.equal(expected.mainnet, 61)
+    assert.equal(expected.testnet, 63)
+
+    for (const network of ['mainnet', 'testnet'] as const) {
+      const node = fakeNode({
+        chainId: expected[network],
+        balances: { [TREASURY.toLowerCase()]: 10n ** 19n },
+      })
+      const unsigned = await etc.build(
+        { network, rpc: node.rpc },
+        { from: TREASURY, to: ALICE, value: 10n ** 17n, fee: TEST_FEE, bounds: TEST_BOUNDS, shape: 'payment' },
+      )
+      const payload = fields(unsigned.payload)
+      assert.equal(payload['type'], 0, network)
+      assert.equal(payload['chainId'], expected[network], network)
+      assert.equal(payload['maxFeePerGas'], undefined, network)
+      assert.equal(payload['maxPriorityFeePerGas'], undefined, network)
+      assert.equal(payload['gasPrice'], '40000000000', network)
+      // The fee is EXACT at plan time on a legacy chain, and this is where that is visible: what
+      // the row books is `gasLimit * gasPrice`, with no base fee to move between the quote and the
+      // block and no priority-fee refund afterwards. Nothing in this service reads a receipt to
+      // correct a fee, and on ETC there is nothing a receipt could correct.
+      assert.equal(unsigned.fee, TEST_FEE, network)
+      assert.equal(BigInt(String(payload['gasPrice'])) * TRANSFER_GAS, TEST_FEE, network)
+    }
+
+    // The mainnet id on the testnet network and the reverse: the gate is the pair, not the value.
+    // A node answering 61 for a Mordor withdrawal is a node whose signature spends mainnet coin.
+    for (const [network, wrong] of [
+      ['testnet', expected.mainnet],
+      ['mainnet', expected.testnet],
+    ] as const) {
+      const node = fakeNode({ chainId: wrong, balances: { [TREASURY.toLowerCase()]: 10n ** 19n } })
+      await assert.rejects(
+        etc.build(
+          { network, rpc: node.rpc },
+          { from: TREASURY, to: ALICE, value: 1n, fee: TEST_FEE, bounds: TEST_BOUNDS, shape: 'payment' },
+        ),
+        /this build is pinned to/,
+        `${network} accepted chain id ${wrong}`,
+      )
+    }
+
     // And the same chain-id gate as every other EVM chain: a node answering Ethereum's 1 here is
-    // one whose signatures would be replayable on a chain with 12,000 times the value on it.
+    // one whose signatures would be replayable on a chain with far more value on it — which is the
+    // reason `custodyChainOf('etc')` may never be `ethereum` either. The two guards sit at
+    // different times: this one before signing, that one before an address is even adopted.
     const ethereum = fakeNode({ chainId: 1, balances: { [TREASURY.toLowerCase()]: 10n ** 19n } })
     await assert.rejects(
       etc.build(

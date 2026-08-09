@@ -374,11 +374,20 @@ export interface Env {
    * `chain → JSON-RPC endpoint`. Empty by default, which makes a chain with no endpoint refuse
    * rather than fall back to a public node nobody chose.
    *
+   * **A CHAIN IS ADDED HERE AND NOWHERE ELSE — THERE IS NO PER-CHAIN VARIABLE AND THERE MUST NOT
+   * BE.** `doge` and `etc` became buildable on 2026-08-09 and neither needed a new variable: this
+   * map's keys are the chain slugs, so a deployment points at a Dogecoin node by growing a key. A
+   * `DOGE_RPC_URL` beside it would be a second place a chain can be configured and a second place
+   * it can be forgotten, and under rule 9 it would also be a variable this service declares and
+   * only sometimes reads. An absent key is not an error at boot: the chain reports `no_endpoint`
+   * (see `chainStatuses` in `registry.ts`) and every call on it ends at a classified
+   * `NoEndpointError`, refunded at the deadline.
+   *
    * **THIS MAP CAN HOLD A PASSWORD.** Bitcoin, Litecoin and Dogecoin Core speak HTTP Basic and
    * have no anonymous mode, so their entries are `http://rpcuser:rpcpassword@host:8332` and
    * `registry.ts` turns that userinfo into an `Authorization` header. Nothing may print a value
-   * from this map: `index.ts` reports `Boolean(env.rpcUrls[chain])` at boot and not the URL, and
-   * the parse failure above is redacted before it is sliced.
+   * from this map: `index.ts` reports a per-chain STATUS at boot and never a URL, and the parse
+   * failure above is redacted before it is sliced.
    */
   readonly rpcUrls: Readonly<Record<string, string>>
   readonly rpcDeadlineMs: number

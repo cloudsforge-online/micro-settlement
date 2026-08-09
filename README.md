@@ -171,48 +171,65 @@ withdrawal path to pay it back — leaving the tokens at the deposit address is 
 
 ## Chains
 
-`ember`, `eth` and `etc` are one implementation (`src/evm.ts`); `btc` and `ltc` are another
-(`src/bitcoin.ts`) and `sol` is `src/solana.ts`. `xrp` and `doge` are **real objects on the real
-interface that throw `NotImplementedError` naming their phase** — not absent from the registry, not
-stubs returning zero. `chainFor` is total, so an unsupported chain is a classified,
-immediately-refunded build failure rather than a `TypeError` in a job handler.
+`ember`, `eth` and `etc` are one implementation (`src/evm.ts`); `btc`, `ltc` and `doge` are another
+(`src/bitcoin.ts`) and `sol` is `src/solana.ts`. `xrp` is a **real object on the real interface that
+throws `NotImplementedError` naming its phase** — not absent from the registry, not a stub returning
+zero. `chainFor` is total, so an unsupported chain is a classified, immediately-refunded build
+failure rather than a `TypeError` in a job handler.
 
-**ETC and DOGE arrived together in `contracts-chain` and landed on opposite sides of that line, for
-one reason: family membership says what the RPC and the transaction structure are, and says nothing
-about whether the adapter's assumptions hold.** Both looked like a one-word registry edit.
+**ETC and DOGE arrived together in `contracts-chain` and cost wildly different amounts, for one
+reason: family membership says what the RPC and the transaction structure are, and says nothing
+about whether the adapter's assumptions hold.** Both looked like a one-word registry edit, and only
+one of them was.
 
 * **Ethereum Classic really was one.** It never adopted London, so it has no base fee and will not
   accept a `maxFeePerGas` — but `evm.ts` has only ever built `type: 0` with a `gasPrice`, for Ember
   (whose node has no type-2 decoder) as much as for Ethereum. The shape that already served both is
   the shape ETC requires, so the pre-London property costs nothing here; `assertChainId` holds the
-  node to 61/63 and the 7,500-confirmation depth arrives through `chainSpec`. **No `etc` endpoint is
-  configured and none should be** — the adapter being capable and the deployment being pointed at a
-  node are two decisions, and only the first has been made.
-* **Dogecoin was not.** It has no segwit: its addresses are base58 only, and `bitcoin.ts` is P2WPKH
-  end to end. `bitcoinChain('doge')` would commit every input as a `witnessUtxo`, which bitcoinjs-lib
-  will not sign for a non-witness script, and would price `vsize` with the witness discount — a fee
-  under half the transaction's real size, which is a *signed* payment that every node then drops
-  below the relay floor. The first failure is loud; the second is not, and it is why there is an
-  `unimplementedChain` entry instead of a row in `NETWORKS`. Custody has no Dogecoin parameters and
-  derives P2WPKH only, so both halves are new work.
+  node to 61/63 and the 7,500-confirmation depth arrives through `chainSpec` rather than through any
+  constant in this service. Legacy gas also makes the plan-time booking *exact*: `gasLimit ×
+  gasPrice` is the fee, there is no base fee to move under it, and so there is nothing a receipt
+  could reconcile afterwards.
+* **Dogecoin was not, and the one-word edit was the bug rather than the fix.** It has no segwit in
+  practice: its addresses are base58 only. `bitcoinChain('doge')` alone would commit every input as
+  a `witnessUtxo`, which bitcoinjs-lib will not sign for a non-witness script, and would price
+  `vsize` with the witness discount — a fee under half the transaction's real size, which is a
+  *signed* payment that every node then drops below a relay floor a hundred times Bitcoin's. The
+  first failure is loud; the second is not. What the chain now selects instead is an **address
+  kind**: `p2pkh` means the PSBT carries `nonWitnessUtxo` — the whole previous transaction, fetched
+  once per funding txid — and `vsizeOf` prices at 148 bytes an input with no discount applied.
 
-**Litecoin is `bitcoinChain('ltc')` — the same code, and deliberately not the same constants.** It
-speaks the same JSON-RPC and has the same transaction structure, so the follower, the coin selector,
-the PSBT encoder and the UTXO death proof are reused unchanged. What the chain argument selects is
-everything that is a property of the chain rather than of the software:
+**Litecoin and Dogecoin are `bitcoinChain(…)` — the same code, and deliberately not the same
+constants.** All three speak the same JSON-RPC and have the same transaction structure, so the
+follower, the coin selector, the PSBT encoder and the UTXO death proof are reused unchanged. What
+the chain argument selects is everything that is a property of the chain rather than of the
+software:
 
-| | BTC | LTC | why it is not shared |
-|---|---|---|---|
-| bech32 HRP | `bc` / `tb` | `ltc` / `tltc` | the HRP is inside the checksum, so this is a binding |
-| P2PKH / P2SH version | 0 / 5 | 48 / 50 | Core encodes `SCRIPT_ADDRESS2` 50, not the 5 it also decodes |
-| confirmations | 6 | **12** | ~2.5-minute blocks on a fraction of the hashrate |
-| dust threshold | 546 | **5,460** | `DUST_RELAY_TX_FEE` is 3,000 against 30,000 |
-| supply cap | 21e6 | 84e6 | a sanity bound on a node's JSON answer |
+| | BTC | LTC | DOGE | why it is not shared |
+|---|---|---|---|---|
+| address kind | `p2wpkh` | `p2wpkh` | **`p2pkh`** | decides `witnessUtxo` against `nonWitnessUtxo`, and the vsize model with it |
+| bech32 HRP | `bc` / `tb` | `ltc` / `tltc` | **none** | the HRP is inside the checksum, so this is a binding |
+| P2PKH / P2SH version | 0 / 5 | 48 / 50 | 30 / 22 | Core encodes Litecoin's `SCRIPT_ADDRESS2` 50, not the 5 it also decodes |
+| confirmations | 6 | 12 | 30 | read from `chainSpec`, never from a literal here |
+| dust threshold | 546 | 5,460 | **1,000,000** | Dogecoin's is a flat `COIN / 100`, not a fee-rate function |
+| min relay per vB | 1 | 1 | **100** | `DEFAULT_MIN_RELAY_TX_FEE` is 0.01 DOGE per kvB |
+| our fee ceiling, sweep / payment | 900 / 4,500 | 900 / 4,500 | **9,000 / 45,000** | Dogecoin's *ordinary* fee is ~1,000 koinu/vB |
+| supply cap | 21e6 | 84e6 | 100e9 | a sanity bound on a node's JSON answer |
 
-The dust threshold is the one where copying Bitcoin's number is not merely inaccurate: 546 sits
-*below* Litecoin's real threshold, so a change output between the two would be built, signed, and
-refused by every node as `dust` — a broadcast failure after a signature. The fee ceilings are
-deliberately NOT per-chain, because custody's are not; see `assertUnderCustodysCeiling`.
+Every number in that table was read from the chain's own source — `policy.h`, `validation.h`,
+`amount.h`, `chainparams.cpp` — and `src/bitcoin.ts` cites the file each one came from beside it.
+Two of the rows are the kind that costs money rather than accuracy:
+
+* **Dust.** 546 sits *below* Litecoin's real threshold, so a change output priced with Bitcoin's
+  number would be built, signed, and refused by every node as `dust` — a broadcast failure after a
+  signature.
+* **The fee ceiling, which used to be shared and is now per-chain.** The old sweep bound of 900
+  sat/vB sat *below Dogecoin's normal fee rate of ~1,000 koinu/vB*, so a correctly-priced Dogecoin
+  sweep would have been refused by this service as extortionate before custody ever saw it — the
+  ceiling would have functioned as an outage rather than as a guard. Each chain now carries its own
+  pair, held below the pair we believe custody enforces so that a bad fee is a classified local
+  refusal with a refund rather than a 403 from a service the operator does not run. See
+  `assertUnderCustodysCeiling`.
 
 **A UTXO node is reached with HTTP Basic, and the credential travels in `SETTLEMENT_RPC_URLS`.**
 Bitcoin, Litecoin and Dogecoin Core have no anonymous JSON-RPC mode and no cookie path a container
@@ -225,8 +242,9 @@ into `Authorization: Basic …`. Two consequences an operator has to know:
   service decodes before it authenticates, so getting this wrong is not a parse error you can see —
   it is a 401 on a password that is correct. An escape that is not valid percent-encoding is
   refused by name at the first call on that chain, with the value never printed.
-* **This variable is therefore a secret.** Nothing prints a value from it: the boot line reports
-  `endpoint: true/false` per chain and not the URL, and a map that will not parse is redacted to
+* **This variable is therefore a secret.** Nothing prints a value from it: the boot line reports a
+  per-chain STATUS — `ready`, `no_endpoint` or `unimplemented` — and never the URL, and a map that
+  will not parse is redacted to
   `//***:***@host` before the diagnostic is truncated. `env.ts` `redactUserinfo` is that rule, and
   `env.test.ts` pins it.
 
@@ -234,12 +252,27 @@ This is why `URL.origin` alone was not enough. `origin` is scheme, host and port
 userinfo — so a client built on it sent no credential and every Litecoin call was answered 401,
 against a node that was up, synced and reachable the whole time.
 
-**Taproot destinations are refused on both chains.** `bitcoinjs-lib` routes witness version 1
+**Taproot destinations are refused on both segwit chains.** `bitcoinjs-lib` routes witness version 1
 through `p2tr`, which throws without `initEccLib`, and nothing in this estate calls it — not this
 service, which has no secp256k1 package, and not custody, which has one it never initialises. So a
 `bc1p…` or `ltc1p…` address cannot be built for or signed, and `wallet` refuses one at request time
 rather than reserving a balance against it. Making them payable means a native binding in both
 services, for a destination form rather than a chain; it was not done in the change that found it.
+
+**Any bech32 destination is refused on Dogecoin, by the chain and not by the encoding.**
+`validateAddress` asks `addressKindFor` first: a `p2pkh` chain rejects a `bech32`-looking string
+before bitcoinjs is given the chance to decode it against a network whose HRP is the empty one.
+Without that check the refusal would depend on a checksum happening not to validate, and the
+mirror-image bug — a `bc1…` accepted for a Litecoin withdrawal because the HRPs were never compared
+— is the one this codebase has already had once and pins a test against.
+
+**Neither `etc` nor `doge` has an endpoint in this estate, and that is a separate decision from
+having an adapter.** As read on 2026-08-09 no deploy manifest interpolates either key into
+`SETTLEMENT_RPC_URLS`. A chain with an adapter and no endpoint is reported `no_endpoint` at boot and
+refuses each request by name; **it does not stop the service starting**, because one unconfigured
+chain taking down settlement for the six that are configured would be the worse failure. Custody
+carries `dogecoin` and `ethereum-classic` (read the same day), so the remaining work is operational
+— a node, a treasury pin, and an indexer that watches the chain — and not a code dependency.
 
 A withdrawal and a sweep are built to **different shapes**, because custody applies a different
 signing policy to each: a sweep's destination is chosen by the vault and not by this service, and on

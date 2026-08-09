@@ -1,5 +1,5 @@
 /**
- * The outbound chain interface, and the five objects that implement it.
+ * The outbound chain interface, and the objects that implement it.
  *
  * **Nothing in `@cloudsforge/contracts-chain` is redefined here.** Decimals, confirmation depths
  * and chain ids are read from that package and never restated, because the whole reason it is
@@ -8,11 +8,15 @@
  * not meant for. Custody resolves the chain id independently from the address's own row
  * (`gates.resolveChainId`) and refuses a disagreement, which is the second half of the same rule.
  *
- * ## Four implemented, one real and unimplemented
+ * ## Seven implemented, one real and unimplemented
  *
- * `eth` and `ember` are one implementation — see `evm.ts`. An EMBER payment is a legacy (type 0)
- * EVM transaction against a standard `eth_*` endpoint, so the two differ only in which node answers
- * and which chain id the signature commits to. `btc` is `bitcoin.ts`; `sol` is `solana.ts`.
+ * `eth`, `ember` and `etc` are ONE implementation — see `evm.ts`. All three are legacy (type 0) EVM
+ * transactions against a standard `eth_*` endpoint, so they differ only in which node answers and
+ * which chain id the signature commits to. `btc`, `ltc` and `doge` are one implementation too —
+ * `bitcoin.ts` — but not in the same sense: Dogecoin has no segwit, so that file chooses its
+ * address kind, its prev-out field, its vsize model, its dust threshold, its relay floor and its
+ * fee ceiling per chain rather than sharing one set. Sharing a MODULE is not sharing PARAMETERS,
+ * and that distinction is the whole of the Dogecoin work. `sol` is `solana.ts`.
  *
  * `xrp` is **a real object on this interface that throws `NotImplementedError` naming the phase
  * that brings it**. It is not a stub that returns zero, it is not absent from the registry, and
@@ -138,34 +142,50 @@ export function familyOf(chain: ChainId): ChainFamily {
  *
  * **`ltc → 'litecoin'` IS THE SECOND ENTRY THAT EARNS THIS TABLE**, and it earns it twice over.
  * Getting it wrong is not a 500: custody resolves the signing parameters from the row's stored
- * chain name (`custody/src/chains.ts`, `bitcoinNetwork`), so `'ltc'` sent where `'litecoin'` is
- * expected is refused outright, and — worse — a name that resolved to `'bitcoin'` would sign a
- * Litecoin PSBT with a Bitcoin key. The value here is verified against
- * `custody/src/chains.ts:CHAIN_ASSET`, which spells it `litecoin`.
+ * chain name (`custody/src/chains.ts`), so `'ltc'` sent where `'litecoin'` is expected is refused
+ * outright, and — worse — a name that resolved to `'bitcoin'` would sign a Litecoin PSBT with a
+ * Bitcoin key. The value here is verified against custody's own `CHAIN_ASSET`, which spells it
+ * `litecoin`.
  *
- * ── THE LAST TWO ENTRIES ARE PROPOSALS, AND THIS PARAGRAPH IS WHY THAT IS SAFE ─────────────────
+ * ── THE LAST TWO ENTRIES WERE PROPOSALS UNTIL 2026-08-09, AND ARE NOT ANY MORE ─────────────────
  *
- * **Custody names neither Ethereum Classic nor Dogecoin today.** Read on 2026-08-09: its
- * `CHAIN_ASSET` holds exactly `ethereum`, `bitcoin`, `litecoin`, `solana`, `xrp`, `ember` and the
- * generic `evm`, and `isKnownChain` is a `hasOwn` over that object — so `/v1/addresses` cannot mint
- * an ETC or DOGE key at all, and there is no stored row for either name to be compared against.
- * These two values are therefore what this service WOULD send, not something checked against a row
- * that exists, and they must be confirmed against custody on the day it grows an entry.
+ * This paragraph used to say custody named neither Ethereum Classic nor Dogecoin, that its
+ * `CHAIN_ASSET` held exactly `ethereum`, `bitcoin`, `litecoin`, `solana`, `xrp`, `ember` and the
+ * generic `evm`, and that these two values were therefore what this service WOULD send rather than
+ * anything checked against a row that exists. **Read again on 2026-08-09, custody names both**:
+ * `CHAIN_ASSET` carries `dogecoin → 'DOGE'` and `'ethereum-classic' → 'ETC'`, `isKnownChain` is
+ * still a `hasOwn` over that object and now answers true for both, so `/v1/addresses` mints keys
+ * for either and there is a stored row for each name to be compared against. The instruction that
+ * accompanied the change said custody had them and asked for the dependency to be made explicit;
+ * it is explicit here, dated, and it is a confirmation rather than a proposal.
  *
- * A name custody does not know is refused, which is the failure this service can afford. The one
- * that must never be written here is `ethereum` for `etc`: an EVM address is the same 20 bytes on
- * both chains, so custody would return the Ethereum treasury's address for an ETC pin and the two
- * positions would be one row in this service's books. The signature itself would still be refused —
- * `expectedEvmChainId('ethereum')` is 1/11155111 against the 61/63 an ETC payload declares, and
- * SD-09 gate 3 compares them — but a treasury address is adopted long before anything is signed
- * with it, and adopting Ethereum's under Ethereum Classic's name is a bookkeeping fault no gate at
- * signing time can undo. `dogecoin` carries the same rule against `bitcoin`, and there the gate
- * does not exist: a UTXO signature is not bound to a chain id.
+ * **What has NOT changed is why `ethereum` may never be written here for `etc`.** An EVM address is
+ * the same 20 bytes on both chains, so custody would return the Ethereum treasury's address for an
+ * ETC pin and the two positions would be one row in this service's books. The signature itself
+ * would still be refused — `expectedEvmChainId('ethereum')` is 1/11155111 against the 61/63 an ETC
+ * payload declares, and SD-09 gate 3 compares them — but a treasury address is adopted long before
+ * anything is signed with it, and adopting Ethereum's under Ethereum Classic's name is a
+ * bookkeeping fault no gate at signing time can undo. `dogecoin` carries the same rule against
+ * `bitcoin`, and there the gate does not exist at all: a UTXO signature is not bound to a chain id,
+ * so a Dogecoin PSBT signed with a Bitcoin key is refused by nothing except the fact that the key
+ * is wrong.
  *
- * `dogecoin` is the more likely of the two to be right — custody's own suite already spells it that
- * way where it asserts Dogecoin is refused — and it is also the one this service can never send,
- * because `doge` is an unimplemented chain in the registry.
+ * Both values are exported as named constants below, so a test asserts against the thing the table
+ * reads rather than against the same string literal typed a second time — which would pass while
+ * agreeing only with itself.
  */
+/**
+ * Custody's name for Ethereum Classic. **Never `ethereum`.** @see CUSTODY_CHAIN
+ *
+ * Exported because the rule it carries is worth a symbol: the failure it prevents is not a crash
+ * but a treasury address adopted under the wrong chain's name, and a symbol is something a reader
+ * can follow to the argument.
+ */
+export const CUSTODY_CHAIN_ETC = 'ethereum-classic'
+
+/** Custody's name for Dogecoin. **Never `bitcoin`.** @see CUSTODY_CHAIN */
+export const CUSTODY_CHAIN_DOGE = 'dogecoin'
+
 const CUSTODY_CHAIN: Readonly<Record<ChainId, string>> = Object.freeze({
   ember: 'ember',
   eth: 'ethereum',
@@ -173,8 +193,8 @@ const CUSTODY_CHAIN: Readonly<Record<ChainId, string>> = Object.freeze({
   sol: 'solana',
   xrp: 'xrp',
   ltc: 'litecoin',
-  etc: 'ethereum-classic',
-  doge: 'dogecoin',
+  etc: CUSTODY_CHAIN_ETC,
+  doge: CUSTODY_CHAIN_DOGE,
 })
 
 export function custodyChainOf(chain: ChainId): string {
