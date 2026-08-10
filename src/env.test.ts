@@ -117,8 +117,11 @@ describe('loadEnv', () => {
     })
 
     it('accepts a credential carried in SETTLEMENT_SERVICE_TOKEN', () => {
-      // Settlement's compose block passes only this variable, so this is how the live estate closes
-      // the cliff without a deploy edit. See `Env.identityCredential`.
+      // Settlement's compose block once passed only this variable, and this is how the estate
+      // closed the cliff without waiting for a deploy edit. Since micro-org#191 both blocks pass
+      // `SETTLEMENT_IDENTITY_CREDENTIAL`, so this case is no longer the live estate's path — it is
+      // the rollback and the mid-deploy skew, where a container comes up with the new image and the
+      // old block. That is why the case is kept rather than deleted. See `Env.identityCredential`.
       const source: Record<string, string> = { ...BASE, SETTLEMENT_SERVICE_TOKEN: CREDENTIAL }
       delete source['SETTLEMENT_IDENTITY_CREDENTIAL']
       const env = loadEnv(source)

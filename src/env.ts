@@ -113,9 +113,15 @@ function requiredSigningSecret(source: Source, name: string): string {
  *
  * Absent is a deployment that has not been granted a credential yet; it returns `null`, `/readyz`
  * reports it as a HARD failure, and the service boots. Turning that into `exit(1)` would convert a
- * gap into an outage on the service that broadcasts transactions — and settlement's compose block
- * does not pass `SETTLEMENT_IDENTITY_CREDENTIAL` at all, so on the live estate absence is the
- * NORMAL case rather than an edge one. The empty check therefore stays AHEAD of the assertion,
+ * gap into an outage on the service that broadcasts transactions.
+ *
+ * This paragraph used to end "and settlement's compose block does not pass
+ * `SETTLEMENT_IDENTITY_CREDENTIAL` at all, so on the live estate absence is the NORMAL case rather
+ * than an edge one". That stopped being true with micro-org#191: both the `settlement` and
+ * `settlement-migrate` blocks now pass `${SETTLEMENT_IDENTITY_CREDENTIAL:-}`. Absence is an
+ * ordinary case again rather than the usual one — a deployment not yet granted a credential, or an
+ * image booted for CI's startup smoke test — and every reason below for tolerating it is unchanged.
+ * The empty check therefore stays AHEAD of the assertion,
  * because compose interpolates `${X:-}` and an unset variable arrives as the empty string; that is
  * the supported mode, not a malformed one.
  *
@@ -339,12 +345,19 @@ export interface Env {
    * by itself, it is revocable, and it survives a restart.
    *
    * **Read from `SETTLEMENT_IDENTITY_CREDENTIAL` first, then from `SETTLEMENT_SERVICE_TOKEN` when
-   * that value carries the `cfsc_` prefix.** The second is not sloppiness: settlement's compose
-   * block passes only `SETTLEMENT_SERVICE_TOKEN`, so on the live estate the credential the
-   * bootstrap mints reaches no container, and accepting it under either name lets the cliff be
-   * closed by changing one VALUE rather than by waiting for a deploy edit. The prefix decides, and
-   * it is unambiguous: identity's credentials begin `cfsc_` and its tokens are JWTs beginning
-   * `eyJ`.
+   * that value carries the `cfsc_` prefix.** The second was not sloppiness: settlement's compose
+   * block passed only `SETTLEMENT_SERVICE_TOKEN`, so the credential the bootstrap minted reached no
+   * container, and accepting it under either name let the cliff be closed by changing one VALUE
+   * rather than by waiting for a deploy edit. The prefix decides, and it is unambiguous: identity's
+   * credentials begin `cfsc_` and its tokens are JWTs beginning `eyJ`.
+   *
+   * **THE DEPLOY EDIT HAS NOW LANDED** — micro-org#191, both blocks passing
+   * `${SETTLEMENT_IDENTITY_CREDENTIAL:-}` — so the estate no longer depends on the second read.
+   * It is kept anyway, and not out of sentiment: a deploy cannot change the image and the compose
+   * block in the same instant, so the container that comes up with the new image and the old block
+   * has to boot. Deleting the fallback would make a rollback of that compose file a settlement that
+   * cannot authenticate to anything. It costs one `??` and it is what makes the transition
+   * survivable in both directions.
    *
    * Whichever name carries it, the value is held to `assertServiceCredential` — the SERVICE
    * CREDENTIAL class, not the generated-key class. Measured live on 2026-08-05 both variables hold
