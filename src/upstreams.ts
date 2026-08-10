@@ -34,14 +34,18 @@
  * `SETTLEMENT_IDENTITY_CREDENTIAL` is the estate's name for it and is preferred whenever it is set.
  * `estate-bootstrap.sh` has been minting it into `compose/estate/tokens.env` all along.
  *
- * But settlement's compose block never referenced it — it passes only `SETTLEMENT_SERVICE_TOKEN` —
- * so on the live estate the minted credential reaches no container. Rather than make the repair
- * depend on a deploy edit landing first, `SETTLEMENT_SERVICE_TOKEN` is ALSO accepted when its value
- * carries the `cfsc_` credential prefix. The prefix is unambiguous: identity issues credentials with
- * it and tokens are JWTs, which begin `eyJ`. So an operator can close the cliff by changing one
- * VALUE in `tokens.env`, and the tidier deploy change — passing `SETTLEMENT_IDENTITY_CREDENTIAL`
- * through, as wallet's and the ledger's blocks already do — remains strictly better and is what the
- * variable above is for.
+ * For a long time settlement's compose block never referenced it — it passed only
+ * `SETTLEMENT_SERVICE_TOKEN` — so the minted credential reached no container. Rather than make the
+ * repair depend on a deploy edit landing first, `SETTLEMENT_SERVICE_TOKEN` is ALSO accepted when
+ * its value carries the `cfsc_` credential prefix. The prefix is unambiguous: identity issues
+ * credentials with it and tokens are JWTs, which begin `eyJ`. So an operator could close the cliff
+ * by changing one VALUE in `tokens.env`.
+ *
+ * The tidier deploy change — passing `SETTLEMENT_IDENTITY_CREDENTIAL` through, as wallet's and the
+ * ledger's blocks already did — has since landed for both the `settlement` and `settlement-migrate`
+ * blocks (micro-org#191), so that is now the path the estate takes. The fallback stays because a
+ * deploy cannot swap the image and the compose block in the same instant, and a rollback of either
+ * one must still boot.
  *
  * A `SETTLEMENT_SERVICE_TOKEN` that is a genuine JWT is reported at boot and otherwise IGNORED. It
  * cannot be used: it is the ten-minute token, and using it is the defect.
