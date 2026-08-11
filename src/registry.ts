@@ -11,7 +11,7 @@
  * a `failure_reason` column when they ask why a withdrawal was refunded.
  */
 
-import { HttpClient } from '@cloudsforge/http'
+import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { CHAIN_IDS, unimplementedChain, type ChainCall, type ChainId, type JsonRpc, type OutboundChain } from './chains.ts'
 import { evmChain } from './evm.ts'
@@ -269,6 +269,28 @@ interface RpcEnvelope {
 }
 
 /**
+ * A JSON-RPC envelope out of a FAILED response body, or `undefined` if it is not one.
+ *
+ * Deliberately incurious about everything except whether `error` is an object: the caller only
+ * needs to know whether the node described a fault, and `HttpError.body` is already truncated to
+ * 2,000 characters by the client — so a truncated body simply fails to parse and stays the
+ * transport fault it looked like. `null` is excluded explicitly because `typeof null` is
+ * `'object'`, and a body of the four characters `null` is valid JSON.
+ */
+function parseRpcEnvelope(body: string): RpcEnvelope | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined
+  const error = (parsed as { error?: unknown }).error
+  if (typeof error !== 'object' || error === null) return undefined
+  return parsed as RpcEnvelope
+}
+
+/**
  * A JSON-RPC caller per chain, over `@cloudsforge/http`.
  *
  * `HttpClient` rather than bare `fetch`, for the reason its own header gives: on undici there is no
@@ -354,7 +376,56 @@ export function rpcFactory(options: RpcOptions): (chain: ChainId) => JsonRpc {
     const http = client
     return async (method, params) => {
       id += 1
-      const body = await http.post<RpcEnvelope>(path, { jsonrpc: '2.0', id, method, params })
+      let body: RpcEnvelope
+      try {
+        body = await http.post<RpcEnvelope>(path, { jsonrpc: '2.0', id, method, params })
+      } catch (err) {
+        /*
+         * ════════════════════════════════════════════════════════════════════════════════════
+         * BITCOIN CORE PUTS ITS RPC ERRORS IN THE HTTP STATUS TOO, AND THAT ATE EVERY RECOVERY.
+         *
+         * An EVM node answers a failed call with HTTP 200 and an `error` member, so the branch
+         * below is reached and the node's own words arrive as an `RpcError`. Core does not:
+         * `HTTPReq_JSONRPC` passes the RPC code through `HTTPStatusFromRPCError` and answers
+         * 500 for almost everything (404 for an unknown method), with the SAME well-formed
+         * envelope in the body. `HttpClient` throws on any non-2xx before anything reads that
+         * body, so on Bitcoin, Litecoin and Dogecoin every RPC error reached callers as
+         * `HttpError: POST … → 500` and no `RpcError` was ever constructed for them.
+         *
+         * Every recovery in this service that matches on the node's words was therefore dead on
+         * exactly the three chains those words come from. Measured on mainnet 2026-08-11, with
+         * `WALLET_FEE_QUOTES` naming BTC for the first time:
+         *
+         *   * `feeRate` catches "Fee estimation disabled" to fall back to confirmed blocks. The
+         *     estate's bitcoind runs `blocksonly`, so Core builds no estimator and EVERY BTC fee
+         *     quote answered 500 — `GET /v1/fees/btc/mainnet/BTC`, live, with the treasury
+         *     provisioned and deposits already open.
+         *   * `broadcast` catches "already in block chain" / -27 and returns the derived txid,
+         *     which is what makes a retried broadcast idempotent. Core answers -27 with HTTP
+         *     500, so the retry threw instead — and the row that is retried after a crash is the
+         *     NORMAL case, not the exception.
+         *   * `deriveFeeRateFromBlocks` catches "Method not found" to answer `null` for a node
+         *     without `getblockstats`. Core answers that one 404, so it threw and took the whole
+         *     quote with it.
+         *
+         * The repair is here and not in each catch, because the defect is that the envelope was
+         * discarded — not that three call sites matched the wrong string. Matching `→ 500` in
+         * `bitcoin.ts` would have been matching on the transport's phrasing of a fault the node
+         * described precisely.
+         *
+         * NARROW: only an `HttpError` whose body really is a JSON-RPC error envelope is
+         * translated. A 502 from a reverse proxy, an HTML error page, a 401 — none of them parse,
+         * and all of them keep propagating as the transport faults they are. Nothing from `url`
+         * can leak through this: the only string taken out of the response is the node's own
+         * `error.message`, and `HttpError`'s own message is already redacted.
+         * ════════════════════════════════════════════════════════════════════════════════════
+         */
+        const envelope = err instanceof HttpError ? parseRpcEnvelope(err.body) : undefined
+        if (envelope?.error && typeof envelope.error.message === 'string') {
+          throw new RpcError(method, envelope.error.message)
+        }
+        throw err
+      }
       if (body.error) {
         // The node's own words, verbatim and un-normalised. `broadcast` matches on them to
         // recognise a re-broadcast of bytes the node already holds, and a rewritten message is a
