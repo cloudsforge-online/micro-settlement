@@ -26,7 +26,7 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { Network } from '@cloudsforge/contracts-chain'
-import type { ChainId } from './chains.ts'
+import type { ChainId, OutpointCandidate } from './chains.ts'
 import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
@@ -156,6 +156,52 @@ export interface IndexerClient {
    * ══════════════════════════════════════════════════════════════════════════════════════════════
    */
   custodyBalance(chain: ChainId, network: Network, address: string): Promise<ObservedBalance>
+  /**
+   * Which outpoints an address may still hold — the CANDIDATES a bitcoin-family spend is built
+   * from, on chains where no node will list them.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **`listunspent` IS A WALLET RPC AND THIS ESTATE'S NODES HAVE NO WALLET.** bitcoind and
+   * litecoind both run `disablewallet=1` — correct for a node that is not a custodian, since a
+   * wallet it does not need is a key it might lose — and the method answers `-32601 Method not
+   * found`. Every bitcoin-family withdrawal this service could otherwise build dies there
+   * (micro-org#382).
+   *
+   * The indexer walked every block, so it can answer from its own record. **But this is a list of
+   * CANDIDATES, not authority to spend**, and the difference is load-bearing: `bitcoin.ts`
+   * re-reads each one with `gettxout`, which a wallet-less node does answer, and takes the node's
+   * word for whether the coin still exists and what it is worth. A candidate the node no longer
+   * serves is dropped in silence, because that is the ordinary case — our own in-flight spend.
+   *
+   * So the failure this call can cause is a list that is too LONG, which the verification pass
+   * corrects. A list that is too SHORT would be uncorrectable, and the indexer's route refuses
+   * with a fault rather than serving one; every one of those refusals arrives here as an
+   * `IndexerUnavailableError`, and a build that cannot enumerate its coins must not proceed to
+   * select from a subset of them.
+   *
+   * **Throws rather than returning null, and an empty list is a real answer.** An address the
+   * indexer answers for with `[]` has been swept — nothing to spend, and the caller refuses the
+   * withdrawal for insufficient funds, which is true. That is why the difference between "empty"
+   * and "could not say" may never be flattened here.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  outpoints(chain: ChainId, network: Network, address: string): Promise<ObservedOutpoints>
+}
+
+/**
+ * The candidate set, and the anchor it was read at.
+ *
+ * The rows are `OutpointCandidate` from `chains.ts` — the SAME type the `UtxoCandidateSource` port
+ * hands the bitcoin adapter, not a copy of it. A copy would be two places to state that `amount`
+ * is informational and never signed against, and the day they disagreed the disagreement would be
+ * invisible: both shapes are `{txid, vout, amount, blockHeight}` and TypeScript would accept
+ * either for the other.
+ */
+export interface ObservedOutpoints {
+  readonly outpoints: readonly OutpointCandidate[]
+  readonly observedAtBlock: number
+  readonly observedAtBlockHash: string
+  readonly requiredConfirmations: number
 }
 
 /** One address as the indexer's custody arithmetic sees it. */
@@ -266,6 +312,87 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
       }
       return {
         balance: BigInt(raw),
+        observedAtBlock: height,
+        observedAtBlockHash: hash,
+        requiredConfirmations:
+          typeof answer.requiredConfirmations === 'number' ? answer.requiredConfirmations : 0,
+      }
+    },
+
+    async outpoints(chain, network, address) {
+      let answer: {
+        outpoints?: unknown
+        observedAtBlock?: unknown
+        observedAtBlockHash?: unknown
+        requiredConfirmations?: unknown
+      }
+      try {
+        answer = await client.get(
+          `/v1/custody/${chain}/${network}/addresses/${encodeURIComponent(address)}/outpoints`,
+        )
+      } catch (err) {
+        // No 404 case, for a sharper reason than `custodyBalance` has. There a 404 read as zero
+        // understates a book; here a 404 read as `[]` states that an address has been SWEPT, and
+        // the caller would refuse a fully funded withdrawal — or, if some coins were listed and
+        // others were not, build a transaction spending part of the address and send the rest to
+        // change. Every failure is an unavailability and no transaction is built.
+        throw new IndexerUnavailableError(err instanceof Error ? err.message : String(err))
+      }
+
+      const rows = answer.outpoints
+      if (!Array.isArray(rows)) {
+        // An absent key is NOT an empty list. A response shaped differently from the contract —
+        // an older indexer, a proxy serving an error page with a 200 — must not be read as "this
+        // address holds nothing", which is the one wrong answer that looks like a right one.
+        throw new IndexerUnavailableError(
+          `the indexer answered no outpoint list for ${address} on ${chain}:${network}`,
+        )
+      }
+      const height = answer.observedAtBlock
+      const hash = answer.observedAtBlockHash
+      if (typeof height !== 'number' || typeof hash !== 'string') {
+        throw new IndexerUnavailableError(
+          `the indexer answered outpoints for ${address} with no height they were read at`,
+        )
+      }
+
+      const outpoints: OutpointCandidate[] = []
+      for (const entry of rows) {
+        // Every row is validated and NONE is skipped. `listunspent`'s parser skips a malformed
+        // entry because the node is the authority there and a row it will not describe is a row
+        // it will not let us spend; here the authority is `gettxout`, so a row dropped at this
+        // layer is a coin that never reaches the only check that could have vouched for it — a
+        // short list, built quietly, which is the exact outcome this whole path is arranged to
+        // prevent.
+        const row = (typeof entry === 'object' && entry !== null ? entry : {}) as Record<
+          string,
+          unknown
+        >
+        const amount = row['amount']
+        if (
+          typeof row['txid'] !== 'string' ||
+          typeof row['vout'] !== 'number' ||
+          !Number.isInteger(row['vout']) ||
+          typeof amount !== 'string' ||
+          !/^\d+$/.test(amount)
+        ) {
+          throw new IndexerUnavailableError(
+            `the indexer answered an outpoint for ${address} this service cannot read: ` +
+              JSON.stringify(entry),
+          )
+        }
+        outpoints.push({
+          txid: row['txid'],
+          vout: row['vout'],
+          // A decimal string, never a JSON number. `BigInt('')` is `0n`, which is why the shape is
+          // proved above rather than after the conversion.
+          amount: BigInt(amount),
+          blockHeight: typeof row['blockHeight'] === 'number' ? row['blockHeight'] : 0,
+        })
+      }
+
+      return {
+        outpoints,
         observedAtBlock: height,
         observedAtBlockHash: hash,
         requiredConfirmations:

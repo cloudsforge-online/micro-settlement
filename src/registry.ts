@@ -427,7 +427,11 @@ function decodeUserinfo(raw: string, chain: ChainId, field: 'username' | 'passwo
   }
 }
 
-/** Bind a chain adapter to a network and a node. The one place a `ChainCall` is constructed. */
-export function callFor(rpc: (chain: ChainId) => JsonRpc, chain: ChainId, network: Network): ChainCall {
-  return { network, rpc: rpc(chain) }
-}
+/*
+ * `callFor` used to live here too, claiming in its own comment to be "the one place a `ChainCall`
+ * is constructed" while `outbound.ts` exported another one that every caller in this service
+ * actually used. It is deleted rather than corrected: it had no caller, and once a `ChainCall`
+ * carries a `candidates` source (micro-org#382) a second constructor that omits one is a trap —
+ * anything built through it would quietly ask a wallet-less node for `listunspent` and be told the
+ * address holds nothing.
+ */

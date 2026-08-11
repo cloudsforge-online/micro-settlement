@@ -23,6 +23,9 @@ import {
   isNetwork,
 } from './chains.ts'
 import { chainFor, chainStatuses, implementedChains } from './registry.ts'
+import { callFor, type OutboundDeps } from './outbound.ts'
+import { IndexerUnavailableError, type IndexerClient } from './indexerclient.ts'
+import { Logger } from '@cloudsforge/telemetry'
 import { planBuildFailure } from './withdrawals.ts'
 
 describe('chain identity', () => {
@@ -249,5 +252,75 @@ describe('the registry', () => {
     // withdrawal that waits for one sits with a user's balance reserved for a quarter.
     assert.equal(plan.refund, 'now')
     assert.match(plan.reason, /BTC withdrawals are not available yet/)
+  })
+})
+
+describe('the coin source on a ChainCall', () => {
+  /**
+   * `callFor` is now the ONLY place a `ChainCall` is built, and the only place a coin source is
+   * attached. There used to be a second `callFor` in `registry.ts` that attached nothing; it had
+   * no caller and it is deleted, because on a wallet-less node a `ChainCall` without a source does
+   * not fail loudly — `listunspent` answers `-32601` and the address reads as empty (micro-org#382).
+   */
+  const depsWith = (indexer: IndexerClient): OutboundDeps => ({
+    sql: {} as never,
+    producer: 'settlement',
+    network: 'mainnet',
+    custody: {} as never,
+    indexer,
+    rpc: () => async () => null,
+    bounds: { minGasPriceWei: 1n, maxGasPriceWei: 2n, maxFeeWei: 3n },
+    stuckMinutes: 60,
+    logger: new Logger({ service: 'settlement-test', sink: () => {} }),
+  })
+
+  it('reaches the indexer for the chain, network and address it was built for', async () => {
+    const asked: string[] = []
+    const rows = [{ txid: 'a'.repeat(64), vout: 3, amount: 900n, blockHeight: 700_001 }]
+    const deps = depsWith({
+      async outpoints(chain: string, network: string, address: string) {
+        asked.push(`${chain}:${network}:${address}`)
+        return {
+          outpoints: rows,
+          observedAtBlock: 700_010,
+          observedAtBlockHash: 'ff'.repeat(32),
+          requiredConfirmations: 6,
+        }
+      },
+    } as unknown as IndexerClient)
+
+    const call = callFor(deps, 'btc')
+    assert.ok(call.candidates, 'a ChainCall with no coin source cannot spend on a wallet-less node')
+    // The rows arrive unchanged. Nothing is filtered, sorted or dropped between the indexer and
+    // the adapter: the adapter is where every candidate meets `gettxout`, and a row that never got
+    // there is a coin removed from the estate's spendable set by a layer with no evidence.
+    assert.deepEqual(await call.candidates('bc1qexample'), rows)
+    assert.deepEqual(asked, ['btc:mainnet:bc1qexample'])
+
+    // The network comes from the deps and not from the chain id, which is what stops a mainnet
+    // service reading a testnet address's coins — the two chains share an id and share nothing else.
+    assert.equal(call.network, 'mainnet')
+  })
+
+  it('lets the indexer refusal through rather than turning it into an empty set', async () => {
+    const refusal = new IndexerUnavailableError('503 backfill_in_flight')
+    const deps = depsWith({
+      async outpoints() {
+        throw refusal
+      },
+    } as unknown as IndexerClient)
+    await assert.rejects(
+      () => callFor(deps, 'ltc').candidates!('ltc1qexample'),
+      (err) => err === refusal,
+    )
+  })
+
+  it('attaches a source for every chain, including the ones that will never ask for one', async () => {
+    // Attached unconditionally rather than for a bitcoin-family list, because only the bitcoin
+    // adapter consults it and a second copy of "which chains are bitcoin-family" living in
+    // `outbound.ts` is a copy that can go stale. It is a closure: an EVM build never calls it.
+    for (const chain of CHAIN_IDS) {
+      assert.ok(callFor(depsWith({} as unknown as IndexerClient), chain).candidates)
+    }
   })
 })

@@ -34,7 +34,7 @@ import postgres from 'postgres'
 import { migrate, type Sql as DbSql } from '@cloudsforge/db'
 import { Logger, Metrics } from '@cloudsforge/telemetry'
 import type { Network } from '@cloudsforge/contracts-chain'
-import type { ChainId, FeeBounds, JsonRpc } from './chains.ts'
+import type { ChainId, FeeBounds, JsonRpc, OutpointCandidate } from './chains.ts'
 import { canonicaliseEvm, evmTxHash, TRANSFER_GAS } from './evm.ts'
 import { registerServiceMetrics } from './server.ts'
 import { MIGRATIONS, TABLES } from './migrations.ts'
@@ -560,6 +560,18 @@ export interface FakeIndexer extends IndexerClient {
   setBalance(address: string, balance: bigint): void
   /** Every address whose balance was read, in order. Asserts the measure-before-watch ordering. */
   readonly measured: readonly string[]
+  /**
+   * What outpoints the indexer will PROPOSE for one address. Absent REFUSES, as with `setBalance`.
+   *
+   * Refusing rather than answering `[]` for an unarmed address is the same line the real route
+   * holds and the reason it holds it: an empty list says the address has been swept, and a caller
+   * that believes it builds a transaction over a subset of the coins — or tells a user with money
+   * on chain that they have none. A fake that answered `[]` here would let a test pass while
+   * proving the opposite of what it claims.
+   */
+  setOutpoints(address: string, outpoints: readonly OutpointCandidate[]): void
+  /** Every address whose outpoints were enumerated, in order. */
+  readonly enumerated: readonly string[]
 }
 
 /**
@@ -578,7 +590,9 @@ export function fakeIndexer(): FakeIndexer {
     freshlyDerived: boolean
   }[] = []
   const measured: string[] = []
+  const enumerated: string[] = []
   const balances = new Map<string, bigint>()
+  const candidates = new Map<string, readonly OutpointCandidate[]>()
   let unavailable = false
   let watchFails = false
   let coldStarted = false
@@ -586,6 +600,7 @@ export function fakeIndexer(): FakeIndexer {
     asked,
     watched,
     measured,
+    enumerated,
     setWatchFails(value) {
       watchFails = value
     },
@@ -594,6 +609,23 @@ export function fakeIndexer(): FakeIndexer {
     },
     setBalance(address, balance) {
       balances.set(address.toLowerCase(), balance)
+    },
+    setOutpoints(address, outpoints) {
+      candidates.set(address.toLowerCase(), outpoints)
+    },
+    async outpoints(_chain, _network, address) {
+      enumerated.push(address)
+      const found = candidates.get(address.toLowerCase())
+      if (found === undefined) {
+        const { IndexerUnavailableError } = await import('./indexerclient.ts')
+        throw new IndexerUnavailableError(`the fake indexer has no outpoints armed for ${address}`)
+      }
+      return {
+        outpoints: found,
+        observedAtBlock: 41,
+        observedAtBlockHash: `0x${'ab'.repeat(32)}`,
+        requiredConfirmations: 60,
+      }
     },
     async custodyBalance(_chain, _network, address) {
       measured.push(address)

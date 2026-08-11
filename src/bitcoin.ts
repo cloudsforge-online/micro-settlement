@@ -71,6 +71,7 @@ import {
   type OutboundStatus,
   type SweepQuote,
   type UnsignedOutbound,
+  type UtxoCandidateSource,
 } from './chains.ts'
 
 /* ------------------------------------------------------------------ networks */
@@ -558,15 +559,50 @@ function integer(value: unknown, method: string): number {
 }
 
 /**
- * Spendable outputs of one address, newest-confirmation-last.
+ * Spendable outputs of one address, largest first.
  *
- * `listunspent` with an explicit address filter and a minimum confirmation depth. The depth is the
- * asset's own `confirmations` from `contracts-chain` and not a local constant: spending an output
- * that is not yet at the depth this estate credits at would build a payment on money it has not
- * itself accepted, and if that input is reorganised out the payment becomes unminable with a user
- * waiting on it.
+ * The minimum confirmation depth is the asset's own `confirmations` from `contracts-chain` and not
+ * a local constant: spending an output that is not yet at the depth this estate credits at would
+ * build a payment on money it has not itself accepted, and if that input is reorganised out the
+ * payment becomes unminable with a user waiting on it.
+ *
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * **TWO SOURCES, CHOSEN AT CONSTRUCTION AND NEVER BY FALLING BACK.** `listunspent` is a WALLET
+ * rpc; this estate's bitcoind and litecoind run `disablewallet=1` and answer it `-32601 Method not
+ * found`, so until micro-org#382 no BTC or LTC withdrawal could be built at all. When the
+ * `ChainCall` carries a `candidates` source the coins are named from a record and then CONFIRMED
+ * one at a time against the node; when it does not, the node's own wallet is asked, exactly as
+ * before.
+ *
+ * Which one is in force is decided by `callFor`, not by catching an error here. A source that
+ * fails must fail the build: switching to the wallet mid-flight would mean one address read two
+ * ways inside one selection, and the wallet's answer on a wallet-less node is not "no coins", it
+ * is "no answer" — which `selectCoins` would report to a user as insufficient funds.
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
  */
 async function listUnspent(
+  call: ChainCall,
+  chain: BitcoinFamilyChainId,
+  address: string,
+  minConfirmations: number,
+): Promise<Utxo[]> {
+  const utxos = call.candidates
+    ? await confirmCandidates(call, call.candidates, chain, address, minConfirmations)
+    : await walletUnspent(call, address, minConfirmations)
+
+  // Largest first, then by outpoint so the order is total and identical on every rebuild. A
+  // selection that depends on the node's iteration order is a selection that can differ between
+  // the build and the rebuild after a crash, which is two transactions for one payment.
+  return utxos.sort(
+    (a, b) =>
+      (b.sats > a.sats ? 1 : b.sats < a.sats ? -1 : 0) ||
+      a.txid.localeCompare(b.txid) ||
+      a.vout - b.vout,
+  )
+}
+
+/** The original path: a node that keeps a wallet lists its own coins. */
+async function walletUnspent(
   call: ChainCall,
   address: string,
   minConfirmations: number,
@@ -582,6 +618,10 @@ async function listUnspent(
     if (row['spendable'] === false) continue
     const script = row['scriptPubKey']
     if (typeof row['txid'] !== 'string' || typeof script !== 'string') continue
+    // Skipped rather than thrown, and this is the one place that is right: the node is BOTH the
+    // proposer and the authority here, so a row it will not describe is a row it would not let us
+    // spend either. Below, where the proposer is a record and the authority is `gettxout`, the
+    // same skip would drop a coin before the only check that could have vouched for it.
     utxos.push({
       txid: row['txid'],
       vout: integer(row['vout'], 'listunspent'),
@@ -590,15 +630,97 @@ async function listUnspent(
       confirmations: integer(row['confirmations'] ?? 0, 'listunspent'),
     })
   }
-  // Largest first, then by outpoint so the order is total and identical on every rebuild. A
-  // selection that depends on the node's iteration order is a selection that can differ between
-  // the build and the rebuild after a crash, which is two transactions for one payment.
-  return utxos.sort(
-    (a, b) =>
-      (b.sats > a.sats ? 1 : b.sats < a.sats ? -1 : 0) ||
-      a.txid.localeCompare(b.txid) ||
-      a.vout - b.vout,
-  )
+  return utxos
+}
+
+/**
+ * The wallet-less path: a record names the coins, and `gettxout` decides which of them exist.
+ *
+ * `gettxout` is a CHAINSTATE rpc — it reads the UTXO set, needs no wallet, and answers on every
+ * node this estate runs. It reports `null` for an outpoint that is not in that set, and otherwise
+ * the coin's `value`, its `scriptPubKey` and its depth. That is every fact a spend of it needs, so
+ * nothing the record said about the coin is carried into the transaction: the record's job ends at
+ * naming an outpoint to go and ask about.
+ *
+ * `include_mempool` is **true**, and deliberately opposite to `proveDead`'s `false`. Here the
+ * question is "may I spend this", and a coin already spent by an unconfirmed transaction — which,
+ * on this service, means our own in-flight withdrawal — must be treated as gone, or the next build
+ * conflicts with the last one. There the question is "can these bytes never be mined", and a
+ * mempool spend has settled nothing, so it may not be used as proof of death.
+ *
+ * Asked one outpoint at a time, sequentially, which is a UTXO-set lookup per coin and measured at
+ * about 2 ms each over the WireGuard link to the chain host (2026-08). An address holding a few
+ * dozen coins costs well under a tenth of a second; if one ever holds thousands, the fix is a
+ * batched request, not a cap on how many are examined — a cap silently returns a short list, which
+ * is the failure this whole path exists to make impossible.
+ */
+async function confirmCandidates(
+  call: ChainCall,
+  source: UtxoCandidateSource,
+  chain: BitcoinFamilyChainId,
+  address: string,
+  minConfirmations: number,
+): Promise<Utxo[]> {
+  // Derived here rather than taken from the node's rendering of the script, because a node old
+  // enough to answer `addresses: [...]` instead of `address` would silently fail every comparison
+  // and empty the list. Encoding the address we were ASKED about is version-independent.
+  const expected = bitcoin.address
+    .toOutputScript(address, networkFor(chain, call.network))
+    .toString('hex')
+
+  const candidates = await source(address)
+  const utxos: Utxo[] = []
+  for (const candidate of candidates) {
+    const served = await call.rpc('gettxout', [candidate.txid, candidate.vout, true])
+    // The ordinary case, and the reason a too-long candidate list is harmless: the coin was spent
+    // after the record was written. Nothing to report — this is what "the node disposes" means.
+    if (served === null || served === undefined) continue
+
+    if (typeof served !== 'object') {
+      throw new AddressError(
+        `gettxout answered ${String(served)} for ${candidate.txid}:${candidate.vout}, which is ` +
+          'neither a coin nor an absence',
+      )
+    }
+    const row = served as Record<string, unknown>
+    const script = row['scriptPubKey']
+    const hex =
+      typeof script === 'object' && script !== null
+        ? (script as Record<string, unknown>)['hex']
+        : undefined
+    if (typeof hex !== 'string') {
+      throw new AddressError(
+        `gettxout answered no scriptPubKey for ${candidate.txid}:${candidate.vout} — without the ` +
+          'script this coin pays to there is nothing to sign against',
+      )
+    }
+    if (hex.toLowerCase() !== expected) {
+      // NOT skipped. A coin that exists and pays somebody else means the record and the chain
+      // disagree about who owns what, and the rest of that record's answer is no more trustworthy
+      // than this part of it. Spending the remainder would be building on a list already known to
+      // be wrong, in the one direction — too short — that cannot be detected downstream.
+      throw new AddressError(
+        `${candidate.txid}:${candidate.vout} was offered as a coin of ${address} and the chain ` +
+          `says it pays ${hex} instead. Refusing to select coins from a record the node ` +
+          'contradicts',
+      )
+    }
+
+    const confirmations = integer(row['confirmations'] ?? 0, 'gettxout')
+    // Below the estate's own credit depth, so not ours to spend yet — including, at zero, a coin
+    // that exists only in the mempool. Skipped rather than refused because a fresh deposit is the
+    // ordinary state of a funded address, and it becomes spendable by itself.
+    if (confirmations < minConfirmations) continue
+
+    utxos.push({
+      txid: candidate.txid,
+      vout: candidate.vout,
+      sats: btcToSats(row['value'], chain),
+      scriptPubKey: hex,
+      confirmations,
+    })
+  }
+  return utxos
 }
 
 export interface Selection {
@@ -1542,7 +1664,7 @@ export function bitcoinChain(
     }
 
     const rate = await feeRate(call, input.shape)
-    const utxos = await listUnspent(call, input.from, spec.confirmations)
+    const utxos = await listUnspent(call, chain, input.from, spec.confirmations)
 
     let inputs: readonly Utxo[]
     let fee: bigint
@@ -1649,7 +1771,7 @@ export function bitcoinChain(
     },
 
     async spendableBalance(call, address) {
-      return totalOf(await listUnspent(call, address, spec.confirmations))
+      return totalOf(await listUnspent(call, chain, address, spec.confirmations))
     },
 
     /**
@@ -1663,7 +1785,7 @@ export function bitcoinChain(
      */
     async sweepQuote(call, address, bounds) {
       const rate = await feeRate(call, 'sweep')
-      const plan = sweepPlan(await listUnspent(call, address, spec.confirmations), rate, dust, chain)
+      const plan = sweepPlan(await listUnspent(call, chain, address, spec.confirmations), rate, dust, chain)
       if (!plan) return null
       if (plan.fee > bounds.maxFeeWei) {
         throw new FeeOutOfBandError(chain, 'above', plan.fee, bounds.maxFeeWei)
@@ -1839,7 +1961,7 @@ export async function buildSweepPsbt(
   validateAddress(chain, treasury, call.network)
 
   const plan = sweepPlan(
-    await listUnspent(call, from, minConfirmations),
+    await listUnspent(call, chain, from, minConfirmations),
     feeRatePerVb,
     dustThreshold,
     chain,
