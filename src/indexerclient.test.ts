@@ -21,10 +21,17 @@ import { IndexerUnavailableError, httpIndexerClient } from './indexerclient.ts'
 
 const ADDRESS = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4'
 
-/** A client whose every request is answered by `body`, with `status`. */
+/**
+ * A client whose every request is answered by `body`, with `status`.
+ *
+ * `fetch` is injected, so the base address is never dialled and exists only to be joined with a
+ * path and asserted on. Loopback rather than a reserved `.invalid` name because CI refuses any
+ * test that names a host it cannot prove is local, and being unresolvable is not the same as
+ * being local (micro-org#268).
+ */
 function clientAnswering(body: unknown, status = 200): ReturnType<typeof httpIndexerClient> {
   return httpIndexerClient({
-    baseUrl: 'http://indexer.invalid',
+    baseUrl: 'http://127.0.0.1:1',
     token: () => 'test-token',
     deadlineMs: 1_000,
     fetch: async () =>
@@ -173,7 +180,7 @@ describe('outpoints', () => {
   it('sends the address encoded, so an address is never a path', async () => {
     let asked = ''
     const client = httpIndexerClient({
-      baseUrl: 'http://indexer.invalid',
+      baseUrl: 'http://127.0.0.1:1',
       token: () => 'test-token',
       deadlineMs: 1_000,
       fetch: async (input) => {
@@ -187,7 +194,7 @@ describe('outpoints', () => {
     await client.outpoints('btc', 'mainnet', '../../v1/admin')
     assert.equal(
       asked,
-      'http://indexer.invalid/v1/custody/btc/mainnet/addresses/..%2F..%2Fv1%2Fadmin/outpoints',
+      'http://127.0.0.1:1/v1/custody/btc/mainnet/addresses/..%2F..%2Fv1%2Fadmin/outpoints',
     )
   })
 })
