@@ -1083,23 +1083,32 @@ const FEE_WINDOW_BLOCKS = 24
  * floor, never above this chain's ceiling, which is the same bound custody enforces on the
  * signature.
  *
- * ── AND WHAT IT CHANGES ON LITECOIN, WHICH IS THE CHAIN THAT MOVES MONEY TODAY ──────────────────
+ * ── WHAT IT CHANGES ON LITECOIN: NOTHING TODAY, AND THAT IS A MEASUREMENT AND NOT A DESIGN ──────
  *
- * This does not only add Bitcoin. Litecoin reaches the same branch — its estimator answers with the
- * `errors` array above and always will — so from this change LTC withdrawals are priced from its
- * blocks too. Measured on the chain host over Litecoin mainnet blocks 3,157,776–3,157,799 (24
- * blocks, the live window this function would read), 2026-08-11, in litoshi/vB:
+ * Litecoin is the chain that moves money on this estate, so what this does to LTC was measured
+ * rather than reasoned about — and the measurement moved between two readings of the SAME node,
+ * which is the whole reason the fallback is worth having.
  *
- *     block's 50th-pct feerate, per block   3 5 3 3 5 5 5 3 5 5 · 5 5 5 5 5 3 1 1 3 4 4 · 3
+ *     2026-08-09   estimatesmartfee 3 → {"errors":["Insufficient data or no feerate found"]}
+ *     2026-08-11   estimatesmartfee 3 → {"feerate":0.00000999,"blocks":3}   mempool 30 tx / 7,553 B
+ *
+ * `litecoind` lost `blocksonly` when micro-pool needed it to build templates, so unlike `bitcoind`
+ * it HAS an estimator; it simply had not seen enough traffic to answer on the 9th. So **LTC takes
+ * the estimator branch today and keeps paying 1 litoshi/vB** — 999 litoshi/kvB is one per vB — and
+ * this change reaches Litecoin only on the days the estimator goes quiet again, which is a state
+ * this node was in 48 hours before the deploy.
+ *
+ * What the blocks say meanwhile, read through settlement's own RPC path over Litecoin mainnet
+ * blocks 3,157,793–3,157,816 on 2026-08-11, in litoshi/vB:
+ *
+ *     block's 50th-pct feerate, per block   105 1 1 4 5 4 3 5 5 5 3 5 4 5 5 3 5 3 5 3 3 5 5 5
  *     p90 across the window                 5
  *
- * The two `·` are blocks carrying two transactions each, whose percentiles are all zero; the
- * derivation drops them and 22 of 24 remain, which is why the "too few usable blocks" guard is a
- * majority and not a count. **So LTC goes from paying 1 litoshi/vB to paying 5** — five times the
- * fee, and about 800 litoshi more on a 200-vB transaction, which is 0.000008 LTC. The 10th-pct
- * measurement above says the floor still gets confirmed on Litecoin, so this is not a fix there;
- * it is the same rule applied to every chain rather than a carve-out for the one whose blocks
- * happen to have room today. A carve-out would have to be re-justified the first busy week.
+ * Five, against an estimator that says one. Both are honest and they answer different questions:
+ * the blocks say what senders PAID, the estimator says what it would have taken to GET IN, and on a
+ * chain whose blocks are nowhere near full those differ by everything the overpayers left on the
+ * table. The estimator is asked first for exactly that reason, and the blocks are what remains when
+ * there is no estimator to ask — which on Bitcoin is permanent and on Litecoin is a Tuesday.
  *
  * ── WHAT STILL TAKES THE FLOOR, AND WHY THAT IS NOT A REGRESSION ────────────────────────────────
  *
@@ -1445,7 +1454,15 @@ export function bitcoinChain(
     const quoted = row['feerate']
     if (typeof quoted !== 'number' || !(quoted > 0)) return withoutEstimate()
     const perKvb = btcToSats(quoted, chain)
-    return clamp(perKvb / 1_000n)
+    // ROUNDED UP, because bigint division truncates and truncating a fee rate is the one direction
+    // that gets a transaction stuck. A node quoting 1,500 sat/kvB wants 1.5/vB; taking 1 pays a
+    // third less than the node just said was needed, and the transaction that results is relayed
+    // and then sits — which is the whole failure this block was written about. Rounding up costs at
+    // most one sat/vB, about 141 satoshi on the one-input two-output spend `estimateFee` quotes.
+    //
+    // It changes nothing about the live LTC quote either way: 999 rounds to 1 in both directions,
+    // and that arithmetic is measured in the Litecoin block above rather than assumed.
+    return clamp((perKvb + 999n) / 1_000n)
   }
 
   async function statusOf(call: ChainCall, txid: string): Promise<OutboundStatus> {

@@ -2063,4 +2063,22 @@ describe('the fee estimate this deployment will never get', () => {
     const node = fakeLtcNode({ feerate: 0.00009 })
     assert.equal(await chainFor('ltc').estimateFee(node.call, BOUNDS), paymentFee('ltc', 9n))
   })
+
+  it('rounds a fractional estimate UP, because truncating a fee rate is what gets a spend stuck', async () => {
+    // `estimatesmartfee` answers in coin per KILOvbyte and this adapter signs in units per vB, so
+    // every quote that is not a whole thousand has to go one way or the other. Bigint division
+    // truncates, and truncating pays LESS than the node just said was needed — 1,500 sat/kvB is
+    // 1.5/vB and taking 1 is a third under the estimate, on a transaction whose whole failure mode
+    // is being relayed and then sitting.
+    //
+    // 0.000015 is not a contrived number: it is what `estimatesmartfee` answers whenever the market
+    // sits between two whole sat/vB, which is most of the time it is moving at all.
+    const node = fakeBtcNode({ feerate: 0.000015, height: 900_007 })
+    assert.equal(await chainFor('btc').estimateFee(node.call, BOUNDS), paymentFee('btc', 2n))
+
+    // And the floor still holds it from below rather than the rounding doing it: 0.0000001 is
+    // 10 sat/kvB, which rounds up to 1 and is the floor anyway.
+    const dust = fakeBtcNode({ feerate: 0.0000001, height: 900_008 })
+    assert.equal(await chainFor('btc').estimateFee(dust.call, BOUNDS), paymentFee('btc', 1n))
+  })
 })
