@@ -858,8 +858,28 @@ export interface OutboundDeps {
   readonly now?: () => number
 }
 
+/**
+ * Bind an adapter to a network, a node, and — for the chains that need one — a coin source.
+ *
+ * The `candidates` source is attached for EVERY chain rather than for a list of bitcoin-family
+ * ones, because only the bitcoin adapter consults it and a second copy of "which chains are
+ * bitcoin-family" living here is a copy that can go stale. It is a closure, so an EVM build never
+ * calls the indexer for outpoints; it merely could.
+ *
+ * Attached UNCONDITIONALLY, and that is a statement about this estate: bitcoin.conf, litecoin.conf
+ * and dogecoin.conf all carry `disablewallet=1` (verified on the chain host 2026-08-11), so there
+ * is no node here whose wallet could have answered `listunspent` and none whose behaviour this
+ * changes. The wallet path stays in `bitcoin.ts` for a deployment that is not this one — and for
+ * the tests that hold it to its contract — not as a fallback for when this source fails, which
+ * would be one address read two ways inside one selection.
+ */
 export function callFor(deps: OutboundDeps, chain: ChainId): ChainCall {
-  return { network: deps.network, rpc: deps.rpc(chain) }
+  return {
+    network: deps.network,
+    rpc: deps.rpc(chain),
+    candidates: async (address) =>
+      (await deps.indexer.outpoints(chain, deps.network, address)).outpoints,
+  }
 }
 
 /**

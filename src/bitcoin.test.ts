@@ -44,6 +44,8 @@ import {
   custodyChainOf,
   custodyFamilyOf,
   type ChainCall,
+  type JsonRpc,
+  type OutpointCandidate,
 } from './chains.ts'
 import { RpcError, chainFor, implementedChains } from './registry.ts'
 
@@ -2080,5 +2082,544 @@ describe('the fee estimate this deployment will never get', () => {
     // 10 sat/kvB, which rounds up to 1 and is the floor anyway.
     const dust = fakeBtcNode({ feerate: 0.0000001, height: 900_008 })
     assert.equal(await chainFor('btc').estimateFee(dust.call, BOUNDS), paymentFee('btc', 1n))
+  })
+})
+
+/* ============================================================ the wallet-less coin source (#382) */
+
+/**
+ * Re-point one of the three node fakes at the wallet-less path, serving the SAME coins.
+ *
+ * A wrapper rather than an option on each fake, and that is the point of it: the `ChainCall` it
+ * returns delegates every method to the original node, so a case written for `listunspent` can be
+ * run again through `gettxout` with one line and the two answers COMPARED. If the two paths ever
+ * select different coins, or commit to different values, a test that shares a fixture between them
+ * is the only kind that notices.
+ *
+ * `gettxout` is answered here rather than by the underlying fake because the underlying fake's
+ * version exists for `proveDead` and answers a stub with no `scriptPubKey`. Delegating to it would
+ * have made every case below fail identically for a reason that has nothing to do with coins.
+ */
+interface IndexerPathOptions {
+  /** What the RECORD proposes. Defaults to every coin, in the order the indexer's route returns. */
+  readonly proposes?: readonly OutpointCandidate[]
+  /** Outpoints, as `txid:vout`, the node no longer serves — spent since the record was written. */
+  readonly spent?: readonly string[]
+  /** Replace `gettxout`'s whole answer for one outpoint, for shapes a coin cannot legitimately have. */
+  readonly serves?: Readonly<Record<string, unknown>>
+  /** The source itself fails, as an indexer refusal or an outage arrives. */
+  readonly refuses?: Error
+  /** The depth a coin whose fixture does not state one is served at. */
+  readonly depth?: number
+  /** Record every `gettxout` the path makes, as `txid:vout:include_mempool`. */
+  readonly probed?: string[]
+}
+
+function throughTheIndexer(
+  call: ChainCall,
+  chain: BitcoinFamilyChainId,
+  owner: string,
+  coins: readonly FakeUtxo[],
+  options: IndexerPathOptions = {},
+): ChainCall {
+  const params = networkFor(chain, call.network)
+  const script = bitcoin.address.toOutputScript(owner, params).toString('hex')
+
+  const rpc: JsonRpc = async (method, args) => {
+    if (method !== 'gettxout') return call.rpc(method, args)
+    const key = `${String(args[0])}:${String(args[1])}`
+    options.probed?.push(`${key}:${String(args[2])}`)
+    if (Object.hasOwn(options.serves ?? {}, key)) return options.serves?.[key]
+    if ((options.spent ?? []).includes(key)) return null
+    const coin = coins.find((c) => `${c.txid}:${c.vout}` === key)
+    // A record proposing an outpoint no node has ever had is the same answer as one proposing a
+    // coin that was spent an hour ago: `null`. The node does not distinguish and neither may this.
+    if (!coin) return null
+    return {
+      value: satsToBtc(coin.sats),
+      confirmations: coin.confirmations ?? options.depth ?? 12,
+      scriptPubKey: { hex: script },
+    }
+  }
+
+  return {
+    network: call.network,
+    rpc,
+    candidates: async () => {
+      if (options.refuses) throw options.refuses
+      return (
+        options.proposes ??
+        coins.map((c) => ({
+          txid: c.txid,
+          vout: c.vout,
+          amount: c.sats,
+          blockHeight: 700_000,
+        }))
+      )
+    },
+  }
+}
+
+describe('the wallet-less coin source', () => {
+  it('selects the SAME coins the wallet path would, from the same set', async () => {
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // The load-bearing test of micro-org#382. Everything else here checks a way the new path can
+    // go wrong; this checks that when nothing goes wrong it is not a NEW path at all — the same
+    // fixture, built twice, must produce byte-identical PSBTs. A selection that differed would be
+    // a second opinion about which coins the estate holds, and the estate is not entitled to two.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    const coins = [utxo(1, 500_000n), utxo(2, 300_000n), utxo(3, 900_000n)]
+    const input = {
+      from: TREASURY,
+      to: USER,
+      value: 600_000n,
+      fee: 100_000n,
+      bounds: BOUNDS,
+      shape: 'payment' as const,
+    }
+
+    const wallet = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_001,
+    })
+    const viaWallet = await chainFor('btc').build(wallet.call, input)
+
+    const probed: string[] = []
+    const node = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_001,
+    })
+    const viaIndexer = await chainFor('btc').build(
+      throughTheIndexer(node.call, 'btc', TREASURY, coins, {
+        depth: 6,
+        probed,
+      }),
+      input,
+    )
+
+    assert.equal(viaIndexer.payload, viaWallet.payload, 'the same coins, chosen the same way')
+    assert.equal(viaIndexer.fee, viaWallet.fee)
+    assert.equal(viaIndexer.value, viaWallet.value)
+    // And the wallet rpc was never reached — otherwise the equality above proves nothing, because
+    // both builds would have gone down the same path. `gettxout` is counted through `probed`
+    // rather than `node.calls`, because the wrapper answers it and never delegates it inward.
+    assert.equal(node.calls.includes('listunspent'), false, 'no wallet rpc on the wallet-less path')
+    assert.equal(probed.length, 3, 'every candidate is re-read against the UTXO set')
+  })
+
+  it('signs the value the NODE serves, never the value the record proposed', async () => {
+    // The record's amount is informational and this is why. A signature commits to the value of
+    // the coin it spends; take that number from anywhere but the party who validates the
+    // signature and the transaction either will not relay or pays a fee nobody chose. Here the
+    // record is wrong by a factor of five, in the direction that would look like plenty of money.
+    const coins = [utxo(1, 400_000n)]
+    const node = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_002,
+    })
+    const call = throughTheIndexer(node.call, 'btc', TREASURY, coins, {
+      depth: 6,
+      proposes: [
+        {
+          txid: coins[0]!.txid,
+          vout: 0,
+          amount: 2_000_000n,
+          blockHeight: 700_000,
+        },
+      ],
+    })
+
+    const unsigned = await chainFor('btc').build(call, {
+      from: TREASURY,
+      to: USER,
+      value: 300_000n,
+      fee: 20_000n,
+      bounds: BOUNDS,
+      shape: 'payment',
+    })
+    const psbt = bitcoin.Psbt.fromBase64(String(unsigned.payload), {
+      network: TESTNET,
+    })
+    assert.equal(
+      psbt.data.inputs[0]?.witnessUtxo?.value,
+      400_000,
+      "the node's value, not the record's",
+    )
+
+    // And the arithmetic closes against the node's number, which is the assertion that would fail
+    // if the record's were used anywhere downstream of the selection.
+    const outputs = psbt.txOutputs.reduce((s, o) => s + BigInt(o.value), 0n)
+    assert.equal(400_000n - outputs, unsigned.fee)
+
+    // The same lie in the other direction cannot fund a payment the coins do not cover: a record
+    // claiming 2,000,000 does not make 400,000 enough for a 900,000 withdrawal.
+    await assert.rejects(
+      () =>
+        chainFor('btc').build(call, {
+          from: TREASURY,
+          to: USER,
+          value: 900_000n,
+          fee: 20_000n,
+          bounds: BOUNDS,
+          shape: 'payment',
+        }),
+      InsufficientTreasuryError,
+    )
+  })
+
+  it('drops a candidate the node no longer serves, in silence, and spends the rest', async () => {
+    // The ORDINARY case, and the reason a too-long candidate list is harmless: the record lags the
+    // mempool, so a coin our own in-flight withdrawal already spends is still in it. Dropping it
+    // must not be an error — it is what "the node disposes" means — and the remaining coins must
+    // still fund the payment.
+    const coins = [utxo(1, 500_000n), utxo(2, 300_000n), utxo(3, 900_000n)]
+    const probed: string[] = []
+    const node = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_003,
+    })
+    const unsigned = await chainFor('btc').build(
+      throughTheIndexer(node.call, 'btc', TREASURY, coins, {
+        depth: 6,
+        probed,
+        spent: [`${coins[2]!.txid}:0`],
+      }),
+      {
+        from: TREASURY,
+        to: USER,
+        value: 600_000n,
+        fee: 100_000n,
+        bounds: BOUNDS,
+        shape: 'payment',
+      },
+    )
+
+    const psbt = bitcoin.Psbt.fromBase64(String(unsigned.payload), {
+      network: TESTNET,
+    })
+    assert.equal(psbt.inputCount, 2, 'the 900,000 coin is gone, so both of the others are needed')
+    const spent = psbt.txInputs.map((i) => Buffer.from(i.hash).reverse().toString('hex')).sort()
+    assert.deepEqual(spent, [coins[0]!.txid, coins[1]!.txid].sort())
+
+    // Every candidate was asked about, including the one that turned out to be gone. A path that
+    // stopped at the first `null` would silently shorten the list.
+    assert.equal(probed.length, 3)
+  })
+
+  it('asks with include_mempool TRUE, so our own in-flight spend hides the coin it uses', async () => {
+    // The opposite of `proveDead`, deliberately. There the question is "can these bytes never be
+    // mined", and a mempool spend has settled nothing so it may not be used as proof of death.
+    // Here the question is "may I spend this", and a coin already committed by an unconfirmed
+    // transaction — on this service, our own previous withdrawal — must read as gone, or the next
+    // build conflicts with the last one and one of the two users waits forever.
+    const coins = [utxo(1, 900_000n)]
+    const probed: string[] = []
+    const node = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_004,
+    })
+    await chainFor('btc').build(
+      throughTheIndexer(node.call, 'btc', TREASURY, coins, {
+        depth: 6,
+        probed,
+      }),
+      {
+        from: TREASURY,
+        to: USER,
+        value: 500_000n,
+        fee: 50_000n,
+        bounds: BOUNDS,
+        shape: 'payment',
+      },
+    )
+    assert.deepEqual(probed, [`${coins[0]!.txid}:0:true`])
+  })
+
+  it('will not spend a coin below the depth this estate credits at', async () => {
+    // The same rule `listunspent`'s `minconf` enforces, restated where the filtering now happens.
+    // Spending at less than the asset's own `confirmations` builds a payment on money this estate
+    // has not itself accepted; if that input is reorganised out the payment becomes unminable with
+    // a user waiting on it. BTC is six, so five is one short — and the coin is still PROPOSED, so
+    // only the depth check can be what drops it.
+    const shallow = [{ ...utxo(1, 900_000n), confirmations: 5 }]
+    const node = fakeBtcNode({
+      utxos: shallow,
+      feerate: 0.0001,
+      height: 910_005,
+    })
+    const call = throughTheIndexer(node.call, 'btc', TREASURY, shallow)
+    await assert.rejects(
+      () =>
+        chainFor('btc').build(call, {
+          from: TREASURY,
+          to: USER,
+          value: 500_000n,
+          fee: 50_000n,
+          bounds: BOUNDS,
+          shape: 'payment',
+        }),
+      InsufficientTreasuryError,
+    )
+
+    // One more confirmation and the same coin funds the same payment. Without this the case above
+    // would also pass against a path that dropped every coin it was offered.
+    const deep = [{ ...utxo(1, 900_000n), confirmations: 6 }]
+    const ok = fakeBtcNode({ utxos: deep, feerate: 0.0001, height: 910_005 })
+    const unsigned = await chainFor('btc').build(
+      throughTheIndexer(ok.call, 'btc', TREASURY, deep),
+      {
+        from: TREASURY,
+        to: USER,
+        value: 500_000n,
+        fee: 50_000n,
+        bounds: BOUNDS,
+        shape: 'payment',
+      },
+    )
+    assert.equal(
+      bitcoin.Psbt.fromBase64(String(unsigned.payload), { network: TESTNET }).inputCount,
+      1,
+    )
+  })
+
+  it('REFUSES when the node says a proposed coin pays somebody else', async () => {
+    // Not skipped. A coin that exists and pays another address means the record and the chain
+    // disagree about who owns what, and the rest of that record's answer is worth no more than
+    // this part of it. Selecting from the remainder would be building on a list already known to
+    // be wrong, in the one direction — too short — that nothing downstream can detect.
+    const coins = [utxo(1, 500_000n), utxo(2, 900_000n)]
+    const node = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_006,
+    })
+    const stranger = bitcoin.address.toOutputScript(USER, TESTNET).toString('hex')
+    await assert.rejects(
+      () =>
+        chainFor('btc').build(
+          throughTheIndexer(node.call, 'btc', TREASURY, coins, {
+            depth: 6,
+            serves: {
+              [`${coins[1]!.txid}:0`]: {
+                value: satsToBtc(900_000n),
+                confirmations: 6,
+                scriptPubKey: { hex: stranger },
+              },
+            },
+          }),
+          {
+            from: TREASURY,
+            to: USER,
+            value: 300_000n,
+            fee: 20_000n,
+            bounds: BOUNDS,
+            shape: 'payment',
+          },
+        ),
+      (err: unknown) =>
+        err instanceof AddressError &&
+        err.message.includes(stranger) &&
+        err.message.includes(coins[1]!.txid),
+      // Note the shape of this fixture: 500,000 alone WOULD have covered the payment, so a path
+      // that skipped the contradicted coin would have succeeded here and this test would pass for
+      // the wrong reason if it only asserted "does not spend the stranger's coin".
+    )
+  })
+
+  it('REFUSES an answer that is not a coin and not an absence', async () => {
+    // `gettxout` answers an object or `null`, and nothing else is a shape a node produces. A
+    // string here is a proxy, a wrapper, or a version that has changed under us — and the one
+    // reading that must never happen is "falsy, therefore spent", which would empty the list.
+    const coins = [utxo(1, 900_000n)]
+    for (const [label, answer] of [
+      ['a string', 'unspent'],
+      ['a number', 0],
+      ['a coin with no scriptPubKey', { value: 0.009, confirmations: 6 }],
+      ['a scriptPubKey with no hex', { value: 0.009, confirmations: 6, scriptPubKey: {} }],
+    ] as const) {
+      const node = fakeBtcNode({
+        utxos: coins,
+        feerate: 0.0001,
+        height: 910_007,
+      })
+      await assert.rejects(
+        () =>
+          chainFor('btc').build(
+            throughTheIndexer(node.call, 'btc', TREASURY, coins, {
+              depth: 6,
+              serves: { [`${coins[0]!.txid}:0`]: answer },
+            }),
+            {
+              from: TREASURY,
+              to: USER,
+              value: 500_000n,
+              fee: 50_000n,
+              bounds: BOUNDS,
+              shape: 'payment',
+            },
+          ),
+        AddressError,
+        `${label} must refuse, not read as an absence`,
+      )
+    }
+  })
+
+  it('does not fall back to the wallet when the source refuses', async () => {
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // The failure a fallback would cause is not an outage, it is a WRONG ANSWER. `listunspent` on
+    // a wallet-less node does not say "no coins", it says `-32601 Method not found`; and where a
+    // node does have a wallet, that wallet holds different coins from the ones the record names.
+    // Either way a build that switched sources mid-flight would be one address read two ways
+    // inside one selection. The refusal has to propagate.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    const coins = [utxo(1, 900_000n)]
+    const node = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_008,
+    })
+    const outage = new Error('the indexer refused: history_not_walked')
+    await assert.rejects(
+      () =>
+        chainFor('btc').build(
+          throughTheIndexer(node.call, 'btc', TREASURY, coins, {
+            refuses: outage,
+          }),
+          {
+            from: TREASURY,
+            to: USER,
+            value: 500_000n,
+            fee: 50_000n,
+            bounds: BOUNDS,
+            shape: 'payment',
+          },
+        ),
+      (err: unknown) => err === outage,
+    )
+    assert.equal(node.calls.includes('listunspent'), false)
+    // Not an InsufficientTreasuryError either, which is what a caught-and-emptied list would have
+    // produced — and which classifies as a treasury fault and tells a funded user they have no
+    // money.
+  })
+
+  it('an empty candidate list is an ANSWER, and it is insufficient funds', async () => {
+    // A swept address really does hold nothing, and the caller is entitled to be told so plainly.
+    // This is the one case where `[]` is right, and it is right only because it ARRIVED as `[]`
+    // rather than being manufactured from a failure.
+    const node = fakeBtcNode({ utxos: [], feerate: 0.0001, height: 910_009 })
+    const call = throughTheIndexer(node.call, 'btc', TREASURY, [])
+    assert.equal(await chainFor('btc').spendableBalance(call, TREASURY), 0n)
+    assert.equal(await chainFor('btc').sweepQuote(call, TREASURY, BOUNDS), null)
+    await assert.rejects(
+      () =>
+        chainFor('btc').build(call, {
+          from: TREASURY,
+          to: USER,
+          value: 500_000n,
+          fee: 50_000n,
+          bounds: BOUNDS,
+          shape: 'payment',
+        }),
+      InsufficientTreasuryError,
+    )
+  })
+
+  it('reads a balance and quotes a sweep from the same coins the wallet path would', async () => {
+    // `build` is not the only caller. `spendableBalance` feeds the treasury float alarm and
+    // `sweepQuote` sizes the fee of a sweep from the address's real coin count — both of which
+    // read zero, forever, on a wallet-less node before this existed.
+    const coins = [utxo(1, 500_000n), utxo(2, 300_000n), utxo(3, 900_000n)]
+    const wallet = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_010,
+    })
+    const node = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_010,
+    })
+    const call = throughTheIndexer(node.call, 'btc', TREASURY, coins, {
+      depth: 6,
+    })
+
+    assert.equal(
+      await chainFor('btc').spendableBalance(call, TREASURY),
+      await chainFor('btc').spendableBalance(wallet.call, TREASURY),
+    )
+    assert.equal(await chainFor('btc').spendableBalance(call, TREASURY), 1_700_000n)
+    assert.deepEqual(
+      await chainFor('btc').sweepQuote(call, TREASURY, BOUNDS),
+      await chainFor('btc').sweepQuote(wallet.call, TREASURY, BOUNDS),
+    )
+  })
+
+  it('works on the legacy chain too, where the coins are proved by a whole previous transaction', async () => {
+    // Dogecoin has no segwit, so its PSBT inputs carry `nonWitnessUtxo` — the entire funding
+    // transaction — rather than a `witnessUtxo`. That path fetches `getrawtransaction` for each
+    // input, which is a SECOND place the outpoint has to be right, and it is reached only on this
+    // chain. A source that worked on Bitcoin and handed doge a vout the previous transaction does
+    // not have would fail here and nowhere else.
+    const funding = [
+      { ...dogeFunding(1, 400_000_000n), sats: 400_000_000n },
+      { ...dogeFunding(2, 600_000_000n), sats: 600_000_000n },
+    ]
+    const coins = funding.map((f) => ({
+      txid: f.txid,
+      vout: f.vout,
+      sats: f.sats,
+    }))
+    const wallet = fakeDogeNode({ funding, feerate: 0.01, height: 5_100_001 })
+    const node = fakeDogeNode({ funding, feerate: 0.01, height: 5_100_001 })
+
+    const input = {
+      from: DOGE_TREASURY,
+      to: DOGE_USER,
+      value: 500_000_000n,
+      fee: 100_000_000n,
+      bounds: BOUNDS,
+      shape: 'payment' as const,
+    }
+    const viaWallet = await chainFor('doge').build(wallet.call, input)
+    const viaIndexer = await chainFor('doge').build(
+      throughTheIndexer(node.call, 'doge', DOGE_TREASURY, coins, { depth: 30 }),
+      input,
+    )
+    assert.equal(viaIndexer.payload, viaWallet.payload)
+
+    const psbt = bitcoin.Psbt.fromBase64(String(viaIndexer.payload), {
+      network: DOGE_TESTNET,
+    })
+    assert.ok(psbt.data.inputs[0]?.nonWitnessUtxo, 'a legacy input is proved by the whole prevtx')
+    assert.equal(psbt.data.inputs[0]?.witnessUtxo, undefined)
+  })
+
+  it('leaves the wallet path exactly as it was when no source is attached', async () => {
+    // The wallet path is not dead code kept for sentiment: a node that HAS a wallet is a
+    // deployment this adapter still serves, and the choice between the two is made where the
+    // `ChainCall` is constructed. A `ChainCall` without a source must reach `listunspent` and must
+    // not reach `gettxout` — otherwise the two paths have quietly become one.
+    const coins = [utxo(1, 900_000n)]
+    const node = fakeBtcNode({
+      utxos: coins,
+      feerate: 0.0001,
+      height: 910_011,
+    })
+    assert.equal(node.call.candidates, undefined, 'the fake models a node, not a wiring')
+    await chainFor('btc').build(node.call, {
+      from: TREASURY,
+      to: USER,
+      value: 500_000n,
+      fee: 50_000n,
+      bounds: BOUNDS,
+      shape: 'payment',
+    })
+    assert.ok(node.calls.includes('listunspent'))
+    assert.equal(node.calls.includes('gettxout'), false)
   })
 })

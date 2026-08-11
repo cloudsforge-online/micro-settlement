@@ -319,10 +319,58 @@ export class FeeOutOfBandError extends Error {
  */
 export type JsonRpc = (method: string, params: readonly unknown[]) => Promise<unknown>
 
-/** One chain call: which network, and the node that answers for it. */
+/**
+ * One outpoint some record believes an address may still hold.
+ *
+ * There is no `scriptPubKey` and the `amount` is not signed against. Both come from `gettxout`
+ * instead, and the reason is that a signature commits to the value of the coin it spends: taking
+ * that number from anywhere but the party who validates the signature is how a transaction gets
+ * built that no node will accept, or — worse, on segwit — one that pays a fee nobody chose.
+ */
+export interface OutpointCandidate {
+  readonly txid: string
+  readonly vout: number
+  /** Smallest units, per the record. Orders the candidates before the node is asked; never signed. */
+  readonly amount: bigint
+  readonly blockHeight: number
+}
+
+/**
+ * Who can name the outpoints of an address, for a node that will not.
+ *
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE INDEXER PROPOSES; THE NODE DISPOSES.** `listunspent` is a WALLET rpc, and this estate's
+ * bitcoind and litecoind run `disablewallet=1` — so on the chains that need it most there is no
+ * node method that will enumerate an address's coins, and every bitcoin-family withdrawal died at
+ * `-32601 Method not found` (micro-org#382).
+ *
+ * This port answers from a record that walked every block. What comes back is a set of
+ * CANDIDATES: outpoints that, as of a stated height, have not been observed spent. `bitcoin.ts`
+ * then re-reads each one with `gettxout` — which a wallet-less node does answer, and which reports
+ * the live UTXO set — and spends only what the node still serves, at the node's value.
+ *
+ * The asymmetry is the whole design. A candidate list that is too LONG is corrected by that pass,
+ * one coin at a time, and being too long is the ORDINARY state: the record lags the mempool, so
+ * our own in-flight spend is still in it. A list that is too SHORT cannot be corrected by any
+ * amount of asking, because a missing coin is indistinguishable from a swept address — so the
+ * source must refuse rather than answer short, and every refusal must arrive here as a thrown
+ * error and not as `[]`.
+ * ════════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export type UtxoCandidateSource = (address: string) => Promise<readonly OutpointCandidate[]>
+
+/** One chain call: which network, the node that answers for it, and who can name its coins. */
 export interface ChainCall {
   readonly network: Network
   readonly rpc: JsonRpc
+  /**
+   * Absent means "ask the node's wallet", which is the ONLY behaviour that existed before
+   * micro-org#382 and is still the right one for a node that has a wallet. Optional rather than
+   * required because the choice is made where the call is CONSTRUCTED — a configuration fact — and
+   * not by falling back when the source errors. Falling back would switch coin sources mid-flight
+   * on a transient outage, which is two views of one address inside one build.
+   */
+  readonly candidates?: UtxoCandidateSource
 }
 
 /** The bounds a fee must sit inside. From `env`, passed rather than imported so it is testable. */
