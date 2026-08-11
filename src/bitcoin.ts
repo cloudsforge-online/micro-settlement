@@ -1277,10 +1277,12 @@ const FEE_WINDOW_BLOCKS = 24
  * propagate. Swallowing them would build every transaction on the estate at the relay floor during
  * an outage, silently, which is a far worse defect than the one this closes.
  *
- * BTC and DOGE have no endpoint in `SETTLEMENT_RPC_URLS` today, so (2) and (3) are latent rather
- * than live. Both nodes are already running on this host; adding either chain to that variable is
- * a one-line deploy edit, and until this change it was a one-line deploy edit that broke every fee
- * quote on the chain it enabled.
+ * BTC gained an endpoint in `SETTLEMENT_RPC_URLS` on 2026-08-11 and (2) is now the live path on
+ * mainnet, not a latent one: that node runs `blocksonly`, so every Bitcoin fee quote this estate
+ * answers comes back through the branch above. It was a one-line deploy edit, and before this
+ * change it was a one-line deploy edit that broke every fee quote on the chain it enabled — which
+ * is the whole reason the enabling edit came second. DOGE is still endpoint-less and therefore
+ * still latent; its node is already running on the chain host.
  */
 const NO_ESTIMATE_RPC_MESSAGE = 'Fee estimation disabled'
 
