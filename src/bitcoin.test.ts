@@ -72,6 +72,49 @@ interface FakeUtxo {
   readonly confirmations?: number
 }
 
+/**
+ * What a fake node's `getblockstats` serves, as the 50th-percentile feerate of each block in the
+ * trailing window — or `'unsupported'` for a node whose Core base predates the RPC.
+ */
+type FakeFeeWindow = readonly number[] | 'unsupported'
+
+/**
+ * Bitcoin mainnet blocks 961,919–961,942, read 2026-08-11. Its p90 is 3 sat/vB, which is the number
+ * the fee block in `bitcoin.ts` reports for the wider 144-block sample — the point of using a real
+ * window rather than a tidy one is that a derivation tuned to a synthetic ramp would pass here and
+ * price a real chain wrong.
+ */
+const BTC_FEE_WINDOW: readonly number[] = [
+  1, 1, 1, 2, 1, 1, 3, 1, 2, 1, 1, 4, 1, 2, 1, 1, 3, 1, 1, 2, 1, 1, 3, 1,
+]
+
+/**
+ * Litecoin mainnet blocks 3,157,776–3,157,799, read off the chain host 2026-08-11. Its p90 is 5
+ * litoshi/vB against a relay floor of 1, which is the measurement that says this derivation changes
+ * what LTC pays and not only what BTC pays. The two zeroes are real: both blocks carried two
+ * transactions and `getblockstats` reported every percentile as 0.
+ */
+const LTC_FEE_WINDOW: readonly number[] = [
+  3, 5, 3, 3, 5, 5, 5, 3, 5, 5, 0, 5, 5, 5, 5, 5, 3, 1, 1, 3, 4, 4, 0, 3,
+]
+
+/**
+ * `getblockstats` as Core answers it, for the one field this service reads.
+ *
+ * The percentiles are the 10th, 25th, 50th, 75th and 90th of the block's WEIGHT, and this fake
+ * spreads them around the given median rather than repeating it, so a derivation that read the
+ * wrong index would return a different number here instead of the same one.
+ */
+function fakeBlockStats(window: FakeFeeWindow, tip: number, height: number): unknown {
+  if (window === 'unsupported') throw new RpcError('getblockstats', 'Method not found')
+  const median = window[Math.abs(tip - height) % window.length] ?? 0
+  const at = (n: number): number => Math.max(0, n)
+  return {
+    height,
+    feerate_percentiles: [at(median - 2), at(median - 1), median, median + 2, median + 5],
+  }
+}
+
 interface FakeBtcNodeOptions {
   readonly utxos?: readonly FakeUtxo[]
   /** BTC per kvB, as `estimatesmartfee` reports it. Absent means the node cannot estimate. */
@@ -86,6 +129,18 @@ interface FakeBtcNodeOptions {
   readonly feeAnswer?: unknown
   /** The node raises a JSON-RPC error instead of answering. The message is Core's, verbatim. */
   readonly feeError?: string
+  /**
+   * What `getblockstats` says the last blocks paid, per block, in base units per vB.
+   *
+   * This is the source `feeRate` falls to when the node has no estimate, so the DEFAULT matters:
+   * `fakeBtcNode` and `fakeLtcNode` serve a measured window because their real nodes have the RPC,
+   * and `fakeDogeNode` serves `'unsupported'` because `dogecoind 1.14.9` predates it. A fake that
+   * defaulted the other way would let the floor look like the derivation and the derivation look
+   * like the floor — which is the exact confusion this option exists to keep out.
+   */
+  readonly blockFeerates?: FakeFeeWindow
+  /** `getblockstats` raises this instead of answering. The message is Core's, verbatim. */
+  readonly blockStatsError?: string
   readonly height?: number
   readonly confirmationsByTxid?: Readonly<Record<string, number>>
   /** Outpoints `gettxout` still reports, as `txid:vout`. Anything else has been spent. */
@@ -129,6 +184,11 @@ function fakeBtcNode(options: FakeBtcNodeOptions = {}): {
       }
       case 'getblockcount':
         return height
+      case 'getblockstats':
+        if (options.blockStatsError !== undefined) {
+          throw new RpcError('getblockstats', options.blockStatsError)
+        }
+        return fakeBlockStats(options.blockFeerates ?? BTC_FEE_WINDOW, height, Number(params[0]))
       case 'getrawtransaction': {
         const txid = String(params[0])
         const confirmations = options.confirmationsByTxid?.[txid]
@@ -802,7 +862,16 @@ describe('build, for a sweep', () => {
     // The number that was wrong. `estimateFee` quotes `vsizeOf(1, 2)` = 141 vbytes; a three-coin
     // sweep is `vsizeOf(3, 1)` = 246. At the relay floor of 1 sat/vB the old quote would have paid
     // 141 satoshis for a 246-vbyte transaction — 0.57 sat/vB, which no node forwards.
-    const node = fakeBtcNode({ utxos: [utxo(1, 500_000n), utxo(2, 300_000n), utxo(3, 90_000n)] })
+    //
+    // The window is pinned to 1 sat/vB so this stays a test about the SIZE. Without it the node
+    // derives 3 from `BTC_FEE_WINDOW` and the arithmetic above, which is the whole point of the
+    // case, would have to be restated every time a measured window is refreshed. Its own height
+    // keeps it out of the shared per-adapter window cache.
+    const node = fakeBtcNode({
+      utxos: [utxo(1, 500_000n), utxo(2, 300_000n), utxo(3, 90_000n)],
+      height: 800_101,
+      blockFeerates: [1],
+    })
     const quote = await chainFor('btc').sweepQuote(node.call, TREASURY, BOUNDS)
     assert.ok(quote)
     assert.equal(quote.fee, 1n * BigInt(vsizeOf(3, 1)))
@@ -1007,6 +1076,12 @@ function fakeLtcNode(options: FakeBtcNodeOptions = {}): { call: ChainCall; broad
       }
       case 'getblockcount':
         return options.height ?? 3_000_000
+      case 'getblockstats':
+        return fakeBlockStats(
+          options.blockFeerates ?? LTC_FEE_WINDOW,
+          options.height ?? 3_000_000,
+          Number(params[0]),
+        )
       case 'getrawtransaction': {
         const confirmations = options.confirmationsByTxid?.[String(params[0])]
         if (confirmations === undefined) throw new Error('-5: No such mempool or blockchain transaction')
@@ -1318,6 +1393,19 @@ interface FakeDogeNodeOptions {
   readonly feeAnswer?: unknown
   /** @see FakeBtcNodeOptions.feeError */
   readonly feeError?: string
+  /**
+   * @see FakeBtcNodeOptions.blockFeerates — and note the DEFAULT here is `'unsupported'`, because
+   * `dogecoind 1.14.9` is a Core 0.14-era base and `getblockstats` arrived in 0.17. This is the
+   * only fake in this file whose real node cannot answer, so it is the only one where the floor is
+   * still the whole answer.
+   */
+  readonly blockFeerates?: FakeFeeWindow
+  /**
+   * The tip. Worth setting whenever a case reaches the fee window: `registry.ts` builds one adapter
+   * per chain at import, its window cache is keyed on `network:tip`, and every case in this file
+   * shares it — so two cases at one height read each other's rate.
+   */
+  readonly height?: number
   readonly confirmations?: number
   /** Answer `getrawtransaction` with an object instead of hex, as a node with no `txindex` does. */
   readonly withholdRaw?: boolean
@@ -1355,7 +1443,13 @@ function fakeDogeNode(options: FakeDogeNodeOptions = {}): { call: ChainCall; cal
             spendable: true,
           }))
       case 'getblockcount':
-        return 5_000_000
+        return options.height ?? 5_000_000
+      case 'getblockstats':
+        return fakeBlockStats(
+          options.blockFeerates ?? 'unsupported',
+          options.height ?? 5_000_000,
+          Number(params[0]),
+        )
       case 'getrawtransaction': {
         const row = funding.find((f) => f.txid === String(params[0]))
         if (!row) throw new Error('-5: No such mempool or blockchain transaction')
@@ -1664,17 +1758,23 @@ describe('dogecoin', () => {
     /*
      * `dogecoin/dogecoin`, `src/validation.h`: `DEFAULT_MIN_RELAY_TX_FEE = RECOMMENDED_MIN_TX_FEE /
      * 10` = 100,000 koinu per kvB = 100 koinu/vB, against 1 sat/vB on Bitcoin and Litecoin. The
-     * floor is reached whenever the node says it has no estimate, which on the mainnet estate is
-     * every call and for ever — see `NO_ESTIMATE_RPC_MESSAGE` — and a Dogecoin transaction built at
-     * 1 koinu/vB is a signed transaction no node forwards, permanently, because a policy floor does
+     * floor is reached whenever the node says it has no estimate AND cannot be asked what its blocks
+     * paid — which on `dogecoind 1.14.9` is every call and for ever, because `getblockstats` arrived
+     * in Core 0.17 and this node answers `Method not found`. A Dogecoin transaction built at 1
+     * koinu/vB is a signed transaction no node forwards, permanently, because a policy floor does
      * not fall the way a fee market does.
      */
     const node = fakeDogeNode({ feerate: null })
     const fee = await chainFor('doge').estimateFee(node.call, BOUNDS)
     assert.equal(fee, 100n * BigInt(vsizeOf(1, 2, 'doge')))
 
+    // Bitcoin reaches the same missing estimate and does NOT reach the same floor, which is the
+    // whole of the change: its node has `getblockstats`, so the rate is the p90 of what the last 24
+    // blocks' middles actually paid — 3 sat/vB on the measured window — rather than the 1 sat/vB
+    // this assertion used to expect. Below the derivation the floor still catches, and DOGE above is
+    // the proof of that rather than a second case of it.
     const btc = await chainFor('btc').estimateFee(fakeBtcNode({ feerate: null }).call, BOUNDS)
-    assert.equal(btc, 1n * BigInt(vsizeOf(1, 2, 'btc')))
+    assert.equal(btc, 3n * BigInt(vsizeOf(1, 2, 'btc')))
   })
 
   it("uses Dogecoin's flat dust limit of 0.01 DOGE, not a size-derived threshold", async () => {
@@ -1754,7 +1854,7 @@ describe('dogecoin', () => {
 
 /**
  * ════════════════════════════════════════════════════════════════════════════════════════════════
- * THE ANSWER THREE DIFFERENT NODES GIVE WHEN THEY HAVE NO FEE ESTIMATE.
+ * THE ANSWER THREE DIFFERENT NODES GIVE WHEN THEY HAVE NO FEE ESTIMATE, AND WHAT IS PAID INSTEAD.
  *
  * `feeRate` has always documented one behaviour — "no estimate, so take the relay floor" — and had
  * it for one of the three spellings a bitcoin-family node actually uses. The other two came out as
@@ -1763,23 +1863,39 @@ describe('dogecoin', () => {
  * 2026-08-09, not a shape invented for a fake; the fake's own `{}` is neither of them and is the
  * reason this went unnoticed. See `NO_ESTIMATE_RPC_MESSAGE` in `bitcoin.ts` for the sources.
  *
- * Also asserted, and it is the half that matters more: every OTHER node fault still propagates. A
- * catch wide enough to swallow an outage would build every transaction on the estate at the relay
- * floor and say nothing, which is a worse defect than the one this closes.
+ * **What the three now fall to is CONFIRMED BLOCKS and not the floor**, because Bitcoin arrived on
+ * this estate and 1 sat/vB there is a transaction that is relayed and then sits. `getblockstats`
+ * answers under `blocksonly` where the estimator cannot, so the rate is the p90 across a 24-block
+ * window of each block's 50th-percentile feerate, clamped between the relay floor and this
+ * service's ceiling. The floor is what remains when even that has nothing to read — which on
+ * `dogecoind 1.14.9` is always, since `getblockstats` postdates it.
+ *
+ * Also asserted, and it is the half that matters more: every OTHER node fault still propagates,
+ * from BOTH RPCs. A catch wide enough to swallow an outage would build every transaction on the
+ * estate at the relay floor and say nothing, which is a worse defect than the one this closes.
+ *
+ * **Each case below picks its own `height`.** The window is cached per adapter against
+ * `network:tip`, `registry.ts` builds one adapter per chain at import, and these cases share it —
+ * so two cases at the same height would silently read each other's rate.
  * ════════════════════════════════════════════════════════════════════════════════════════════════
  */
 describe('the fee estimate this deployment will never get', () => {
   const paymentFee = (chain: BitcoinFamilyChainId, perVb: bigint): bigint =>
     perVb * BigInt(vsizeOf(1, 2, chain))
 
-  it("takes the floor from litecoind's `errors` answer, which blocksonly makes permanent", async () => {
+  it("prices litecoind's `errors` answer from its blocks, which is FIVE times the floor", async () => {
     // `litecoind 0.21.5.6`, `/data/chains/litecoin/litecoin.conf: blocksonly=1`, at the tip
     // (`initialblockdownload: false`, 3,156,788 blocks, 10 peers). Every target from 2 to 144
     // answers this, and always will: with no mempool the estimator has nothing to learn from.
+    //
+    // This assertion used to read `paymentFee('ltc', 1n)` and the change is the point of the
+    // commit. `LTC_FEE_WINDOW` is 24 real Litecoin blocks and its p90 is 5 litoshi/vB, so the one
+    // chain this estate moves money on now pays what its blocks include rather than the least a
+    // node will forward. On a 200-vB withdrawal that is 800 litoshi, or 0.000008 LTC.
     const node = fakeLtcNode({
       feeAnswer: { errors: ['Insufficient data or no feerate found'], blocks: 0 },
     })
-    assert.equal(await chainFor('ltc').estimateFee(node.call, BOUNDS), paymentFee('ltc', 1n))
+    assert.equal(await chainFor('ltc').estimateFee(node.call, BOUNDS), paymentFee('ltc', 5n))
   })
 
   it("takes the floor from dogecoind's `feerate: -1`, which is a number and is not a fee", async () => {
@@ -1795,22 +1911,128 @@ describe('the fee estimate this deployment will never get', () => {
     assert.notEqual(paymentFee('doge', 100n), paymentFee('doge', 1n))
   })
 
-  it("takes the floor from bitcoind's `Fee estimation disabled`, which arrives as an exception", async () => {
+  it("prices bitcoind's `Fee estimation disabled` from its blocks, not from the floor", async () => {
     // `bitcoind 27.0`, same `blocksonly=1`. Core 25 and later do not construct the estimator at
     // all under it — `bitcoin/bitcoin`, `src/init.cpp`, `if (!peerman_opts.ignore_incoming_txs)` —
     // and `src/rpc/server_util.cpp` `EnsureFeeEstimator` throws `RPC_INTERNAL_ERROR` with this
     // message. Measured: `error code: -32603, error message: Fee estimation disabled`.
-    const node = fakeBtcNode({ feeError: 'Fee estimation disabled' })
-    assert.equal(await chainFor('btc').estimateFee(node.call, BOUNDS), paymentFee('btc', 1n))
-    // The sweep shape reads the same estimate through the tighter ceiling, and a sweep is the
+    //
+    // This is the chain the derivation exists for. The floor of 1 sat/vB is ABOVE Bitcoin's relay
+    // minimum, so a transaction built at it is accepted, forwarded, and then waits — the failure
+    // that announces itself to nobody. `BTC_FEE_WINDOW` p90s at 3.
+    const node = fakeBtcNode({ feeError: 'Fee estimation disabled', height: 900_001 })
+    assert.equal(await chainFor('btc').estimateFee(node.call, BOUNDS), paymentFee('btc', 3n))
+    // The sweep shape reads the same window through the tighter ceiling, and a sweep is the
     // path with nobody watching — so it is the one where an exception becomes a deposit that is
     // simply never consolidated.
     const sweep = fakeBtcNode({
       feeError: 'Fee estimation disabled',
+      height: 900_002,
       utxos: [{ txid: '11'.repeat(32), vout: 0, sats: 5_000_000n }],
     })
     const quote = await chainFor('btc').sweepQuote(sweep.call, TREASURY, BOUNDS)
     assert.ok(quote, 'a sweep of a funded address is still quotable without an estimator')
+  })
+
+  it('clamps the derived rate up to the relay floor, so a quiet chain cannot go unrelayed', async () => {
+    // Dogecoin, given a node that DOES have `getblockstats` — which no dogecoind on this host is,
+    // and that is exactly why the clamp needs asserting somewhere the derivation can reach. Every
+    // block in this window paid 50 koinu/vB, which is half of Dogecoin's `DEFAULT_MIN_RELAY_TX_FEE`
+    // of 100 koinu/vB. Paying what the blocks paid would build a transaction no node forwards.
+    //
+    // A window BELOW the relay floor is not hypothetical on Dogecoin: its floor is a policy
+    // constant a hundred times Bitcoin's, and blocks with room include whatever they are handed.
+    const node = fakeDogeNode({
+      feerate: null,
+      height: 5_000_101,
+      blockFeerates: [50, 50, 50, 50, 50, 50],
+    })
+    assert.equal(await chainFor('doge').estimateFee(node.call, BOUNDS), paymentFee('doge', 100n))
+  })
+
+  it("clamps the derived rate down to this service's ceiling, which is custody's minus a margin", async () => {
+    // A fee event, or a node answering something absurd. 20,000 sat/vB is four times this service's
+    // payment ceiling of 4,500 and above custody's 5,000 — so unclamped it would build a
+    // transaction custody would refuse to sign, and the withdrawal would fail at the signature
+    // rather than wait for a cheaper block. The ceiling is the same bound whichever source quoted
+    // it, which is the property that stops the derivation being a way around it.
+    const hot = Array.from({ length: 24 }, () => 20_000)
+    const node = fakeBtcNode({ feeError: 'Fee estimation disabled', height: 900_003, blockFeerates: hot })
+    assert.equal(await chainFor('btc').estimateFee(node.call, BOUNDS), paymentFee('btc', 4_500n))
+  })
+
+  it('takes the floor when too few blocks in the window carry a usable percentile', async () => {
+    // `getblockstats` reports every percentile as 0 for a block that carried nothing but its
+    // coinbase — measured twice in the 24 real Litecoin blocks of `LTC_FEE_WINDOW`. Two such blocks
+    // are noise; thirteen mean the window is not a fee market reading, and a rate derived from the
+    // eleven that remain would be a confident number built on a sample that is mostly absent.
+    //
+    // The guard is a MAJORITY rather than a count, so it does not need retuning when the window
+    // size changes. Below it the floor takes over, which is the behaviour this whole file used to
+    // assert unconditionally.
+    const sparse = [...Array.from({ length: 13 }, () => 0), ...Array.from({ length: 11 }, () => 9)]
+    const node = fakeBtcNode({ feeError: 'Fee estimation disabled', height: 900_004, blockFeerates: sparse })
+    assert.equal(await chainFor('btc').estimateFee(node.call, BOUNDS), paymentFee('btc', 1n))
+  })
+
+  it("takes the floor when the node has no `getblockstats`, and only for that one refusal", async () => {
+    // `getblockstats` arrived in Bitcoin Core 0.17; `dogecoind 1.14.9` is a 0.14-era base and
+    // answers `-32601 Method not found`. That is the one refusal the derivation swallows, because
+    // it means "this node cannot tell me" rather than "this node is unwell".
+    const doge = fakeDogeNode({ feerate: null, height: 5_000_102 })
+    assert.equal(await chainFor('doge').estimateFee(doge.call, BOUNDS), paymentFee('doge', 100n))
+
+    // Every other `getblockstats` fault propagates, on the same argument as the estimator's. These
+    // are real Core refusals and a pruned node is the one that would actually happen: it says
+    // `Block not available (pruned data)`, and reading that as "no fee data" would build every
+    // Bitcoin withdrawal at 1 sat/vB for as long as the condition lasted, silently.
+    const refusals = ['Block not available (pruned data)', 'Loading block index...', 'Work queue depth exceeded']
+    for (const [index, message] of refusals.entries()) {
+      await assert.rejects(
+        () =>
+          chainFor('btc').estimateFee(
+            fakeBtcNode({
+              feeError: 'Fee estimation disabled',
+              blockStatsError: message,
+              height: 900_010 + index,
+            }).call,
+            BOUNDS,
+          ),
+        (err: unknown) => err instanceof RpcError && err.message === message,
+        `${message} must not be read as "this node has no getblockstats"`,
+      )
+    }
+  })
+
+  it('reads the window once per block, not once per quote', async () => {
+    // 24 `getblockstats` calls is not a per-quote cost. The reconciliation sweep quotes repeatedly
+    // and `status` polls beside it, so an uncached window would multiply this service's RPC load on
+    // a node that already wedged its work queue once (`litecoin.conf`, 2026-08-09).
+    //
+    // Keyed on the tip HEIGHT and not on a clock — Rule 8. The thing that makes the answer stale is
+    // a new block, and asking `getblockcount` to find out is the one call it costs.
+    const node = fakeBtcNode({ feeError: 'Fee estimation disabled', height: 900_005 })
+    await chainFor('btc').estimateFee(node.call, BOUNDS)
+    const afterFirst = node.calls.filter((m) => m === 'getblockstats').length
+    assert.equal(afterFirst, 24, 'the first quote reads the whole window')
+
+    await chainFor('btc').estimateFee(node.call, BOUNDS)
+    assert.equal(
+      node.calls.filter((m) => m === 'getblockstats').length,
+      afterFirst,
+      'a second quote in the same block reads no blocks at all',
+    )
+    assert.equal(
+      node.calls.filter((m) => m === 'getblockcount').length,
+      2,
+      'and it still asks the height, because that is what tells it the answer is still current',
+    )
+
+    // A new block invalidates it. Same fake, one height on: the window is read again rather than
+    // served from a cache with no expiry, which is the failure mode a height key exists to avoid.
+    const next = fakeBtcNode({ feeError: 'Fee estimation disabled', height: 900_006 })
+    await chainFor('btc').estimateFee(next.call, BOUNDS)
+    assert.equal(next.calls.filter((m) => m === 'getblockstats').length, 24)
   })
 
   it('lets every other node fault propagate, so an outage cannot quietly become the floor', async () => {
@@ -1831,10 +2053,14 @@ describe('the fee estimate this deployment will never get', () => {
     }
   })
 
-  it('still prefers a real estimate wherever a node has one, so the floor is a fallback', async () => {
-    // The floor being permanent HERE is a fact about this deployment's node configuration, not a
-    // decision this adapter makes. Point it at a relaying node and the estimate wins immediately.
-    const node = fakeLtcNode({ feerate: 0.00005 })
-    assert.equal(await chainFor('ltc').estimateFee(node.call, BOUNDS), paymentFee('ltc', 5n))
+  it('still prefers a real estimate wherever a node has one, so the blocks are a fallback', async () => {
+    // The estimator being unavailable HERE is a fact about this deployment's node configuration,
+    // not a decision this adapter makes. Point it at a relaying node and the estimate wins
+    // immediately — the derivation is not asked and the node is not read 24 times.
+    //
+    // 9 litoshi/vB is deliberately NOT 5: `LTC_FEE_WINDOW` p90s at 5, so an assertion at 5 would
+    // pass whether the estimate won or the window did.
+    const node = fakeLtcNode({ feerate: 0.00009 })
+    assert.equal(await chainFor('ltc').estimateFee(node.call, BOUNDS), paymentFee('ltc', 9n))
   })
 })
