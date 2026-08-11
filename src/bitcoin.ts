@@ -978,9 +978,25 @@ const MIN_RELAY_PER_VB: Readonly<Record<BitcoinFamilyChainId, bigint>> = Object.
 const FEE_TARGET_BLOCKS = 3
 
 /**
+ * How many trailing blocks `deriveFeeRateFromBlocks` reads when the node has no estimate.
+ *
+ * 24 is four hours of Bitcoin and an hour of Litecoin — long enough that one unusually empty or
+ * unusually contested block cannot set the rate, short enough that a fee market moving during the
+ * day is followed rather than averaged away. It is also 24 RPC calls, which is why the result is
+ * cached against the tip height and recomputed when a block arrives rather than per quote.
+ */
+const FEE_WINDOW_BLOCKS = 24
+
+/**
  * ════════════════════════════════════════════════════════════════════════════════════════════════
- * **THE FLOOR IS THIS DEPLOYMENT'S FEE SOURCE, PERMANENTLY AND BY DEPLOYMENT CHOICE. IT IS NOT A
- * DEGRADED MODE AND NOTHING IS WAITING FOR IT TO END.**
+ * **`estimatesmartfee` IS NOT THIS DEPLOYMENT'S FEE SOURCE AND CANNOT BECOME ONE, SO CONFIRMED
+ * BLOCKS ARE. THE FLOOR IS THE LAST RESORT AND NO LONGER THE WHOLE ANSWER.**
+ *
+ * This block used to read "THE FLOOR IS THIS DEPLOYMENT'S FEE SOURCE, PERMANENTLY AND BY DEPLOYMENT
+ * CHOICE", and every measurement it rests on is still true. What changed is that **Bitcoin
+ * arrived**, and its own last paragraph is what says the floor cannot follow it there. So the
+ * derivation that paragraph named is now built — `deriveFeeRateFromBlocks` below — and the floor is
+ * what remains when even that has nothing to read.
  *
  * The note this block replaces — and its twin in `deploy/compose/docker-compose.estate.yml`, above
  * `x-wallet-fee-quotes` — deferred a decision "once `estimatesmartfee` answers". It cannot answer,
@@ -1022,23 +1038,85 @@ const FEE_TARGET_BLOCKS = 3
  *     block's 90th-pct feerate           11                    44           301
  *     block's average feerate            12                    23            87
  *
- * The row that settles it is the first: in at least nine blocks out of ten, the cheapest tenth of
+ * The row that settled it was the first: in at least nine blocks out of ten, the cheapest tenth of
  * the block's weight paid **1 litoshi/vB** — this floor exactly. Litecoin blocks have room, so a
  * transaction built at the floor is in the band they routinely include. That is a measurement and
- * not a hope, and it is the reason nothing here reaches for a live quote.
+ * not a hope, and it is why the floor stood alone for as long as Litecoin was the only chain here.
  *
- * **If a live quote is ever wanted it comes from `getblockstats`, not from `estimatesmartfee`** —
- * percentiles over a trailing window, from confirmed blocks, available under `blocksonly`.
+ * ── AND THEN BITCOIN, WHERE THE SAME ARGUMENT DOES NOT REACH ────────────────────────────────────
  *
- * ── THE RESIDUAL, STATED RATHER THAN LEFT TO BE DISCOVERED ──────────────────────────────────────
+ * `bitcoind 27.0` on the same host finished its initial block download on 2026-08-10 and the
+ * indexer follows `btc:mainnet` from 2026-08-11. Its `blocksonly=1` is unchanged — Bitcoin builds
+ * no templates for micro-pool, so the argument that took `blocksonly` off `litecoind` does not
+ * apply to it — and Core 25 and later do not construct a fee estimator at all under it. Measured
+ * against that node on 2026-08-11:
  *
- * `SETTLEMENT_RPC_URLS` carries `ember` and `ltc` today, so Litecoin is the only chain in this
- * family that this measurement covers. `bitcoind` is running on the same host with the identical
- * `blocksonly=1`, and Bitcoin's blocks are not Litecoin's: a BTC transaction at 1 sat/vB is above
- * the relay floor and would still sit unconfirmed. **Pointing this service at that node is a
- * deploy change that needs its own fee decision first**, and this block is where whoever makes it
- * should stop. Nothing in this file blocks it, because a refusal nobody can test against a live
- * endpoint is a refusal that breaks the day the endpoint appears.
+ *     estimatesmartfee 2|6|12|24|144   -32603  Fee estimation disabled
+ *     getmempoolinfo                   size 0, mempoolminfee 0.00001
+ *
+ * So Bitcoin arrives with the same missing estimate and **a floor that does not fit it**. 1 sat/vB
+ * is above Bitcoin's relay floor and is routinely below what its blocks include; the same
+ * transaction at the floor sits unconfirmed rather than being refused, which is the failure that
+ * announces itself to nobody. A higher constant is not the answer either, because Bitcoin's fee
+ * market has moved by two orders of magnitude inside a week more than once, and a constant is
+ * wrong in whichever direction the market happens to be.
+ *
+ * ── SO THE LIVE QUOTE THIS BLOCK USED TO DEFER IS NOW BUILT, AND FROM CONFIRMED BLOCKS ──────────
+ *
+ * The deferral read: **"If a live quote is ever wanted it comes from `getblockstats`, not from
+ * `estimatesmartfee`"** — percentiles over a trailing window, from confirmed blocks, available
+ * under `blocksonly`. `deriveFeeRateFromBlocks` is exactly that and nothing more. Measured over
+ * Bitcoin mainnet blocks 961,799–961,942 (144 blocks, 661,103 transactions) on 2026-08-11, in
+ * sat/vB:
+ *
+ *     statistic                  median across blocks   p90 across blocks   max
+ *     block's 10th-pct feerate            0                     1             2
+ *     block's 50th-pct feerate            1                     3             4
+ *     block's 90th-pct feerate            3                     5             7
+ *     block's average feerate             1                     4             7
+ *
+ * The window statistic is the **p90 across the window of each block's 50th-percentile feerate**:
+ * 3 sat/vB on that sample, against a floor of 1. Paying the middle of the block's weight is paying
+ * what the block itself included rather than what somebody predicts it will; taking the p90 across
+ * the window rather than the median means an ordinary day is priced by its worst hour and a spike
+ * is followed within a block or two. Both directions are then clamped — never below the relay
+ * floor, never above this chain's ceiling, which is the same bound custody enforces on the
+ * signature.
+ *
+ * ── WHAT IT CHANGES ON LITECOIN: NOTHING TODAY, AND THAT IS A MEASUREMENT AND NOT A DESIGN ──────
+ *
+ * Litecoin is the chain that moves money on this estate, so what this does to LTC was measured
+ * rather than reasoned about — and the measurement moved between two readings of the SAME node,
+ * which is the whole reason the fallback is worth having.
+ *
+ *     2026-08-09   estimatesmartfee 3 → {"errors":["Insufficient data or no feerate found"]}
+ *     2026-08-11   estimatesmartfee 3 → {"feerate":0.00000999,"blocks":3}   mempool 30 tx / 7,553 B
+ *
+ * `litecoind` lost `blocksonly` when micro-pool needed it to build templates, so unlike `bitcoind`
+ * it HAS an estimator; it simply had not seen enough traffic to answer on the 9th. So **LTC takes
+ * the estimator branch today and keeps paying 1 litoshi/vB** — 999 litoshi/kvB is one per vB — and
+ * this change reaches Litecoin only on the days the estimator goes quiet again, which is a state
+ * this node was in 48 hours before the deploy.
+ *
+ * What the blocks say meanwhile, read through settlement's own RPC path over Litecoin mainnet
+ * blocks 3,157,793–3,157,816 on 2026-08-11, in litoshi/vB:
+ *
+ *     block's 50th-pct feerate, per block   105 1 1 4 5 4 3 5 5 5 3 5 4 5 5 3 5 3 5 3 3 5 5 5
+ *     p90 across the window                 5
+ *
+ * Five, against an estimator that says one. Both are honest and they answer different questions:
+ * the blocks say what senders PAID, the estimator says what it would have taken to GET IN, and on a
+ * chain whose blocks are nowhere near full those differ by everything the overpayers left on the
+ * table. The estimator is asked first for exactly that reason, and the blocks are what remains when
+ * there is no estimator to ask — which on Bitcoin is permanent and on Litecoin is a Tuesday.
+ *
+ * ── WHAT STILL TAKES THE FLOOR, AND WHY THAT IS NOT A REGRESSION ────────────────────────────────
+ *
+ * `getblockstats` is a Bitcoin Core 0.17 RPC. `dogecoind 1.14.9` predates it and answers
+ * `Method not found`, so DOGE lands on its 100 koinu/vB floor exactly as before — the derivation
+ * catches that one refusal by name and nothing else, on the same narrowness rule
+ * `NO_ESTIMATE_RPC_MESSAGE` follows. A window that returns too few usable percentiles takes the
+ * floor for the same reason: a rate derived from three blocks is not a fee market reading.
  * ════════════════════════════════════════════════════════════════════════════════════════════════
  */
 
@@ -1083,6 +1161,68 @@ const FEE_TARGET_BLOCKS = 3
  * quote on the chain it enabled.
  */
 const NO_ESTIMATE_RPC_MESSAGE = 'Fee estimation disabled'
+
+/**
+ * The one refusal `deriveFeeRateFromBlocks` is allowed to swallow: the node does not have the RPC.
+ *
+ * `getblockstats` arrived in Bitcoin Core 0.17. `dogecoind 1.14.9` is a 0.14-era base and answers
+ * `-32601 Method not found`, so DOGE takes its floor and that is the whole of what happens. Every
+ * other fault — a node that is down, a wrong credential, a pruned block, a height that does not
+ * exist — propagates, for the same reason `NO_ESTIMATE_RPC_MESSAGE` is matched narrowly: swallowing
+ * them would build every transaction on the estate at the relay floor during an outage, silently,
+ * which is worse than the gap it closes.
+ */
+const NO_SUCH_RPC_MESSAGE = 'Method not found'
+
+/**
+ * The fee rate a trailing window of CONFIRMED blocks paid, in this chain's base unit per vB.
+ *
+ * `null` means "this node cannot tell me" — the RPC is absent, or too few blocks in the window
+ * carried a usable percentile — and the caller takes the floor. It never throws for a fee reason;
+ * it throws only when the node itself is failing, which is a condition the build would hit anyway.
+ *
+ * The statistic and the reasoning behind it are in the block above `NO_ESTIMATE_RPC_MESSAGE`. In
+ * one line: the p90 across the window of each block's 50th-percentile feerate, which is what those
+ * blocks actually included rather than what an estimator predicts they will.
+ *
+ * Sequentially, not in parallel: 24 requests arriving at once is how `litecoind`'s 16-slot work
+ * queue wedged for fifteen minutes on 2026-08-09 (micro-org#307), and this runs once a block.
+ */
+export async function deriveFeeRateFromBlocks(
+  call: ChainCall,
+  tip: number,
+  window: number = FEE_WINDOW_BLOCKS,
+): Promise<bigint | null> {
+  if (!Number.isInteger(tip) || tip < 0) return null
+  const medians: bigint[] = []
+  let asked = 0
+  for (let height = tip; height > tip - window && height >= 0; height -= 1) {
+    asked += 1
+    let stats: unknown
+    try {
+      stats = await call.rpc('getblockstats', [height, ['feerate_percentiles']])
+    } catch (err) {
+      if (err instanceof Error && err.message.includes(NO_SUCH_RPC_MESSAGE)) return null
+      throw err
+    }
+    const row = (stats ?? {}) as Record<string, unknown>
+    const percentiles = row['feerate_percentiles']
+    // Core reports the 10th, 25th, 50th, 75th and 90th percentile of the block's WEIGHT, already in
+    // base units per vB. Index 2 is the 50th. A block whose only transaction is the coinbase
+    // reports zeroes, which is not a fee market reading and is skipped rather than averaged in.
+    if (!Array.isArray(percentiles) || percentiles.length < 5) continue
+    const median = percentiles[2]
+    if (typeof median !== 'number' || !Number.isFinite(median) || !(median > 0)) continue
+    medians.push(BigInt(Math.round(median)))
+  }
+  // Half the window, so that a chain of empty blocks or a node that answered three requests and
+  // then started failing cannot set the rate for a withdrawal. `asked` rather than `window`,
+  // because a chain shorter than the window is a testnet and not a fault.
+  if (medians.length * 2 < asked) return null
+  medians.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const index = Math.ceil(medians.length * 0.9) - 1
+  return medians[index] ?? null
+}
 
 /* ------------------------------------------------------------------ the two fee ceilings */
 
@@ -1244,6 +1384,38 @@ export function bitcoinChain(
   const floor = MIN_RELAY_PER_VB[chain]
 
   /**
+   * The window statistic, kept against the network and tip height it was read at.
+   *
+   * One adapter instance per chain lives for the life of the process (`registry.ts` builds them at
+   * import), and the window costs 24 RPC calls. Keyed on the HEIGHT and not on a clock: the thing
+   * that makes the answer stale is a new block, and there is no timer here to go wrong — Rule 8.
+   *
+   * The NETWORK is in the key because the adapter is per chain and the `ChainCall` is per request:
+   * one `bitcoinChain('btc')` can be handed a mainnet call and a testnet call, and those are two
+   * different fee markets that happen to be counted in the same units. Their tips are millions of
+   * blocks apart today, so a collision is unlikely rather than impossible — and "unlikely" is not
+   * the standard for a number that gets signed.
+   */
+  let window: { readonly key: string; readonly perVb: bigint | null } | null = null
+
+  /**
+   * What the last blocks paid, or `null` when this node cannot say. Read once per block.
+   *
+   * `getblockcount` is asked every time and is one call. That is the price of never serving a rate
+   * derived from blocks that are no longer near the tip, and it is the same call `status` already
+   * makes on every poll.
+   */
+  async function windowRate(call: ChainCall): Promise<bigint | null> {
+    const tip = Number(await call.rpc('getblockcount', []))
+    if (!Number.isInteger(tip)) return null
+    const key = `${call.network}:${tip}`
+    if (window?.key === key) return window.perVb
+    const perVb = await deriveFeeRateFromBlocks(call, tip)
+    window = { key, perVb }
+    return perVb
+  }
+
+  /**
    * The chain's own base unit per vB from the node, bounded by the ceiling for THIS shape.
    *
    * The shape is a parameter rather than one clamp for both, because the two ceilings are five
@@ -1252,32 +1424,45 @@ export function bitcoinChain(
    */
   async function feeRate(call: ChainCall, shape: OutboundShape): Promise<bigint> {
     const ceiling = shape === 'sweep' ? ceilings.sweep : ceilings.payment
+    const clamp = (perVb: bigint): bigint =>
+      perVb < floor ? floor : perVb > ceiling ? ceiling : perVb
+    /**
+     * "I have no estimate" — all three spellings arrive here, and none of them means the floor any
+     * more. Confirmed blocks are asked first and the floor is what remains when they cannot answer.
+     * @see NO_ESTIMATE_RPC_MESSAGE, deriveFeeRateFromBlocks, MIN_RELAY_PER_VB
+     */
+    const withoutEstimate = async (): Promise<bigint> => clamp((await windowRate(call)) ?? floor)
     let answer: unknown
     try {
       answer = await call.rpc('estimatesmartfee', [FEE_TARGET_BLOCKS])
     } catch (err) {
-      // Spelling three of "I have no estimate", and the only exception this catches. Matched on
-      // Core's own words rather than on a code, which is the same rule `broadcast` follows for
-      // "transaction already in block chain" — and matched NARROWLY, because every other RPC fault
-      // here has to keep propagating. @see NO_ESTIMATE_RPC_MESSAGE
-      if (err instanceof Error && err.message.includes(NO_ESTIMATE_RPC_MESSAGE)) return floor
+      // Spelling three, and the only exception this catches. Matched on Core's own words rather
+      // than on a code, which is the same rule `broadcast` follows for "transaction already in
+      // block chain" — and matched NARROWLY, because every other RPC fault here has to keep
+      // propagating.
+      if (err instanceof Error && err.message.includes(NO_ESTIMATE_RPC_MESSAGE)) {
+        return withoutEstimate()
+      }
       throw err
     }
     const row = (answer ?? {}) as Record<string, unknown>
-    // `feerate` is the coin per kilovbyte. Spellings one and two of "I have no estimate": absent
-    // with an `errors` array on Core 0.16 and later, and the `-1` sentinel on the older lineage
-    // `dogecoind` still carries. Both take the floor rather than guessing high, and on Dogecoin
-    // that floor is a hundred times Bitcoin's. @see NO_ESTIMATE_RPC_MESSAGE, MIN_RELAY_PER_VB
+    // `feerate` is the coin per kilovbyte. Spellings one and two: absent with an `errors` array on
+    // Core 0.16 and later, and the `-1` sentinel on the older lineage `dogecoind` still carries.
     //
     // `!(quoted > 0)` and not `quoted <= 0`, so a `NaN` — which is a number to `typeof` and
-    // compares false against everything — lands on the floor instead of reaching `Math.round`.
+    // compares false against everything — takes this branch instead of reaching `Math.round`.
     const quoted = row['feerate']
-    if (typeof quoted !== 'number' || !(quoted > 0)) return floor
+    if (typeof quoted !== 'number' || !(quoted > 0)) return withoutEstimate()
     const perKvb = btcToSats(quoted, chain)
-    const perVb = perKvb / 1_000n
-    if (perVb < floor) return floor
-    if (perVb > ceiling) return ceiling
-    return perVb
+    // ROUNDED UP, because bigint division truncates and truncating a fee rate is the one direction
+    // that gets a transaction stuck. A node quoting 1,500 sat/kvB wants 1.5/vB; taking 1 pays a
+    // third less than the node just said was needed, and the transaction that results is relayed
+    // and then sits — which is the whole failure this block was written about. Rounding up costs at
+    // most one sat/vB, about 141 satoshi on the one-input two-output spend `estimateFee` quotes.
+    //
+    // It changes nothing about the live LTC quote either way: 999 rounds to 1 in both directions,
+    // and that arithmetic is measured in the Litecoin block above rather than assumed.
+    return clamp((perKvb + 999n) / 1_000n)
   }
 
   async function statusOf(call: ChainCall, txid: string): Promise<OutboundStatus> {
