@@ -37,11 +37,16 @@ export type Tx = TransactionSql
 /* ------------------------------------------------------------------ the topics */
 
 /**
- * What this service consumes. One topic, and it is the whole of the handover.
+ * The money handover, and the whole of it: one topic carries a withdrawal from wallet to here.
  *
  * wallet validates the destination, quotes the fee, **reserves through the ledger**, writes a
  * `queued` row and emits this. Everything after it is settlement's, which is what makes the chain
  * lease enforceable at all: the lease has to live where the state lives.
+ *
+ * It is no longer the only topic this service consumes — `identity.user.deleted` and
+ * `mint.deploy.funding_requested` arrive on the same `POST /v1/events` route, declared beside
+ * their handlers in `erasure.ts` and `deployerfunding.ts`. It is still the only one that moves a
+ * user's money, and the only one whose producer signs the legacy way.
  */
 export const WALLET_WITHDRAWAL_REQUESTED = 'wallet.withdrawal.requested'
 

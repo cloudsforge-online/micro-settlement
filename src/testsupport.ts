@@ -53,6 +53,7 @@ import { tokensFor, type TokenSweepDeps } from './sweeps.ts'
 import type { WorkerDeps } from './worker.ts'
 import type { AdjudicateDeps } from './adjudicate.ts'
 import type { WithdrawalDeps } from './withdrawals.ts'
+import type { DeployFundingDeps } from './deployerfunding.ts'
 import type { TreasuryWatchDeps } from './treasury.ts'
 
 /* ------------------------------------------------------------------ RLP, for the fake signer */
@@ -844,6 +845,7 @@ export interface Harness {
   readonly adjudication: AdjudicateDeps
   readonly sweeps: TokenSweepDeps
   readonly withdrawals: WithdrawalDeps
+  readonly deployerFunding: DeployFundingDeps
   readonly treasuries: { readonly sql: Db; readonly custody: FakeCustody; readonly network: Network }
   readonly treasuryWatch: TreasuryWatchDeps
 }
@@ -858,6 +860,13 @@ export interface HarnessOptions {
   readonly tokenSweepEnabled?: boolean
   readonly minTokenSweep?: bigint
   readonly treasuryTargets?: Readonly<Record<string, string>>
+  /**
+   * The deployer-funding bounds. Both default HIGH rather than to production's numbers, so a test
+   * that means to exercise a cap says so — a suite where every case silently sat under a low cap
+   * would go green for the wrong reason the day the default moved.
+   */
+  readonly deployerTopUpMaxWei?: bigint
+  readonly deployerTopUpMaxPerToken?: number
   readonly now?: () => number
 }
 
@@ -910,6 +919,11 @@ export function harness(sql: postgres.Sql, options: HarnessOptions = {}): Harnes
       tokens: async (chain, network) => tokensFor(await custody.tokenContracts(), chain, network),
     },
     withdrawals: { ...treasuries, producer: 'settlement' },
+    deployerFunding: {
+      ...outbound,
+      topUpMaxWei: options.deployerTopUpMaxWei ?? 10n ** 18n,
+      topUpMaxPerToken: options.deployerTopUpMaxPerToken ?? 3,
+    },
     treasuries,
     treasuryWatch: { ...treasuries, indexer, ledger, producer: 'settlement', logger },
   }

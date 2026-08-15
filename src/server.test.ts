@@ -88,6 +88,7 @@ describe('the HTTP surface', { skip }, () => {
       outbound: deps.outbound,
       adjudication: deps.adjudication,
       withdrawals: deps.withdrawals,
+      deployerFunding: deps.deployerFunding,
       treasuries: deps.treasuries,
       sweeps: deps.sweeps,
       eventSigningSecret: SECRET,
