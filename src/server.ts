@@ -81,6 +81,11 @@ import {
   type WithdrawalDeps,
 } from './withdrawals.ts'
 import {
+  MINT_DEPLOY_FUNDING_REQUESTED,
+  handleDeployFundingRequested,
+  type DeployFundingDeps,
+} from './deployerfunding.ts'
+import {
   IDENTITY_USER_DELETED,
   UUID,
   eraseUser,
@@ -120,6 +125,7 @@ export interface ServerDeps {
   readonly outbound: OutboundDeps
   readonly adjudication: AdjudicateDeps
   readonly withdrawals: WithdrawalDeps
+  readonly deployerFunding: DeployFundingDeps
   readonly treasuries: TreasuryDeps
   readonly sweeps: SweepDeps
   /**
@@ -972,6 +978,39 @@ async function handleEvent(ctx: RequestContext, deps: ServerDeps): Promise<Reply
         status: 202,
         body: { handled: true, status: outcome.status === 'duplicate' ? 'duplicate' : 'erased' },
       }
+    }
+
+    /*
+     * The third topic, and the only one whose producer is not wallet or identity.
+     *
+     * A paid Forge Create order cannot pay for its own deploy: mint holds `custody:sign:deployer`
+     * and the treasury signer is here. Before this branch existed the order sat at
+     * `awaiting_funds` for ever with the customer's money already taken, because nothing in the
+     * estate had both the authority and the reason to move coin to a deployer address.
+     *
+     * **Every refusal returns 200 with a decision on it, and none of them throws.** A 500 on a
+     * permanently unfundable order would be redelivered for ever and hold the relay's per-
+     * subscriber circuit breaker open — the head-of-line failure `refuseUnpayable` documents,
+     * measured on this estate at 1,315 attempts, on the money path. Only faults a retry can fix
+     * reach the catch below: an RPC that did not answer, custody, the database.
+     */
+    if (topic === MINT_DEPLOY_FUNDING_REQUESTED) {
+      const decision = await handleDeployFundingRequested(deps.deployerFunding, {
+        eventId,
+        payload,
+        correlationId: ctx.requestId,
+      })
+      deps.metrics.increment('settlement_events_total', { topic, outcome: decision.kind })
+      if (decision.kind === 'refused') {
+        // WARN: a customer has paid for a token that will not deploy until somebody acts, and the
+        // reason names which action — provision a treasury, raise the cap, look at why a token has
+        // burned its allowance. mint keeps the order at `awaiting_funds`, so nothing is lost, but
+        // nothing moves either.
+        ctx.log.warn('a deploy asked for gas and this service will not send it', { eventId, decision })
+      } else {
+        ctx.log.info('deployer funding handled', { eventId, decision })
+      }
+      return { status: 200, body: { handled: true, decision } }
     }
 
     deps.metrics.increment('settlement_events_total', { topic, outcome: 'unsubscribed' })

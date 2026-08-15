@@ -556,9 +556,10 @@ test('the delivery this relay signs is one a contract-following consumer verifie
  * The INBOUND seam, which is deliberately asymmetric with the outbound one.
  *
  * `micro-wallet`'s relay still signs the pre-contract way (`wallet/src/outbox.ts,168`), and
- * `wallet.withdrawal.requested` is the only topic this service consumes. Verifying only the
- * contract's scheme would 401 every withdrawal request the instant this deploys — the same
- * service's only inbound path.
+ * `wallet.withdrawal.requested` is the only topic this service consumes from wallet — identity and
+ * mint, the other two producers, both sign the contract's way. Verifying only the contract's
+ * scheme would 401 every withdrawal request the instant this deploys, which is the whole money
+ * path in.
  *
  * This test exists so the legacy arm cannot be deleted silently while wallet still needs it, and so
  * that deleting it later is a deliberate act with a red test attached rather than a quiet tidy-up.

@@ -462,6 +462,27 @@ export interface Env {
    */
   readonly minTokenSweep: bigint
 
+  /**
+   * The most one `mint.deploy.funding_requested` may move to a deployer address.
+   *
+   * mint computes the figure from a gas estimate against the same node this service reads, so on a
+   * healthy chain it is a fraction of a coin — an EMBER deploy measures around 0.0014 EMBER. The
+   * default is 0.05 of the native coin, about thirty-five times a real deploy, which leaves room
+   * for a genuinely congested chain and none for a node quoting nonsense.
+   *
+   * Over it the transfer is refused, never truncated: a truncated top-up still cannot pay for the
+   * deploy, so it buys nothing but a fee and an address that now needs sweeping.
+   */
+  readonly deployerTopUpMaxWei: bigint
+  /**
+   * How many top-ups one token order may ever receive from this service.
+   *
+   * The second half of a bound whose first half is mint's `MINT_FUNDING_MAX_REQUESTS`. They are
+   * deliberately two counters in two databases: mint's bounds how often it ASKS, this bounds how
+   * often the treasury PAYS, and a bug on either side of the wire is contained by the other.
+   */
+  readonly deployerTopUpMaxPerToken: number
+
   readonly minGasPriceWei: bigint
   readonly maxGasPriceWei: bigint
   /**
@@ -578,6 +599,8 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     sweepMinFeeMultiple: integer(source, 'SETTLEMENT_SWEEP_MIN_FEE_MULTIPLE', 3, 1, 1_000),
     tokenSweepEnabled: boolean(source, 'SETTLEMENT_TOKEN_SWEEP_ENABLED', false),
     minTokenSweep: wei(source, 'SETTLEMENT_MIN_TOKEN_SWEEP', 0n),
+    deployerTopUpMaxWei: wei(source, 'SETTLEMENT_DEPLOYER_TOPUP_MAX_WEI', 5n * 10n ** 16n),
+    deployerTopUpMaxPerToken: integer(source, 'SETTLEMENT_DEPLOYER_TOPUP_MAX_PER_TOKEN', 3, 0, 20),
 
     minGasPriceWei,
     maxGasPriceWei,

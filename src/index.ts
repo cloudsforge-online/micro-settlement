@@ -235,6 +235,13 @@ const server = createServer({
   outbound,
   adjudication: { ...outbound, metrics, logger: logger.child({ component: 'adjudication' }) },
   withdrawals: { ...treasuries, producer: SERVICE },
+  // `outbound` and not `treasuries`: planning a top-up needs the node (to price the transfer) and
+  // the fee bounds as well as custody, and `OutboundDeps` is the bundle that carries all three.
+  deployerFunding: {
+    ...outbound,
+    topUpMaxWei: env.deployerTopUpMaxWei,
+    topUpMaxPerToken: env.deployerTopUpMaxPerToken,
+  },
   treasuries,
   sweeps,
   // The ACCEPT list, not the signing key: verification widens for the rotation window, signing
