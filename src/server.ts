@@ -122,6 +122,14 @@ export interface ServerDeps {
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
   readonly network: Network
+  /**
+   * Every estate this deployment settles. `[network]` unless `SETTLEMENT_NETWORK_ALSO` names a
+   * second, so a single-network deployment is unchanged.
+   *
+   * This is what the deposit-address gate tests membership against. `network` above stays the
+   * FIRST estate and is what the routes that speak for "this deployment" still report.
+   */
+  readonly networks: readonly Network[]
   readonly outbound: OutboundDeps
   readonly adjudication: AdjudicateDeps
   readonly withdrawals: WithdrawalDeps
@@ -804,14 +812,21 @@ function buildRoutes(): Route[] {
         if (!isChainId(chain)) throw new BadRequestError(`chain '${chain}' is not one this service settles`)
         const network = stringField(body, 'network')
         if (!isNetwork(network)) throw new BadRequestError('network must be mainnet or testnet')
-        if (network !== deps.network) {
-          // Refused rather than stored. A deposit address on the other network is one this
-          // deployment must never sweep — the frozen sweeper's comment is exact: without that rule
-          // a float target is enough to drain every address left over from testnet.
+        if (!deps.networks.includes(network)) {
+          // Refused rather than stored. A deposit address on an estate this deployment does not
+          // settle is one it must never sweep — the frozen sweeper's comment is exact: without
+          // that rule a float target is enough to drain every address left over from testnet.
+          //
+          // A MEMBERSHIP test rather than the equality it used to be. A consolidated deployment
+          // settles more than one estate, and equality against the first would refuse the second's
+          // addresses while the worker for it was running — the worst shape of this bug, because
+          // the sweeper would be live and the addresses it needed would have been turned away.
+          // With one estate configured the two are identical, which is what makes this safe to
+          // ship before anything is consolidated.
           throw new ConflictError(
             'other_network',
-            `this deployment settles ${deps.network}; a ${network} address would never be swept ` +
-              'and storing it would only make it look as though it might be',
+            `this deployment settles ${deps.networks.join(' and ')}; a ${network} address would ` +
+              'never be swept and storing it would only make it look as though it might be',
           )
         }
         const done = deps.lifecycle.track()

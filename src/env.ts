@@ -319,6 +319,15 @@ export interface Env {
    * why it is silent about skipping the other network.
    */
   readonly network: Network
+  /**
+   * Every estate this deployment settles — `[network]` unless `SETTLEMENT_NETWORK_ALSO` names a
+   * second. `network` above stays the FIRST of them, and remains what a single-network
+   * deployment means by "this deployment's network".
+   *
+   * The list is what the deposit-address gate tests membership against, and what the worker
+   * planes are built from. See micro-deploy `docs/network-consolidation.md`.
+   */
+  readonly networks: readonly Network[]
 
   readonly custodyUrl: string
   readonly indexerUrl: string
@@ -514,6 +523,30 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     throw new EnvError(`SETTLEMENT_NETWORK must be mainnet or testnet (got ${network})`)
   }
 
+  // ── THE ESTATES THIS DEPLOYMENT SETTLES ────────────────────────────────────────────────────
+  //
+  // `SETTLEMENT_NETWORK` names the FIRST, and stays the only one unless `SETTLEMENT_NETWORK_ALSO`
+  // names a second. A list rather than a swap, because the refusal in `server.ts` — "this
+  // deployment settles X; a Y address would never be swept and storing it would only make it look
+  // as though it might be" — has to become a MEMBERSHIP test rather than an equality one, and a
+  // membership test over a one-element set is exactly today's behaviour.
+  //
+  // Empty by default, so nothing changes until a deployment asks for it. That is what makes this
+  // the same one-line rollback as every other service in the consolidation: unset the variable.
+  const also = optional(source, 'SETTLEMENT_NETWORK_ALSO', '')
+  if (also !== '' && also !== 'mainnet' && also !== 'testnet') {
+    throw new EnvError(`SETTLEMENT_NETWORK_ALSO must be mainnet, testnet or empty (got ${also})`)
+  }
+  if (also === network) {
+    // Refused rather than deduplicated. Naming the same estate twice means somebody believes they
+    // configured two and they did not, and a silent dedupe would let that belief survive a deploy.
+    throw new EnvError(
+      `SETTLEMENT_NETWORK_ALSO names ${also}, which SETTLEMENT_NETWORK already settles — ` +
+        'name the OTHER estate or leave it empty',
+    )
+  }
+  const networks: readonly Network[] = also === '' ? [network] : [network, also]
+
   const minGasPriceWei = wei(source, 'SETTLEMENT_MIN_GAS_PRICE_WEI', 1_000_000_000n)
   const maxGasPriceWei = wei(source, 'SETTLEMENT_MAX_GAS_PRICE_WEI', 500_000_000_000n)
   if (minGasPriceWei > maxGasPriceWei) {
@@ -581,6 +614,8 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
 
     network,
+
+    networks,
 
     custodyUrl: required(source, 'CUSTODY_URL'),
     indexerUrl: required(source, 'INDEXER_URL'),

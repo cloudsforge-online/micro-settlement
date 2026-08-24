@@ -17,6 +17,7 @@
  * not declare them.
  */
 
+import type { Network } from '@cloudsforge/contracts-chain'
 import postgres from 'postgres'
 import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
@@ -193,22 +194,31 @@ const bounds = {
   maxGasPriceWei: env.maxGasPriceWei,
   maxFeeWei: env.maxFeeWei,
 }
-const outbound: OutboundDeps = {
+// ── ONE SET OF BUNDLES PER ESTATE ──────────────────────────────────────────────────────────────
+//
+// `network` is not a label in this service — it selects the CHAIN a transfer is broadcast to, the
+// custody key that signs it and the treasury it may pay. Every bundle below descends from
+// `outbound`, so making that a factory over the estate makes all of them per-estate at once, and
+// nothing downstream can quietly read a different one than its siblings.
+//
+// The database stays ONE: settlement's tables already carry `network`, and the withdrawal ledger
+// is the one place an operator must be able to read both estates in a single query during an
+// incident. What is bulkheaded is the WORK, not the storage.
+const outboundFor = (network: Network): OutboundDeps => ({
   sql: db,
   producer: SERVICE,
-  network: env.network,
+  network,
   custody,
   indexer,
   rpc,
   bounds,
   stuckMinutes: env.stuckMinutes,
-  logger,
-}
-const worker: WorkerDeps = { ...outbound, metrics, logger: logger.child({ component: 'worker' }) }
-const treasuries = { sql: db, custody, network: env.network }
-const sweeps: TokenSweepDeps = {
-  ...outbound,
-  ...treasuries,
+  logger: logger.child({ network }),
+})
+const treasuriesFor = (network: Network) => ({ sql: db, custody, network })
+const sweepsFor = (network: Network): TokenSweepDeps => ({
+  ...outboundFor(network),
+  ...treasuriesFor(network),
   treasuryTargets: env.treasuryTargets,
   minFeeMultiple: env.sweepMinFeeMultiple,
   probeLimit: 10,
@@ -219,8 +229,63 @@ const sweeps: TokenSweepDeps = {
   // become sweepable without a redeploy, and — the direction that matters more — one they REMOVE
   // must stop being swept immediately. A cache here would be this service's own second copy of the
   // allowlist, which is the exact thing reading from custody exists to avoid.
-  tokens: async (chain, network) => tokensFor(await custody.tokenContracts(), chain, network),
-  logger: logger.child({ component: 'sweeper' }),
+  tokens: async (chain, scope) => tokensFor(await custody.tokenContracts(), chain, scope),
+  logger: logger.child({ component: 'sweeper', network }),
+})
+
+/**
+ * The estates this process settles, each with its own bundles.
+ *
+ * `env.networks` is `[env.network]` unless `SETTLEMENT_NETWORK_ALSO` names a second, so a
+ * single-network deployment builds exactly one plane and is byte-for-byte today's service.
+ */
+const planes = env.networks.map((network) => ({
+  network,
+  outbound: outboundFor(network),
+  worker: { ...outboundFor(network), metrics, logger: logger.child({ component: 'worker', network }) } as WorkerDeps,
+  treasuries: treasuriesFor(network),
+  sweeps: sweepsFor(network),
+}))
+const planeFor = (network: Network) => {
+  const plane = planes.find((p) => p.network === network)
+  if (!plane) throw new Error(`this deployment does not settle ${network}`)
+  return plane
+}
+// The FIRST estate's bundles, for the routes and the scrape hooks that predate the split. Each is
+// replaced per request or per plane where the estate is actually known.
+const outbound = planeFor(env.network).outbound
+const worker = planeFor(env.network).worker
+const treasuries = planeFor(env.network).treasuries
+const sweeps = planeFor(env.network).sweeps
+
+// ── ONE QUEUE AND ONE RUNNER PER ESTATE ────────────────────────────────────────────────────────
+//
+// The strongest bulkhead in the estate, because settlement's jobs BROADCAST TRANSACTIONS. A job
+// claimed by a runner holding the other estate's bundles would sign with the other estate's custody
+// key and pay the other estate's treasury — and it would report success.
+//
+// The lease is what stops two workers taking one chain; the SEPARATE QUEUES are what stop one
+// estate's backlog starving the other. A testnet node that stops answering must not be able to
+// wedge mainnet withdrawals behind it, and a single queue with four concurrent slots is exactly
+// how that happens.
+const queueFor = (network: Network) =>
+  new JobQueue(sql as unknown as JobsSql, {
+    owner: `${env.instanceId}:${network}`,
+    // Longer than the default 60 seconds because a chain job holds its lease across a node round
+    // trip, a custody round trip and a broadcast. The handler heartbeats between steps, so this is
+    // the ceiling on a step rather than on the job — but it must still exceed the slowest single
+    // step, or a second worker takes the chain while a signature is in the air.
+    leaseMs: 120_000,
+  })
+
+
+// One queue per plane, built HERE rather than beside the runners because the server's scrape
+// hook below reads their depth and is constructed first.
+const queues = planes.map((plane) => ({ network: plane.network, queue: queueFor(plane.network) }))
+const queueOf = (network: Network) => {
+  const found = queues.find((q) => q.network === network)
+  if (!found) throw new Error(`no queue for network ${network}`)
+  return found.queue
 }
 
 // 8. Routes. After the Lifecycle so the health handlers report real state, and after the pool so the
@@ -232,6 +297,8 @@ const server = createServer({
   metrics,
   verifier,
   network: env.network,
+  // Every estate this deployment settles; the deposit-address gate tests membership against it.
+  networks: env.networks,
   outbound,
   adjudication: { ...outbound, metrics, logger: logger.child({ component: 'adjudication' }) },
   withdrawals: { ...treasuries, producer: SERVICE },
@@ -250,80 +317,91 @@ const server = createServer({
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository, and CI greps for one — rule 8.
   beforeScrape: async () => {
-    const stats = await queue.stats()
-    metrics.set('jobs_pending', stats.pending)
-    metrics.set('jobs_overdue', stats.overdue)
+    // Per estate. Summed across two queues the depth reads healthy while one estate's chain work
+    // is wedged behind an unreachable node.
+    for (const { network, queue } of queues) {
+      const stats = await queue.stats()
+      metrics.set('jobs_pending', stats.pending, { network })
+      metrics.set('jobs_overdue', stats.overdue, { network })
+    }
     // `withdrawal_stuck` joins them here rather than being incremented by the worker, and
     // that is the whole design: a tally the worker keeps cannot report a dead worker, and a dead
     // worker is one of the two ways a withdrawal gets stuck. The route logs and continues if this
     // throws, so a scrape never fails on it. See `stuck.ts`.
-    await publishStuckWithdrawals({
-      sql: db,
-      metrics,
-      network: env.network,
-      stuckMinutes: env.stuckMinutes,
-    })
+    // Per estate. A stuck-withdrawal gauge summed across two estates reads as healthy while one
+    // of them has a withdrawal wedged, which is the exact signal this exists to raise.
+    for (const plane of planes) {
+      await publishStuckWithdrawals({
+        sql: db,
+        metrics,
+        network: plane.network,
+        stuckMinutes: env.stuckMinutes,
+      })
+    }
   },
 })
 
 // 9. The job runner, started before `listen()`. Background work is claimed under a lease, so a
 //    replica that is draining stops claiming before it stops serving — `shouldClaim` is wired to the
 //    Lifecycle for exactly that.
-const queue = new JobQueue(sql as unknown as JobsSql, {
-  owner: env.instanceId,
-  // Longer than the default 60 seconds because a chain job holds its lease across a node round
-  // trip, a custody round trip and a broadcast. The handler heartbeats between steps, so this is
-  // the ceiling on a step rather than on the job — but it must still exceed the slowest single
-  // step, or a second worker takes the chain while a signature is in the air.
-  leaseMs: 120_000,
-})
-const reschedule = rescheduleRecurring(queue, env.network, logger)
-const runner = new JobRunner({
-  queue,
-  concurrency: 4,
-  pollMs: 1_000,
-  shouldClaim: () => lifecycle.claimingJobs,
-  onEvent: (event) => {
-    if (event.kind) {
-      if (event.type === 'claimed') metrics.increment('jobs_claimed_total', { kind: event.kind })
-      if (event.type === 'completed') metrics.increment('jobs_completed_total', { kind: event.kind })
-      if (event.type === 'failed') metrics.increment('jobs_failed_total', { kind: event.kind })
-      if (event.type === 'dead') metrics.increment('jobs_dead_total', { kind: event.kind })
-      if (event.durationMs !== undefined) {
-        metrics.observe('jobs_duration_ms', event.durationMs, { kind: event.kind })
+const runners = planes.map((plane) => {
+  const queue = queueOf(plane.network)
+  const reschedule = rescheduleRecurring(queue, plane.network, logger)
+  const runner = new JobRunner({
+    queue,
+    concurrency: 4,
+    pollMs: 1_000,
+    shouldClaim: () => lifecycle.claimingJobs,
+    onEvent: (event) => {
+      if (event.kind) {
+        const labels = { kind: event.kind, network: plane.network }
+        if (event.type === 'claimed') metrics.increment('jobs_claimed_total', labels)
+        if (event.type === 'completed') metrics.increment('jobs_completed_total', labels)
+        if (event.type === 'failed') metrics.increment('jobs_failed_total', labels)
+        if (event.type === 'dead') metrics.increment('jobs_dead_total', labels)
+        if (event.durationMs !== undefined) {
+          metrics.observe('jobs_duration_ms', event.durationMs, labels)
+        }
       }
-    }
-    if (event.type === 'failed' || event.type === 'dead' || event.type === 'error') {
-      logger.error('job failure', { ...event })
-    }
-    reschedule(event)
-  },
+      if (event.type === 'failed' || event.type === 'dead' || event.type === 'error') {
+        logger.error('job failure', { ...event, network: plane.network })
+      }
+      reschedule(event)
+    },
+  })
+
+  registerHandlers(runner, {
+    sql: db,
+    logger: logger.child({ network: plane.network }),
+    metrics,
+    signingSecret: env.outboxSigningSecret,
+    worker: plane.worker,
+    sweeps: plane.sweeps,
+    fees: {
+      sql: db,
+      ledger,
+      logger: logger.child({ component: 'fees', network: plane.network }),
+      producer: SERVICE,
+    },
+    // What makes swept coin visible to the platform's solvency check. Built from `treasuries`
+    // rather than from `sweeps`, because the treasury must be registered whether or not
+    // `SWEEP_ENABLED` is set: it is the address every withdrawal is paid from either way.
+    // `ledger` and `producer` because registering an address and booking it are one operation — an
+    // address the indexer counts and the ledger does not is drift, and EMBER reconciles at zero
+    // tolerance. See the correction in `registerTreasuryWithIndexer`.
+    treasuryWatch: {
+      ...plane.treasuries,
+      indexer,
+      ledger,
+      producer: SERVICE,
+      logger: logger.child({ component: 'treasury-watch', network: plane.network }),
+    },
+  })
+  return { runner, queue, network: plane.network }
 })
 
-registerHandlers(runner, {
-  sql: db,
-  logger,
-  metrics,
-  signingSecret: env.outboxSigningSecret,
-  worker,
-  sweeps,
-  fees: { sql: db, ledger, logger: logger.child({ component: 'fees' }), producer: SERVICE },
-  // What makes swept coin visible to the platform's solvency check. Built from `treasuries` rather
-  // than from `sweeps`, because the treasury must be registered whether or not `SWEEP_ENABLED` is
-  // set: it is the address every withdrawal is paid from either way.
-  // `ledger` and `producer` because registering an address and booking it are one operation — an
-  // address the indexer counts and the ledger does not is drift, and EMBER reconciles at zero
-  // tolerance. See the correction in `registerTreasuryWithIndexer`.
-  treasuryWatch: {
-    ...treasuries,
-    indexer,
-    ledger,
-    producer: SERVICE,
-    logger: logger.child({ component: 'treasury-watch' }),
-  },
-})
-await seedRecurring(queue, env.network)
-runner.start()
+for (const r of runners) await seedRecurring(r.queue, r.network)
+for (const r of runners) r.runner.start()
 
 // 10. Listen. Last of the construction steps, because a socket that accepts before its dependencies
 //     exist is a socket that answers 500.
@@ -346,7 +424,7 @@ lifecycle.onShutdown(async () => {
   logger.info('database pool closed')
 })
 lifecycle.onShutdown(async () => {
-  const clean = await runner.stop(20_000)
+  const clean = (await Promise.all(runners.map((r) => r.runner.stop(20_000)))).every(Boolean)
   logger.info('job runner stopped', { clean })
 })
 lifecycle.onShutdown(

@@ -85,6 +85,7 @@ describe('the HTTP surface', { skip }, () => {
         },
       },
       network: 'testnet',
+    networks: ['testnet'] as const,
       outbound: deps.outbound,
       adjudication: deps.adjudication,
       withdrawals: deps.withdrawals,
