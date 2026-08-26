@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { chainSpec } from '@cloudsforge/contracts-chain'
-import { keccak256, sha3_256 } from './keccak.ts'
+import { keccak256, sha3_256 } from '@cloudsforge/evm'
 import {
   TRANSFER_GAS,
   canonicaliseEvm,

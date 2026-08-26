@@ -49,7 +49,7 @@ import {
   decodeUint256,
   gasPriceForLockedFee,
 } from './evm.ts'
-import { keccak256 } from './keccak.ts'
+import { keccak256 } from '@cloudsforge/evm'
 import { failedEvents } from './withdrawals.ts'
 import {
   enabled,
